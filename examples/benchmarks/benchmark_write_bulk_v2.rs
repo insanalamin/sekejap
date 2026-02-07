@@ -10,7 +10,7 @@
 //! cargo test --release --features vector --test benchmark_write_bulk_v2 -- --nocapture
 //! ```
 
-use hsdl_sekejap::{SekejapDB, WriteOptions};
+use sekejap::{SekejapDB, WriteOptions};
 use rand::Rng;
 use std::path::Path;
 use std::time::Instant;

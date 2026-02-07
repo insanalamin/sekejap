@@ -8,7 +8,7 @@
 //! cargo test --release --features vector --test benchmark_write_bulk -- --nocapture
 //! ```
 
-use hsdl_sekejap::SekejapDB;
+use sekejap::SekejapDB;
 use rand::Rng;
 use std::path::Path;
 use std::time::Instant;
@@ -228,7 +228,7 @@ fn benchmark_comparison_write_modes() {
         for i in 0..num_writes {
             let slug = format!("ind-{:06}", i);
             let payload = format!(r#"{{"n": {}}}"#, i);
-            db.write_with_options(&slug, &payload, hsdl_sekejap::WriteOptions {
+            db.write_with_options(&slug, &payload, sekejap::WriteOptions {
                 publish_now: true,
                 ..Default::default()
             }).expect("Write failed");

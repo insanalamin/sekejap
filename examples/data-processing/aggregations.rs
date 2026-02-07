@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run --example aggregations`
 
-use hsdl_sekejap::{SekejapDB, atoms::*, EdgeType};
+use sekejap::{SekejapDB, atoms::*, EdgeType};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

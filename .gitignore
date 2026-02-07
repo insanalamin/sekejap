@@ -90,3 +90,5 @@ test-results/
 *.key
 target/.rustc_info.json
 target
+
+/unused
