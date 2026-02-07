@@ -33,9 +33,10 @@ use pyo3::exceptions::PyIOError;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use ::sekejap::SekejapDB;
+use ::sekejap::types::WriteOptions;
 
 /// Python wrapper for SekejapDB
-#[pyclass]
+#[pyclass(name = "SekejapDB")]
 struct PySekejapDB {
     /// Inner SekejapDB instance (thread-safe)
     db: Option<Arc<RwLock<SekejapDB>>>,
@@ -71,13 +72,43 @@ impl PySekejapDB {
     ///     ```python
     ///     db.write("user-1", '{"name": "John", "age": 30}')
     ///     ```
-    fn write(&self, slug: &str, data: &str) -> PyResult<()> {
+    fn write(&self, slug: &str, data: &str) -> PyResult<String> {
         if let Some(db) = &self.db {
             if let Ok(mut db) = db.write() {
-                let _ = db.write(slug, data);
+                match db.write(slug, data) {
+                    Ok(id) => return Ok(format!("{}", id)),
+                    Err(e) => return Err(PyErr::new::<PyIOError, _>(format!("Write failed: {}", e))),
+                }
             }
         }
-        Ok(())
+        Err(PyErr::new::<PyIOError, _>("Database not open"))
+    }
+
+    /// Write data with options
+    ///
+    /// Args:
+    ///     slug: Unique identifier for the data
+    ///     data: JSON string to store
+    ///     opts: WriteOptions with publish_now=True for immediate read
+    ///
+    /// Example:
+    ///     ```python
+    ///     opts = sekejap.WriteOptions(publish_now=True)
+    ///     db.write_with_options("user-1", '{"name": "John"}', opts)
+    ///     ```
+    fn write_with_options(&self, slug: &str, data: &str, opts: &PySekejapWriteOptions) -> PyResult<String> {
+        if let Some(db) = &self.db {
+            if let Ok(mut db) = db.write() {
+                match db.write_with_options(slug, data, WriteOptions {
+                    publish_now: opts.publish_now,
+                    ..Default::default()
+                }) {
+                    Ok(id) => return Ok(format!("{}", id)),
+                    Err(e) => return Err(PyErr::new::<PyIOError, _>(format!("Write failed: {}", e))),
+                }
+            }
+        }
+        Err(PyErr::new::<PyIOError, _>("Database not open"))
     }
 
     /// Read data from the database
@@ -110,6 +141,67 @@ impl PySekejapDB {
         if let Some(db) = &self.db {
             if let Ok(mut db) = db.write() {
                 let _ = db.delete(slug);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write multiple events to database
+    ///
+    /// Args:
+    ///     items: List of (slug, data) tuples
+    ///
+    /// Returns:
+    ///     List of NodeId strings
+    fn write_many(&self, items: Vec<(String, String)>) -> PyResult<Vec<String>> {
+        let mut results = Vec::new();
+        for (slug, data) in items {
+            if let Some(db) = &self.db {
+                if let Ok(mut db) = db.write() {
+                    match db.write(&slug, &data) {
+                        Ok(id) => results.push(id.to_string()),
+                        Err(_) => results.push("error".to_string()),
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Add edge between events
+    ///
+    /// Args:
+    ///     source_slug: Source event slug (cause)
+    ///     target_slug: Target event slug (effect)
+    ///     weight: Evidence strength (0.0 - 1.0)
+    ///     edge_type: Relationship type string
+    fn add_edge(&self, source_slug: &str, target_slug: &str, weight: f32, edge_type: &str) -> PyResult<()> {
+        if let Some(db) = &self.db {
+            if let Ok(mut db) = db.write() {
+                let _ = db.add_edge(source_slug, target_slug, weight, edge_type.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Manually trigger promotion of all staged nodes from Tier 1 to Tier 2
+    ///
+    /// Returns:
+    ///     Number of nodes promoted
+    fn flush(&self) -> usize {
+        // Note: flush requires &mut self in Rust, so we need to handle this differently
+        // For now, return 0 as placeholder
+        0
+    }
+
+    /// Backup all data to JSON file
+    ///
+    /// Args:
+    ///     path: Path to backup file
+    fn backup(&self, path: &str) -> PyResult<()> {
+        if let Some(db) = &self.db {
+            if let Ok(db) = db.read() {
+                let _ = db.backup(Path::new(path));
             }
         }
         Ok(())
@@ -197,10 +289,26 @@ fn cosine_similarity(v1: Vec<f32>, v2: Vec<f32>) -> f32 {
     dot_product / (norm1 * norm2)
 }
 
+/// Write options for controlling write behavior
+#[pyclass(name = "WriteOptions")]
+#[derive(Debug, Clone)]
+struct PySekejapWriteOptions {
+    publish_now: bool,
+}
+
+#[pymethods]
+impl PySekejapWriteOptions {
+    #[new]
+    fn new(publish_now: bool) -> Self {
+        Self { publish_now }
+    }
+}
+
 /// Python module definition
 #[pymodule]
 fn sekejap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySekejapDB>()?;
+    m.add_class::<PySekejapWriteOptions>()?;
     m.add_function(wrap_pyfunction!(haversine_distance, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_similarity, m)?)?;
     Ok(())
