@@ -2,7 +2,7 @@
 name = "sekejap-python"
 version = "0.1.0"
 edition = "2021"
-description = "Python bindings for Sekejap-DB: a graph-first, embedded multi-model database engine"
+description = "A graph-first, embedded multi-model database engine"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
 homepage = "https://sekejap.mecha.id"
@@ -23,6 +23,7 @@ classifiers = [
 ]
 
 [lib]
+name = "sekejap"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
@@ -45,3 +46,10 @@ fulltext = ["sekejap/fulltext"]
 spatial = ["sekejap/spatial"]
 vector = ["sekejap/vector"]
 all = ["fulltext", "spatial", "vector"]
+
+[tool.maturin]
+module-name = "sekejap"
+package-name = "sekejap"
+
+[project.metadata]
+name = "sekejap"

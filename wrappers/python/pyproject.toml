@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin"]
+build-backend = "maturin"
+
+[project]
+name = "sekejap"  # This is the PyPI name (pip install sekejap)
+version = "0.1.0"
+description = "A graph-first, embedded multi-model database engine"
+requires-python = ">=3.8"
+
+[project.urls]
+homepage = "https://sekejap.mecha.id"
+repository = "https://github.com/insanalamin/sekejap"
+
+[tool.maturin]
+module-name = "sekejap"
+bindings = "pyo3"
