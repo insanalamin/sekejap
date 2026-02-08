@@ -1,7 +1,7 @@
 [package]
 name = "sekejap-python"
-version = "0.1.1"
-edition = "2021"
+version = "0.1.2"
+edition = "2024"
 description = "A graph-first, embedded multi-model database engine"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -51,5 +51,5 @@ all = ["fulltext", "spatial", "vector"]
 module-name = "sekejap"
 package-name = "sekejap"
 
-[project.metadata]
-name = "sekejap"
+#[project.metadata]
+#name = "sekejap"

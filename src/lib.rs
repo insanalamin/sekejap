@@ -1188,7 +1188,8 @@ impl SekejapDB {
         let _slug_hash = hash_slug(slug);
 
         // Find starting node and create EntityId
-        let entity_id = EntityId::new("nodes".to_string(), slug.to_string());
+        let entity_id = EntityId::parse(slug)
+            .unwrap_or_else(|_| EntityId::new("nodes".to_string(), slug.to_string()));
 
         let result = self.graph().backward_bfs(
             &entity_id,
@@ -1242,7 +1243,8 @@ impl SekejapDB {
         let _slug_hash = hash_slug(slug);
 
         // Find starting node and create EntityId
-        let entity_id = EntityId::new("nodes".to_string(), slug.to_string());
+        let entity_id = EntityId::parse(slug)
+            .unwrap_or_else(|_| EntityId::new("nodes".to_string(), slug.to_string()));
 
         // Use the new forward_bfs method
         let result = self.graph().forward_bfs(
