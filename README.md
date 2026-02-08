@@ -4,6 +4,8 @@ A **graph-first**, embedded multi-model database engine for Rust and Python.
 
 ## 1: Overview 
 
+**Think of it as "Data Legos": a transparent, honest engine that replaces hidden black-box magic with explicit connections, giving you the total freedom to see, build, and navigate your own logic brick-by-brick.**
+
 Sekejap-DB is a **graph-native database** designed for high-performance, relationship-heavy workloads like **Root Cause Analysis (RCA)**, **RAG**, and **Agentic AI**.
 
 It unifies **Graph**, **Vector**, **Spatial**, and **Full-Text** search into a single, cohesive engine where the **Graph** acts as the primary structure and other models serve as attributes or filters.
