@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```rust
-//! use hsdl_sekejap::types::{GeoGeometry, GeoFeature, GeoStore};
+//! use sekejap::types::{GeoGeometry, GeoFeature, GeoStore};
 //!
 //! // Point geometry
 //! let point = GeoGeometry::Point { coordinates: [106.8456, -6.2088] };
@@ -53,7 +53,7 @@ pub enum GeoGeometry {
         /// [longitude, latitude]
         coordinates: [f64; 2],
     },
-    
+
     /// LineString geometry - sequence of points
     ///
     /// # JSON
@@ -64,7 +64,7 @@ pub enum GeoGeometry {
         /// Array of [lon, lat] points (at least 2)
         coordinates: Vec<[f64; 2]>,
     },
-    
+
     /// Polygon geometry - closed area with optional holes
     ///
     /// First ring is exterior boundary (counter-clockwise).
@@ -83,7 +83,7 @@ pub enum GeoGeometry {
         /// Rings: first is exterior, rest are holes
         coordinates: Vec<Vec<[f64; 2]>>,
     },
-    
+
     /// MultiPolygon geometry - multiple polygons
     ///
     /// For complex geometries like archipelagos
@@ -106,26 +106,32 @@ pub enum GeoGeometry {
 impl GeoGeometry {
     /// Create a Point geometry
     pub fn point(lon: f64, lat: f64) -> Self {
-        Self::Point { coordinates: [lon, lat] }
+        Self::Point {
+            coordinates: [lon, lat],
+        }
     }
-    
+
     /// Create a LineString geometry
     pub fn line_string(coordinates: Vec<[f64; 2]>) -> Self {
         Self::LineString { coordinates }
     }
-    
+
     /// Create a simple polygon from exterior ring
     pub fn polygon(exterior: Vec<[f64; 2]>) -> Self {
-        Self::Polygon { coordinates: vec![exterior] }
+        Self::Polygon {
+            coordinates: vec![exterior],
+        }
     }
-    
+
     /// Create a polygon with holes
     pub fn polygon_with_holes(exterior: Vec<[f64; 2]>, holes: Vec<Vec<[f64; 2]>>) -> Self {
         let mut coords = vec![exterior];
         coords.extend(holes);
-        Self::Polygon { coordinates: coords }
+        Self::Polygon {
+            coordinates: coords,
+        }
     }
-    
+
     /// Get geometry type as string
     pub fn geometry_type(&self) -> &'static str {
         match self {
@@ -135,40 +141,43 @@ impl GeoGeometry {
             GeoGeometry::MultiPolygon { .. } => "MultiPolygon",
         }
     }
-    
+
     /// Check if geometry is valid
     pub fn is_valid(&self) -> bool {
         match self {
             GeoGeometry::Point { .. } => true,
-            GeoGeometry::LineString { coordinates: coords } => coords.len() >= 2,
+            GeoGeometry::LineString {
+                coordinates: coords,
+            } => coords.len() >= 2,
             GeoGeometry::Polygon { coordinates } => {
                 !coordinates.is_empty() && coordinates.iter().all(|ring| ring.len() >= 4)
             }
             GeoGeometry::MultiPolygon { coordinates } => {
-                !coordinates.is_empty() && coordinates.iter().all(|poly| {
-                    !poly.is_empty() && poly.iter().all(|ring| ring.len() >= 4)
-                })
+                !coordinates.is_empty()
+                    && coordinates
+                        .iter()
+                        .all(|poly| !poly.is_empty() && poly.iter().all(|ring| ring.len() >= 4))
             }
         }
     }
-    
+
     /// Get bounding box (min_lon, min_lat, max_lon, max_lat)
     pub fn bounds(&self) -> (f64, f64, f64, f64) {
         let mut min_lon = f64::INFINITY;
         let mut min_lat = f64::INFINITY;
         let mut max_lon = f64::NEG_INFINITY;
         let mut max_lat = f64::NEG_INFINITY;
-        
+
         self.visit_points(|[lon, lat]| {
             min_lon = min_lon.min(lon);
             min_lat = min_lat.min(lat);
             max_lon = max_lon.max(lon);
             max_lat = max_lat.max(lat);
         });
-        
+
         (min_lon, min_lat, max_lon, max_lat)
     }
-    
+
     /// Get centroid (approximate center point)
     pub fn centroid(&self) -> Option<[f64; 2]> {
         let (min_lon, min_lat, max_lon, max_lat) = self.bounds();
@@ -178,14 +187,14 @@ impl GeoGeometry {
             Some([(min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0])
         }
     }
-    
+
     /// Get total number of vertices
     pub fn vertex_count(&self) -> usize {
         let mut count = 0;
         self.visit_points(|_| count += 1);
         count
     }
-    
+
     /// Visit all points in the geometry
     fn visit_points<F: FnMut([f64; 2])>(&self, mut f: F) {
         match self {
@@ -213,7 +222,7 @@ impl GeoGeometry {
             }
         }
     }
-    
+
     /// Calculate approximate area in square degrees (for Polygon/MultiPolygon)
     pub fn area(&self) -> f64 {
         match self {
@@ -245,7 +254,7 @@ impl GeoGeometry {
             _ => 0.0,
         }
     }
-    
+
     /// Convert to internal Point representation (for simple cases)
     pub fn to_point(&self) -> Option<super::Point> {
         match self {
@@ -283,10 +292,10 @@ impl fmt::Display for GeoGeometry {
 pub struct GeoFeature {
     /// Feature name (e.g., "center", "area", "boundary")
     pub name: String,
-    
+
     /// Geometry data
     pub geometry: GeoGeometry,
-    
+
     /// Optional SRID (default: 4326 = WGS84)
     #[serde(default = "default_srid")]
     pub srid: u32,
@@ -305,37 +314,41 @@ impl GeoFeature {
             srid: default_srid(),
         }
     }
-    
+
     /// Create with custom SRID
     pub fn with_srid(name: String, geometry: GeoGeometry, srid: u32) -> Self {
-        Self { name, geometry, srid }
+        Self {
+            name,
+            geometry,
+            srid,
+        }
     }
-    
+
     /// Get feature name
     pub fn name(&self) -> &str {
         &self.name
     }
-    
+
     /// Get geometry
     pub fn geometry(&self) -> &GeoGeometry {
         &self.geometry
     }
-    
+
     /// Get geometry type
     pub fn geometry_type(&self) -> &'static str {
         self.geometry.geometry_type()
     }
-    
+
     /// Check if valid
     pub fn is_valid(&self) -> bool {
         self.geometry.is_valid()
     }
-    
+
     /// Get centroid
     pub fn centroid(&self) -> Option<[f64; 2]> {
         self.geometry.centroid()
     }
-    
+
     /// Get bounds
     pub fn bounds(&self) -> (f64, f64, f64, f64) {
         self.geometry.bounds()
@@ -356,7 +369,7 @@ impl fmt::Display for GeoFeature {
 /// # Example
 ///
 /// ```rust
-/// use hsdl_sekejap::types::{GeoStore, GeoGeometry, GeoFeature};
+/// use sekejap::types::{GeoStore, GeoGeometry, GeoFeature};
 ///
 /// let mut geo_store = GeoStore::new();
 ///
@@ -389,69 +402,69 @@ impl GeoStore {
     pub fn new() -> Self {
         Self(HashMap::new())
     }
-    
+
     /// Insert a geo feature
     pub fn insert(&mut self, name: String, feature: GeoFeature) -> Option<GeoFeature> {
         self.0.insert(name, feature)
     }
-    
+
     /// Get a geo feature by name
     pub fn get(&self, name: &str) -> Option<&GeoFeature> {
         self.0.get(name)
     }
-    
+
     /// Get mutable reference to a geo feature
     pub fn get_mut(&mut self, name: &str) -> Option<&mut GeoFeature> {
         self.0.get_mut(name)
     }
-    
+
     /// Check if feature exists
     pub fn contains(&self, name: &str) -> bool {
         self.0.contains_key(name)
     }
-    
+
     /// Remove a feature
     pub fn remove(&mut self, name: &str) -> Option<GeoFeature> {
         self.0.remove(name)
     }
-    
+
     /// Get number of features
     pub fn len(&self) -> usize {
         self.0.len()
     }
-    
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-    
+
     /// Iterate over features
     pub fn iter(&self) -> impl Iterator<Item = (&str, &GeoFeature)> {
         self.0.iter().map(|(k, v)| (k.as_str(), v))
     }
-    
+
     /// Iterate mutably over features
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut GeoFeature)> {
         self.0.iter_mut().map(|(k, v)| (k.as_str(), v))
     }
-    
+
     /// Get all feature names
     pub fn names(&self) -> Vec<&str> {
         self.0.keys().map(|s| s.as_str()).collect()
     }
-    
+
     /// Get total vertex count across all features
     pub fn total_vertex_count(&self) -> usize {
         self.0.values().map(|f| f.geometry.vertex_count()).sum()
     }
-    
+
     /// Get combined bounds of all features
     pub fn combined_bounds(&self) -> Option<(f64, f64, f64, f64)> {
         let mut min_lon = f64::INFINITY;
         let mut min_lat = f64::INFINITY;
         let mut max_lon = f64::NEG_INFINITY;
         let mut max_lat = f64::NEG_INFINITY;
-        
+
         for feature in self.0.values() {
             let (f_min_lon, f_min_lat, f_max_lon, f_max_lat) = feature.geometry.bounds();
             min_lon = min_lon.min(f_min_lon);
@@ -459,14 +472,14 @@ impl GeoStore {
             max_lon = max_lon.max(f_max_lon);
             max_lat = max_lat.max(f_max_lat);
         }
-        
+
         if min_lon == f64::INFINITY {
             None
         } else {
             Some((min_lon, min_lat, max_lon, max_lat))
         }
     }
-    
+
     /// Get first point geometry (for indexing)
     pub fn first_point(&self) -> Option<super::Point> {
         for feature in self.0.values() {
@@ -487,19 +500,19 @@ impl fmt::Display for GeoStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_point_geometry() {
         let point = GeoGeometry::point(106.8456, -6.2088);
         assert!(point.is_valid());
         assert_eq!(point.geometry_type(), "Point");
         assert_eq!(point.vertex_count(), 1);
-        
+
         let centroid = point.centroid().unwrap();
         assert!((centroid[0] - 106.8456).abs() < 0.0001);
         assert!((centroid[1] - (-6.2088)).abs() < 0.0001);
     }
-    
+
     #[test]
     fn test_polygon_geometry() {
         let polygon = GeoGeometry::polygon(vec![
@@ -513,7 +526,7 @@ mod tests {
         assert_eq!(polygon.geometry_type(), "Polygon");
         assert_eq!(polygon.vertex_count(), 5);
     }
-    
+
     #[test]
     fn test_polygon_with_holes() {
         let exterior = vec![
@@ -534,40 +547,50 @@ mod tests {
         assert!(polygon.is_valid());
         assert_eq!(polygon.vertex_count(), 10); // 5 + 5
     }
-    
+
     #[test]
     fn test_geo_feature() {
-        let feature = GeoFeature::new(
-            "center".to_string(),
-            GeoGeometry::point(106.85, -6.88),
-        );
+        let feature = GeoFeature::new("center".to_string(), GeoGeometry::point(106.85, -6.88));
         assert_eq!(feature.name(), "center");
         assert_eq!(feature.geometry_type(), "Point");
         assert!(feature.is_valid());
     }
-    
+
     #[test]
     fn test_geo_store() {
         let mut store = GeoStore::new();
         assert!(store.is_empty());
-        
-        store.insert("center".to_string(), GeoFeature::new("center".to_string(), GeoGeometry::point(106.85, -6.88)));
-        store.insert("area".to_string(), GeoFeature::new("area".to_string(), GeoGeometry::polygon(vec![
-            [106.7, -6.9], [107.0, -6.9], [107.0, -6.8], [106.7, -6.8], [106.7, -6.9],
-        ])));
-        
+
+        store.insert(
+            "center".to_string(),
+            GeoFeature::new("center".to_string(), GeoGeometry::point(106.85, -6.88)),
+        );
+        store.insert(
+            "area".to_string(),
+            GeoFeature::new(
+                "area".to_string(),
+                GeoGeometry::polygon(vec![
+                    [106.7, -6.9],
+                    [107.0, -6.9],
+                    [107.0, -6.8],
+                    [106.7, -6.8],
+                    [106.7, -6.9],
+                ]),
+            ),
+        );
+
         assert_eq!(store.len(), 2);
         assert!(store.contains("center"));
         assert!(!store.contains("missing"));
-        
+
         let bounds = store.combined_bounds().unwrap();
         assert!((bounds.0 - 106.7).abs() < 0.0001);
         assert!((bounds.2 - 107.0).abs() < 0.0001);
-        
+
         let total_vertices = store.total_vertex_count();
         assert_eq!(total_vertices, 6); // 1 + 5
     }
-    
+
     #[test]
     fn test_bounds() {
         let polygon = GeoGeometry::polygon(vec![
@@ -577,7 +600,7 @@ mod tests {
             [106.7, -6.8],
             [106.7, -6.9],
         ]);
-        
+
         let (min_lon, min_lat, max_lon, max_lat) = polygon.bounds();
         assert!((min_lon - 106.7).abs() < 0.0001);
         assert!((max_lon - 107.0).abs() < 0.0001);

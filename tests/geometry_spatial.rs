@@ -2,7 +2,7 @@
 //!
 //! Tests Point, Polygon, Polyline types and spatial queries.
 
-use sekejap::{SekejapDB, Point, Polygon, Polyline, Geometry, WriteOptions};
+use sekejap::{Geometry, Point, Polygon, Polyline, SekejapDB, WriteOptions};
 use tempfile::TempDir;
 
 #[cfg(feature = "spatial")]
@@ -22,13 +22,17 @@ mod spatial_tests {
             Point::new(106.8, -6.2),
         ]);
 
-        let node_id = db.write_with_options("jakarta-zone", r#"{"title": "Jakarta Zone"}"#,
-            WriteOptions {
-                geometry: Some(Geometry::Polygon(polygon)),
-                publish_now: true,
-                ..Default::default()
-            }
-        ).unwrap();
+        let node_id = db
+            .write_with_options(
+                "jakarta-zone",
+                r#"{"title": "Jakarta Zone"}"#,
+                WriteOptions {
+                    geometry: Some(Geometry::Polygon(polygon)),
+                    publish_now: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         assert!(node_id > 0);
     }
@@ -44,13 +48,17 @@ mod spatial_tests {
             Point::new(106.9, -6.3),
         ]);
 
-        let node_id = db.write_with_options("route-001", r#"{"title": "Delivery Route"}"#,
-            WriteOptions {
-                geometry: Some(Geometry::Polyline(polyline)),
-                publish_now: true,
-                ..Default::default()
-            }
-        ).unwrap();
+        let node_id = db
+            .write_with_options(
+                "route-001",
+                r#"{"title": "Delivery Route"}"#,
+                WriteOptions {
+                    geometry: Some(Geometry::Polyline(polyline)),
+                    publish_now: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         assert!(node_id > 0);
     }
@@ -62,13 +70,17 @@ mod spatial_tests {
 
         let point = Point::new(106.8456, -6.2088);
 
-        let node_id = db.write_with_options("location-001", r#"{"title": "Jakarta Landmark"}"#,
-            WriteOptions {
-                geometry: Some(Geometry::Point(point)),
-                publish_now: true,
-                ..Default::default()
-            }
-        ).unwrap();
+        let node_id = db
+            .write_with_options(
+                "location-001",
+                r#"{"title": "Jakarta Landmark"}"#,
+                WriteOptions {
+                    geometry: Some(Geometry::Point(point)),
+                    publish_now: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         assert!(node_id > 0);
     }
@@ -89,15 +101,16 @@ mod spatial_tests {
 
     #[test]
     fn test_polyline_length() {
-        // 3-4-5 right triangle = 12 total length
+        // Rectangle path: (0,0)->(3,0)=3, (3,0)->(3,4)=4, (3,4)->(0,4)=3, (0,4)->(0,0)=4. Total = 14
         let polyline = Polyline::new(vec![
             Point::new(0.0, 0.0),
             Point::new(3.0, 0.0),
             Point::new(3.0, 4.0),
             Point::new(0.0, 4.0),
+            Point::new(0.0, 0.0),
         ]);
 
-        assert!((polyline.length() - 12.0).abs() < 1e-6);
+        assert!((polyline.length() - 14.0).abs() < 1e-6);
     }
 
     #[test]
@@ -139,10 +152,7 @@ mod spatial_tests {
         ]);
 
         // Polyline crosses the polygon
-        let crossing = Polyline::new(vec![
-            Point::new(-5.0, 5.0),
-            Point::new(15.0, 5.0),
-        ]);
+        let crossing = Polyline::new(vec![Point::new(-5.0, 5.0), Point::new(15.0, 5.0)]);
 
         assert!(sekejap::polyline_intersects_polygon(&crossing, &polygon));
     }
@@ -158,10 +168,7 @@ mod spatial_tests {
         ]);
 
         // Polyline is completely outside
-        let outside = Polyline::new(vec![
-            Point::new(20.0, 20.0),
-            Point::new(30.0, 30.0),
-        ]);
+        let outside = Polyline::new(vec![Point::new(20.0, 20.0), Point::new(30.0, 30.0)]);
 
         assert!(!sekejap::polyline_intersects_polygon(&outside, &polygon));
     }
@@ -251,7 +258,9 @@ mod spatial_tests {
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
 
         // Zone polygon
-        db.write_with_options("zone-1", r#"{"title": "Delivery Zone"}"#,
+        db.write_with_options(
+            "zone-1",
+            r#"{"title": "Delivery Zone"}"#,
             WriteOptions {
                 geometry: Some(Geometry::Polygon(Polygon::new(vec![
                     Point::new(106.8, -6.2),
@@ -262,11 +271,14 @@ mod spatial_tests {
                 ]))),
                 publish_now: true,
                 ..Default::default()
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
 
         // Route polyline
-        db.write_with_options("route-1", r#"{"title": "Delivery Route"}"#,
+        db.write_with_options(
+            "route-1",
+            r#"{"title": "Delivery Route"}"#,
             WriteOptions {
                 geometry: Some(Geometry::Polyline(Polyline::new(vec![
                     Point::new(106.75, -6.15),
@@ -275,17 +287,21 @@ mod spatial_tests {
                 ]))),
                 publish_now: true,
                 ..Default::default()
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
 
         // Checkpoint point
-        db.write_with_options("checkpoint-1", r#"{"title": "Checkpoint"}"#,
+        db.write_with_options(
+            "checkpoint-1",
+            r#"{"title": "Checkpoint"}"#,
             WriteOptions {
                 geometry: Some(Geometry::Point(Point::new(106.85, -6.25))),
                 publish_now: true,
                 ..Default::default()
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
 
         assert_eq!(db.storage().len(), 3);
     }
@@ -301,8 +317,8 @@ fn test_point_creation() {
 #[test]
 fn test_point_from_lat_lon() {
     let point = Point::from_lat_lon(-6.2088, 106.8456);
-    assert_eq!(point.x, 106.8456);  // lon
-    assert_eq!(point.y, -6.2088);  // lat
+    assert_eq!(point.x, 106.8456); // lon
+    assert_eq!(point.y, -6.2088); // lat
 }
 
 #[test]

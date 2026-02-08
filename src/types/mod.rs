@@ -11,27 +11,35 @@
 //! - Props and Decay types
 //! - Schema types (CollectionSchema, etc.)
 
-pub mod node;
-pub mod edge;
 pub mod blob;
-pub mod payload;
-pub mod geometry;
 pub mod collection;
-pub mod vector;
-pub mod geo;
 pub mod decay;
+pub mod edge;
+pub mod geo;
+pub mod geometry;
+pub mod node;
+pub mod payload;
 pub mod schema;
+pub mod vector;
 
-pub use node::{NodeId, SlugHash, SpatialHash, Epoch, Coordinates, SpatialResult, NodeHeader, NodePayload, Tombstone, HeadPointer};
-pub use edge::{WeightedEdge, EdgeType, EdgePayload, Evidence};
 pub use blob::{BlobPtr, BlobStore};
+pub use collection::{Collection, CollectionId, EdgeRef, EntityId, parse_entity_id};
+pub use decay::{DecayFunction, Props, TemporalDecay};
+pub use edge::{EdgePayload, EdgeType, Evidence, WeightedEdge};
+pub use geo::{GeoFeature, GeoGeometry, GeoStore};
+pub use geometry::{
+    Geometry, Point, Polygon, Polyline, distance, point_in_polygon, polyline_intersects_polygon,
+};
+pub use node::{
+    Coordinates, Epoch, HeadPointer, NodeHeader, NodeId, NodePayload, SlugHash, SpatialHash,
+    SpatialResult, Tombstone,
+};
 pub use payload::{Payload, SerializablePayload};
-pub use geometry::{Point, Polygon, Polyline, Geometry, point_in_polygon, polyline_intersects_polygon, distance};
-pub use collection::{CollectionId, EntityId, EdgeRef, Collection, parse_entity_id};
+pub use schema::{
+    CollectionRegistry, CollectionSchema, GeoType, HnswParams, HotFields, QuantizationType,
+    SpatialSchema, VectorSchema,
+};
 pub use vector::{VectorChannel, VectorStore};
-pub use geo::{GeoGeometry, GeoFeature, GeoStore};
-pub use decay::{Props, TemporalDecay, DecayFunction};
-pub use schema::{CollectionSchema, HotFields, VectorSchema, SpatialSchema, GeoType, CollectionRegistry, HnswParams, QuantizationType};
 
 /// Write options for controlling write behavior
 #[derive(Debug, Clone)]
@@ -74,21 +82,17 @@ impl Default for WriteOptions {
 }
 
 /// Read options for controlling read behavior
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ReadOptions {
     /// If true, includes staged data from Tier 1 in read results
     /// If false, only reads validated data from Tier 2 (default)
     pub include_staged: bool,
 }
 
-
 /// Delete options for controlling delete behavior
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DeleteOptions {
     /// If true, excludes edges from deletion (keeps them for audit)
     /// If false, cascades delete to edges (default)
     pub exclude_edges: bool,
 }
-

@@ -3,8 +3,8 @@
 //! Defines all possible errors that can occur in the storage layer.
 //! Provides detailed error information for debugging and recovery.
 
-use thiserror::Error;
 use std::path::PathBuf;
+use thiserror::Error;
 
 /// Main storage error type
 #[derive(Debug, Error)]
@@ -62,21 +62,15 @@ pub enum StorageError {
 
     /// Compression/Decompression error
     #[error("Compression error: {message}")]
-    Compression {
-        message: String,
-    },
+    Compression { message: String },
 
     /// Database is locked by another process
     #[error("Database is locked")]
-    Locked {
-        path: PathBuf,
-    },
+    Locked { path: PathBuf },
 
     /// Database is in read-only mode but write was attempted
     #[error("Database is read-only")]
-    ReadOnly {
-        path: PathBuf,
-    },
+    ReadOnly { path: PathBuf },
 
     /// Invalid argument passed to storage method
     #[error("Invalid argument: {message}")]
@@ -87,16 +81,11 @@ pub enum StorageError {
 
     /// Timeout waiting for a resource
     #[error("Timeout: {message}")]
-    Timeout {
-        message: String,
-        duration_ms: u64,
-    },
+    Timeout { message: String, duration_ms: u64 },
 
     /// Custom error with message
     #[error("{message}")]
-    Custom {
-        message: String,
-    },
+    Custom { message: String },
 }
 
 impl StorageError {
@@ -223,8 +212,6 @@ impl From<redb::Error> for StorageError {
     fn from(source: redb::Error) -> Self {
         // Extract path and inner error from redb Io variant
         let path_str = format!("{:?}", source);
-        StorageError::Custom {
-            message: path_str,
-        }
+        StorageError::Custom { message: path_str }
     }
 }

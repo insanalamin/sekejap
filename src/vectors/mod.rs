@@ -29,7 +29,7 @@
 //! # Usage
 //!
 //! ```rust
-//! use hsdl_sekejap::SekejapDB;
+//! use sekejap::SekejapDB;
 //! use std::path::Path;
 //!
 //! # fn main() {
@@ -54,7 +54,13 @@ pub mod quantization;
 pub mod index;
 
 #[cfg(feature = "vector")]
-pub use quantization::{QuantizedVector, QuantizationType};
+pub mod hnsw;
+
+#[cfg(feature = "vector")]
+pub use quantization::{QuantizationType, QuantizedVector};
+
+#[cfg(feature = "vector")]
+pub use index::{IndexBuildPolicy, VectorIndex};
 
 /// Vector search result with similarity score
 #[derive(Debug, Clone, PartialEq)]
@@ -67,7 +73,10 @@ pub struct VectorSearchResult {
 #[cfg(feature = "vector")]
 impl VectorSearchResult {
     pub fn new(node_id: crate::types::node::NodeId, similarity: f32) -> Self {
-        Self { node_id, similarity }
+        Self {
+            node_id,
+            similarity,
+        }
     }
 }
 

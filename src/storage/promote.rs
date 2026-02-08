@@ -1,27 +1,27 @@
 //! Promotion from Ingestion Buffer (Tier 1) to Persistent Storage (Tier 2)
-//! 
+//!
 //! This module handles the promotion of nodes from the high-velocity
 //! ingestion buffer to the persistent serving layer.
 
-use crate::{NodeHeader, NodeId};
 use crate::storage::{IngestionBuffer, PersistentStorage};
+use crate::{NodeHeader, NodeId};
 
 /// Promote a single node from Ingestion Buffer to Persistent Storage
-/// 
+///
 /// This moves the node from the volatile in-memory buffer to the
 /// persistent redb-backed storage layer.
-/// 
+///
 /// # Arguments
 /// * `ingestion` - Mutable reference to Ingestion Buffer (Tier 1)
 /// * `persistent` - Reference to Persistent Storage (Tier 2)
 /// * `node_id` - Node ID to promote
-/// 
+///
 /// # Returns
 /// * `Option<NodeHeader>` - The promoted node if found, None otherwise
-/// 
+///
 /// # Example
 /// ```rust,no_run
-/// use hsdl_sekejap::storage::{promote_node, IngestionBuffer, PersistentStorage};
+/// use sekejap::storage::{promote_node, IngestionBuffer, PersistentStorage};
 /// # use std::error::Error;
 /// # fn main() -> Result<(), Box<dyn Error>> {
 /// let mut ingestion = IngestionBuffer::new("/tmp/ingestion")?;
@@ -36,31 +36,31 @@ pub fn promote_node(
 ) -> Option<NodeHeader> {
     // Get node from ingestion buffer
     let node = ingestion.get(node_id)?;
-    
+
     // Write to persistent storage (Tier 2)
     persistent.upsert(node.clone());
-    
+
     // Remove from ingestion buffer (successful promotion)
     ingestion.remove(node_id);
-    
+
     Some(node)
 }
 
 /// Promote multiple nodes from Ingestion Buffer to Persistent Storage
-/// 
+///
 /// Batch promotion for better performance. This function promotes
 /// all nodes currently in the ingestion buffer.
-/// 
+///
 /// # Arguments
 /// * `ingestion` - Mutable reference to Ingestion Buffer (Tier 1)
 /// * `persistent` - Reference to Persistent Storage (Tier 2)
-/// 
+///
 /// # Returns
 /// * `Vec<NodeHeader>` - All promoted nodes
-/// 
+///
 /// # Example
 /// ```rust,no_run
-/// use hsdl_sekejap::storage::{promote_all, IngestionBuffer, PersistentStorage};
+/// use sekejap::storage::{promote_all, IngestionBuffer, PersistentStorage};
 /// # use std::error::Error;
 /// # fn main() -> Result<(), Box<dyn Error>> {
 /// let mut ingestion = IngestionBuffer::new("/tmp/ingestion")?;
@@ -73,38 +73,35 @@ pub fn promote_all(
     persistent: &PersistentStorage,
 ) -> Vec<NodeHeader> {
     let mut promoted = Vec::new();
-    
+
     // Collect all nodes first (need IDs, not references)
-    let node_ids: Vec<NodeId> = ingestion.all()
-        .into_iter()
-        .map(|n| n.node_id)
-        .collect();
-    
+    let node_ids: Vec<NodeId> = ingestion.all().into_iter().map(|n| n.node_id).collect();
+
     // Promote each node
     for node_id in node_ids {
         if let Some(node) = promote_node(ingestion, persistent, node_id) {
             promoted.push(node);
         }
     }
-    
+
     promoted
 }
 
 /// Promote nodes matching a predicate function
-/// 
+///
 /// Selective promotion based on custom criteria.
-/// 
+///
 /// # Arguments
 /// * `ingestion` - Mutable reference to Ingestion Buffer (Tier 1)
 /// * `persistent` - Reference to Persistent Storage (Tier 2)
 /// * `predicate` - Function that returns true for nodes to promote
-/// 
+///
 /// # Returns
 /// * `Vec<NodeHeader>` - All promoted nodes
-/// 
+///
 /// # Example
 /// ```rust,no_run
-/// use hsdl_sekejap::storage::{promote_if, IngestionBuffer, PersistentStorage};
+/// use sekejap::storage::{promote_if, IngestionBuffer, PersistentStorage};
 /// # use std::error::Error;
 /// # fn main() -> Result<(), Box<dyn Error>> {
 /// let mut ingestion = IngestionBuffer::new("/tmp/ingestion")?;
@@ -121,21 +118,22 @@ where
     F: Fn(&NodeHeader) -> bool,
 {
     let mut promoted = Vec::new();
-    
+
     // Collect matching node IDs
-    let node_ids: Vec<NodeId> = ingestion.all()
+    let node_ids: Vec<NodeId> = ingestion
+        .all()
         .into_iter()
         .filter(|n| predicate(n))
         .map(|n| n.node_id)
         .collect();
-    
+
     // Promote each matching node
     for node_id in node_ids {
         if let Some(node) = promote_node(ingestion, persistent, node_id) {
             promoted.push(node);
         }
     }
-    
+
     promoted
 }
 
@@ -148,17 +146,11 @@ mod tests {
     #[test]
     fn test_promote_single_node() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let mut ingestion = IngestionBuffer::new(temp_dir.path()).unwrap();
         let persistent = PersistentStorage::new(temp_dir.path()).unwrap();
 
-        let node = NodeHeader::new(
-            123u128,
-            456,
-            789,
-            BlobPtr::new(0, 100, 200),
-            1700000000000,
-        );
+        let node = NodeHeader::new(123u128, 456, 789, BlobPtr::new(0, 100, 200), 1700000000000);
 
         // Write to ingestion buffer
         ingestion.upsert(node.clone());
@@ -178,7 +170,7 @@ mod tests {
     #[test]
     fn test_promote_all_nodes() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let mut ingestion = IngestionBuffer::new(temp_dir.path()).unwrap();
         let persistent = PersistentStorage::new(temp_dir.path()).unwrap();
 
@@ -204,7 +196,7 @@ mod tests {
     #[test]
     fn test_promote_if_predicate() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let mut ingestion = IngestionBuffer::new(temp_dir.path()).unwrap();
         let persistent = PersistentStorage::new(temp_dir.path()).unwrap();
 
@@ -235,7 +227,7 @@ mod tests {
     #[test]
     fn test_promote_nonexistent_node() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let mut ingestion = IngestionBuffer::new(temp_dir.path()).unwrap();
         let persistent = PersistentStorage::new(temp_dir.path()).unwrap();
 

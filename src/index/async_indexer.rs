@@ -11,21 +11,23 @@
 //!
 //! # Usage
 //!
-//! ```rust
+//! ```rust,no_run
 //! use std::sync::{Arc, Mutex};
-//! use hsdl_sekejap::index::AsyncIndexer;
-//! use hsdl_sekejap::storage::SingleStorage;
-//! use hsdl_sekejap::types::BlobStore;
+//! use sekejap::index::AsyncIndexer;
+//! use sekejap::storage::SingleStorage;
+//! use sekejap::types::BlobStore;
+//! use std::path::Path;
 //!
 //! // Create storage and blob store
-//! let storage = Arc::new(SingleStorage::new("./data").unwrap());
-//! let blob_store = Arc::new(BlobStore::new("./data/blobs").unwrap());
+//! let storage = Arc::new(SingleStorage::new(Path::new("./data")).unwrap());
+//! let blob_store = Arc::new(BlobStore::new(Path::new("./data/blobs").to_path_buf()).unwrap());
 //!
 //! // Create and start async indexer
 //! let mut indexer = AsyncIndexer::new(storage, blob_store);
 //! indexer.start();
 //!
 //! // Enqueue nodes for indexing (non-blocking)
+//! let node_id = 123456789;
 //! indexer.enqueue_add_vector(node_id);
 //!
 //! // Check indexing progress
@@ -36,9 +38,9 @@
 //! indexer.stop();
 //! ```
 
-use crate::types::node::NodeId;
 use crate::storage::SingleStorage;
 use crate::types::BlobStore;
+use crate::types::node::NodeId;
 use crossbeam::channel::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,7 +52,10 @@ pub enum IndexJob {
     /// Add a single node to vector index
     AddVector { node_id: NodeId, priority: u32 },
     /// Add multiple nodes to vector index (batch)
-    AddVectors { node_ids: Vec<NodeId>, priority: u32 },
+    AddVectors {
+        node_ids: Vec<NodeId>,
+        priority: u32,
+    },
     /// Rebuild entire index from storage
     RebuildAll,
     /// Clear and restart indexing
@@ -129,12 +134,28 @@ impl AsyncIndexer {
                             let start_time = std::time::Instant::now();
 
                             match j {
-                                IndexJob::AddVector { node_id, priority: _ } => {
-                                    Self::process_add_vector(&storage, &blob_store, node_id, &stats);
+                                IndexJob::AddVector {
+                                    node_id,
+                                    priority: _,
+                                } => {
+                                    Self::process_add_vector(
+                                        &storage,
+                                        &blob_store,
+                                        node_id,
+                                        &stats,
+                                    );
                                 }
-                                IndexJob::AddVectors { node_ids, priority: _ } => {
+                                IndexJob::AddVectors {
+                                    node_ids,
+                                    priority: _,
+                                } => {
                                     for node_id in node_ids {
-                                        Self::process_add_vector(&storage, &blob_store, node_id, &stats);
+                                        Self::process_add_vector(
+                                            &storage,
+                                            &blob_store,
+                                            node_id,
+                                            &stats,
+                                        );
                                     }
                                 }
                                 IndexJob::RebuildAll => {

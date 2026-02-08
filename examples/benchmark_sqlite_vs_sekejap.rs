@@ -2,12 +2,12 @@
 //! Compares insertion, queries (lookup, filter, traversal, count, aggregation, join)
 //! Dataset: Company hierarchy (1000+ nodes, 6 levels deep for traversal testing)
 
+use rand::Rng;
+use rand::prelude::SliceRandom;
+use rand::thread_rng;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
-use rand::thread_rng;
-use rand::Rng;
-use rand::prelude::SliceRandom;
 
 // Use local crate
 use sekejap::SekejapDB;
@@ -32,15 +32,16 @@ struct BenchmarkResult {
 
 // SQLite setup (embedded)
 mod sqlite_bridge {
-    use super::{fs, NodeData};
+    use super::{NodeData, fs};
     use rusqlite::{Connection, Result};
 
     pub fn create_db(path: &str) -> Result<Connection> {
         let _ = fs::remove_file(path);
         let conn = Connection::open(path)?;
-        
+
         // Create tables matching our hierarchy
-        conn.execute_batch(r#"
+        conn.execute_batch(
+            r#"
             CREATE TABLE nodes (
                 id TEXT PRIMARY KEY,
                 node_type TEXT,
@@ -59,7 +60,8 @@ mod sqlite_bridge {
                 name TEXT UNIQUE,
                 total_value INTEGER DEFAULT 0
             );
-        "#)?;
+        "#,
+        )?;
         Ok(conn)
     }
 
@@ -89,11 +91,9 @@ mod sqlite_bridge {
     }
 
     pub fn query_lookup(conn: &Connection, id: &str) -> Result<i64> {
-        let val: i64 = conn.query_row(
-            "SELECT value FROM nodes WHERE id = ?1",
-            [id],
-            |row| row.get(0),
-        )?;
+        let val: i64 = conn.query_row("SELECT value FROM nodes WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })?;
         Ok(val)
     }
 
@@ -130,11 +130,9 @@ mod sqlite_bridge {
     }
 
     pub fn query_aggregate_avg_value(conn: &Connection) -> Result<f64> {
-        let avg: f64 = conn.query_row(
-            "SELECT AVG(CAST(value AS REAL)) FROM nodes",
-            [],
-            |row| row.get(0),
-        )?;
+        let avg: f64 = conn.query_row("SELECT AVG(CAST(value AS REAL)) FROM nodes", [], |row| {
+            row.get(0)
+        })?;
         Ok(avg)
     }
 
@@ -148,9 +146,10 @@ mod sqlite_bridge {
             level4 AS (SELECT id FROM nodes WHERE parent_id IN (SELECT id FROM level3)),
             level5 AS (SELECT id FROM nodes WHERE parent_id IN (SELECT id FROM level4)),
             level6 AS (SELECT id FROM nodes WHERE parent_id IN (SELECT id FROM level5))
-            SELECT id FROM level6"
+            SELECT id FROM level6",
         )?;
-        let ids = stmt.query_map([company], |row| row.get(0))?
+        let ids = stmt
+            .query_map([company], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ids)
     }
@@ -160,9 +159,10 @@ mod sqlite_bridge {
             "SELECT c.name, c.total_value, COUNT(n.id) as node_count
              FROM companies c
              LEFT JOIN nodes n ON n.company = c.name
-             GROUP BY c.name"
+             GROUP BY c.name",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -172,15 +172,29 @@ fn generate_hierarchy_data() -> (Vec<NodeData>, Vec<String>) {
     let mut rng = thread_rng();
     let mut nodes = Vec::new();
     let mut companies = Vec::new();
-    
-    let node_types = ["company", "department", "team", "project", "task", "employee"];
-    let departments = ["Engineering", "Sales", "Marketing", "HR", "Finance", "Operations"];
-    
+
+    let node_types = [
+        "company",
+        "department",
+        "team",
+        "project",
+        "task",
+        "employee",
+    ];
+    let departments = [
+        "Engineering",
+        "Sales",
+        "Marketing",
+        "HR",
+        "Finance",
+        "Operations",
+    ];
+
     // Create ~50 companies, each with ~20 nodes across 6 levels
     for i in 0..50 {
         let company_name = format!("Company_{:03}", i);
         companies.push(company_name.clone());
-        
+
         // Level 0: Company (1 per company)
         let company_id = format!("c_{}_{}", i, 0);
         nodes.push(NodeData {
@@ -192,7 +206,7 @@ fn generate_hierarchy_data() -> (Vec<NodeData>, Vec<String>) {
             department: "HQ".to_string(),
             company: company_name.clone(),
         });
-        
+
         // Level 1: Departments (3-5 per company)
         let num_depts = rng.random_range(3..=5);
         for j in 0..num_depts {
@@ -207,7 +221,7 @@ fn generate_hierarchy_data() -> (Vec<NodeData>, Vec<String>) {
                 department: dept_name.to_string(),
                 company: company_name.clone(),
             });
-            
+
             // Level 2: Teams (2-4 per department)
             let num_teams = rng.random_range(2..=4);
             for k in 0..num_teams {
@@ -221,7 +235,7 @@ fn generate_hierarchy_data() -> (Vec<NodeData>, Vec<String>) {
                     department: dept_name.to_string(),
                     company: company_name.clone(),
                 });
-                
+
                 // Level 3: Projects (2-3 per team)
                 let num_projects = rng.random_range(2..=3);
                 for m in 0..num_projects {
@@ -235,7 +249,7 @@ fn generate_hierarchy_data() -> (Vec<NodeData>, Vec<String>) {
                         department: dept_name.to_string(),
                         company: company_name.clone(),
                     });
-                    
+
                     // Level 4: Tasks (2-4 per project)
                     let num_tasks = rng.random_range(2..=4);
                     for n in 0..num_tasks {
@@ -249,7 +263,7 @@ fn generate_hierarchy_data() -> (Vec<NodeData>, Vec<String>) {
                             department: dept_name.to_string(),
                             company: company_name.clone(),
                         });
-                        
+
                         // Level 5: Employees (1-2 per task)
                         let num_emps = rng.random_range(1..=2);
                         for p in 0..num_emps {
@@ -269,11 +283,11 @@ fn generate_hierarchy_data() -> (Vec<NodeData>, Vec<String>) {
             }
         }
     }
-    
+
     // Shuffle to test insert order independence
     let mut rng = thread_rng();
     nodes.shuffle(&mut rng);
-    
+
     (nodes, companies)
 }
 
@@ -281,41 +295,41 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
     let mut results = Vec::new();
     let db_path = "benchmark_sqlite.db";
     let conn = sqlite_bridge::create_db(db_path).expect("Failed to create SQLite DB");
-    
+
     // Insert companies
     let insert_start = Instant::now();
     for company in companies {
         sqlite_bridge::insert_company(&conn, company).expect("Failed to insert company");
     }
     let insert_companies_ms = insert_start.elapsed().as_secs_f64() * 1000.0;
-    
+
     // Insert nodes
     let insert_start = Instant::now();
     for node in nodes {
         sqlite_bridge::insert_node(&conn, node).expect("Failed to insert node");
     }
     let insert_nodes_ms = insert_start.elapsed().as_secs_f64() * 1000.0;
-    
+
     // Commit
     conn.execute("COMMIT", []).ok();
-    
+
     results.push(BenchmarkResult {
         name: "Insert Companies".to_string(),
         sqlite_ms: insert_companies_ms,
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     results.push(BenchmarkResult {
         name: "Insert Nodes".to_string(),
         sqlite_ms: insert_nodes_ms,
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     // Queries
     let mut rng = thread_rng();
-    
+
     // Point lookup
     let lookup_start = Instant::now();
     for _ in 0..100 {
@@ -329,7 +343,7 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     // Filter by type
     let filter_start = Instant::now();
     for _ in 0..50 {
@@ -343,7 +357,7 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     // Filter by department
     let filter_dept_start = Instant::now();
     for _ in 0..30 {
@@ -357,7 +371,7 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     // Count all
     let count_start = Instant::now();
     for _ in 0..100 {
@@ -370,7 +384,7 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     // 6-hop traversal
     let traversal_start = Instant::now();
     for _ in 0..10 {
@@ -384,7 +398,7 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     // Aggregation
     let agg_start = Instant::now();
     for _ in 0..50 {
@@ -398,7 +412,7 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     // Avg aggregation
     let avg_start = Instant::now();
     for _ in 0..50 {
@@ -411,7 +425,7 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     // Join
     let join_start = Instant::now();
     for _ in 0..10 {
@@ -424,7 +438,7 @@ fn run_sqlite_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchma
         sekejap_ms: 0.0,
         winner: "SQLite".to_string(),
     });
-    
+
     results
 }
 
@@ -432,13 +446,13 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
     let mut results = Vec::new();
     let db_path = "benchmark_sekejap_db";
     let _ = fs::remove_dir_all(db_path);
-    
+
     // Create SekejapDB
     let mut db = SekejapDB::new(Path::new(db_path)).expect("Failed to create Sekejap DB");
-    
+
     // Insert data as JSON for simplicity
     let mut rng = thread_rng();
-    
+
     // Insert companies
     let insert_start = Instant::now();
     for company in companies {
@@ -453,9 +467,10 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         let _ = db.write_json(&json.to_string()).ok();
     }
     let insert_companies_ms = insert_start.elapsed().as_secs_f64() * 1000.0;
-    
+
     // Insert nodes with edges
-    let mut parent_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut parent_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let insert_start = Instant::now();
     for node in nodes {
         let json = serde_json::json!({
@@ -467,11 +482,11 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
             "company": node.company
         });
         let _ = db.write_json(&json.to_string()).ok();
-        
+
         // Store mapping
         let node_slug = format!("node/{}", node.id);
         parent_map.insert(node.id.clone(), node_slug.clone());
-        
+
         // Add edge to parent if exists
         if let Some(ref parent_id) = node.parent_id {
             if let Some(parent_slug) = parent_map.get(parent_id) {
@@ -486,23 +501,23 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         }
     }
     let insert_nodes_ms = insert_start.elapsed().as_secs_f64() * 1000.0;
-    
+
     results.push(BenchmarkResult {
         name: "Insert Companies".to_string(),
         sqlite_ms: 0.0,
         sekejap_ms: insert_companies_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     results.push(BenchmarkResult {
         name: "Insert Nodes".to_string(),
         sqlite_ms: 0.0,
         sekejap_ms: insert_nodes_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     let mut rng = thread_rng();
-    
+
     // Point lookup (immutable)
     let lookup_start = Instant::now();
     for _ in 0..100 {
@@ -517,15 +532,14 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         sekejap_ms: lookup_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     // Filter by type (using query API - immutable)
     let filter_start = Instant::now();
     for _ in 0..50 {
         let node_type = ["employee", "project", "team"][rng.random_range(0..3)];
-        let _ = db.graph().backward_bfs(
-            &sekejap::EntityId::new("nodes", node_type),
-            1, 0.0, None
-        );
+        let _ = db
+            .graph()
+            .backward_bfs(&sekejap::EntityId::new("nodes".to_string(), node_type.to_string()), 1, 0.0, None, None);
     }
     let filter_type_ms = filter_start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
@@ -534,11 +548,11 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         sekejap_ms: filter_type_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     // Filter by department (simplified - traverse all)
     let filter_dept_start = Instant::now();
     for _ in 0..30 {
-        let _ = db.traverse("Company_000", 1, 0.0);
+        let _ = db.traverse("Company_000", 1, 0.0, None);
     }
     let filter_dept_ms = filter_dept_start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
@@ -547,11 +561,11 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         sekejap_ms: filter_dept_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     // Count all (via traversal)
     let count_start = Instant::now();
     for _ in 0..100 {
-        let _ = db.traverse("Company_000", 6, 0.0);
+        let _ = db.traverse("Company_000", 6, 0.0, None);
     }
     let count_ms = count_start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
@@ -560,12 +574,12 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         sekejap_ms: count_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     // 6-hop traversal
     let traversal_start = Instant::now();
     for _ in 0..10 {
         let company = format!("Company_{:03}", rng.random_range(0..50));
-        let _ = db.traverse(&company, 6, 0.0);
+        let _ = db.traverse(&company, 6, 0.0, None);
     }
     let traversal_ms = traversal_start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
@@ -574,12 +588,12 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         sekejap_ms: traversal_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     // Aggregation (via traversal)
     let agg_start = Instant::now();
     for _ in 0..50 {
         let company = format!("Company_{:03}", rng.random_range(0..50));
-        let _ = db.traverse(&company, 6, 0.0);
+        let _ = db.traverse(&company, 6, 0.0, None);
     }
     let agg_ms = agg_start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
@@ -588,12 +602,12 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         sekejap_ms: agg_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     // Avg aggregation (via traversal)
     let avg_start = Instant::now();
     for _ in 0..50 {
         let company = format!("Company_{:03}", rng.random_range(0..50));
-        let _ = db.traverse(&company, 6, 0.0);
+        let _ = db.traverse(&company, 6, 0.0, None);
     }
     let avg_ms = avg_start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
@@ -602,13 +616,13 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         sekejap_ms: avg_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     // Join ( Sekejap - cross-reference via traversal)
     let join_start = Instant::now();
     for _ in 0..10 {
         for i in 0..10 {
             let company = format!("Company_{:03}", i);
-            let _ = db.traverse(&company, 6, 0.0);
+            let _ = db.traverse(&company, 6, 0.0, None);
         }
     }
     let join_ms = join_start.elapsed().as_secs_f64() * 1000.0;
@@ -618,7 +632,7 @@ fn run_sekejap_benchmark(nodes: &[NodeData], companies: &[String]) -> Vec<Benchm
         sekejap_ms: join_ms,
         winner: "Sekejap".to_string(),
     });
-    
+
     results
 }
 
@@ -627,44 +641,57 @@ fn main() {
     println!("  SQLite vs SekejapDB Benchmark");
     println!("  1000+ nodes, 6-level hierarchy");
     println!("========================================\n");
-    
+
     // Generate data
     println!("Generating company hierarchy data...");
     let (nodes, companies) = generate_hierarchy_data();
-    println!("  Generated {} nodes across {} companies", nodes.len(), companies.len());
-    
+    println!(
+        "  Generated {} nodes across {} companies",
+        nodes.len(),
+        companies.len()
+    );
+
     // Check parent chain depth
     let mut max_depth = 0;
     let mut current = &nodes[0];
     let mut depth = 0;
     while let Some(ref parent) = current.parent_id {
         depth += 1;
-        if depth > max_depth { max_depth = depth; }
-        if depth > 10 { break; }
+        if depth > max_depth {
+            max_depth = depth;
+        }
+        if depth > 10 {
+            break;
+        }
         current = nodes.iter().find(|n| &n.id == parent).unwrap_or(current);
     }
     println!("  Max traversal depth: {} hops\n", max_depth.min(10));
-    
+
     // Run SQLite benchmark
     println!("Running SQLite benchmark...");
     let sqlite_results = run_sqlite_benchmark(&nodes, &companies);
-    
+
     // Run Sekejap benchmark
     println!("Running SekejapDB benchmark...");
     let sekejap_results = run_sekejap_benchmark(&nodes, &companies);
-    
+
     // Merge results
     let mut all_results: Vec<BenchmarkResult> = Vec::new();
     for (sqlite_res, sekejap_res) in sqlite_results.into_iter().zip(sekejap_results.into_iter()) {
         let sqlite_time = sqlite_res.sqlite_ms;
         let sekejap_time = sekejap_res.sekejap_ms;
-        let winner = if sqlite_time < sekejap_time { "SQLite" } else { "Sekejap" }.to_string();
+        let winner = if sqlite_time < sekejap_time {
+            "SQLite"
+        } else {
+            "Sekejap"
+        }
+        .to_string();
         let speedup = if sqlite_time < sekejap_time {
             sekejap_time / sqlite_time.max(0.001)
         } else {
             sqlite_time / sekejap_time.max(0.001)
         };
-        
+
         all_results.push(BenchmarkResult {
             name: sqlite_res.name.clone(),
             sqlite_ms: sqlite_time,
@@ -672,44 +699,68 @@ fn main() {
             winner: format!("{} ({:.1}x)", winner, speedup),
         });
     }
-    
+
     // Print results
     println!("\n========================================");
     println!("  BENCHMARK RESULTS");
     println!("========================================\n");
-    println!(" {:<30} | {:>12} | {:>12} | {:>15}", 
-             "Operation", "SQLite (ms)", "Sekejap (ms)", "Winner");
-    println!(" {}-+-{}-+-{}-+-{}-", 
-             "-".repeat(30), "-".repeat(12), "-".repeat(12), "-".repeat(15));
-    
+    println!(
+        " {:<30} | {:>12} | {:>12} | {:>15}",
+        "Operation", "SQLite (ms)", "Sekejap (ms)", "Winner"
+    );
+    println!(
+        " {}-+-{}-+-{}-+-{}-",
+        "-".repeat(30),
+        "-".repeat(12),
+        "-".repeat(12),
+        "-".repeat(15)
+    );
+
     for result in &all_results {
-        println!(" {:<30} | {:>12.2} | {:>12.2} | {:>15}", 
-                 result.name, result.sqlite_ms, result.sekejap_ms, result.winner);
+        println!(
+            " {:<30} | {:>12.2} | {:>12.2} | {:>15}",
+            result.name, result.sqlite_ms, result.sekejap_ms, result.winner
+        );
     }
-    
+
     // Summary
-    let sqlite_wins = all_results.iter().filter(|r| r.winner.starts_with("SQLite")).count();
-    let sekejap_wins = all_results.iter().filter(|r| r.winner.starts_with("Sekejap")).count();
-    
+    let sqlite_wins = all_results
+        .iter()
+        .filter(|r| r.winner.starts_with("SQLite"))
+        .count();
+    let sekejap_wins = all_results
+        .iter()
+        .filter(|r| r.winner.starts_with("Sekejap"))
+        .count();
+
     println!("\n========================================");
     println!("  SUMMARY");
     println!("========================================");
     println!("  SQLite wins:   {}", sqlite_wins);
     println!("  Sekejap wins:  {}", sekejap_wins);
     println!("  Total tests:   {}\n", all_results.len());
-    
+
     // File sizes
-    let sqlite_size = fs::metadata("benchmark_sqlite.db").map(|m| m.len()).unwrap_or(0);
-    let sekejap_size = fs::metadata("benchmark_sekejap_db").map(|m| m.len()).unwrap_or(0);
-    
+    let sqlite_size = fs::metadata("benchmark_sqlite.db")
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let sekejap_size = fs::metadata("benchmark_sekejap_db")
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     println!("  SQLite DB size:  {}", format_bytes(sqlite_size));
     println!("  Sekejap DB size: {}", format_bytes(sekejap_size));
     println!("\n");
 }
 
 fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 { format!("{} B", bytes) }
-    else if bytes < 1024 * 1024 { format!("{:.1} KB", bytes as f64 / 1024.0) }
-    else if bytes < 1024 * 1024 * 1024 { format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)) }
-    else { format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0)) }
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
 }

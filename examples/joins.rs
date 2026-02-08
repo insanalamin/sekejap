@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// INNER JOIN cuisines c ON c.id = e.target
 /// WHERE e._type = 'related'
 /// ```
-/// 
+///
 /// Sekejap implementation pattern:
 /// ```rust
 /// // Traverse from restaurants to find cuisine edges
@@ -89,7 +89,7 @@ fn inner_join() -> Result<(), Box<dyn std::error::Error>> {
 /// ```
 fn left_join() -> Result<(), Box<dyn std::error::Error>> {
     println!("Left Join: Restaurants with their locations (all restaurants, NULL if no match):");
-    
+
     println!("  SQL: SELECT r.title, l.title FROM restaurants r");
     println!("       LEFT JOIN edges e ON e.source = r.id");
     println!("       LEFT JOIN locations l ON l.id = e.target");
@@ -125,7 +125,7 @@ fn left_join() -> Result<(), Box<dyn std::error::Error>> {
 /// ```
 fn multi_way_join() -> Result<(), Box<dyn std::error::Error>> {
     println!("Multi-Way Join: Restaurants with cuisine AND location:");
-    
+
     println!("  SQL: SELECT r.title, c.title, l.title");
     println!("       FROM restaurants r");
     println!("       INNER JOIN cuisines c ON ... (related edge)");
@@ -158,7 +158,7 @@ fn multi_way_join() -> Result<(), Box<dyn std::error::Error>> {
 /// ```
 fn join_with_filter() -> Result<(), Box<dyn std::error::Error>> {
     println!("Join with Filter: Italian restaurants in CBD:");
-    
+
     println!("  SQL: SELECT r.title, c.title, l.title");
     println!("       FROM restaurants r");
     println!("       INNER JOIN cuisines c ON ...");
@@ -182,11 +182,26 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
 
     // Create restaurants
     let restaurants = vec![
-        ("luigis-pizza", r#"{"title": "Luigi's Pizza", "type": "restaurant"}"#),
-        ("mamas-pasta", r#"{"title": "Mama's Pasta", "type": "restaurant"}"#),
-        ("bella-cucina", r#"{"title": "Bella Cucina", "type": "restaurant"}"#),
-        ("napoli-classic", r#"{"title": "Napoli Classic", "type": "restaurant"}"#),
-        ("sushi-yama", r#"{"title": "Sushi Yama", "type": "restaurant"}"#),
+        (
+            "luigis-pizza",
+            r#"{"title": "Luigi's Pizza", "type": "restaurant"}"#,
+        ),
+        (
+            "mamas-pasta",
+            r#"{"title": "Mama's Pasta", "type": "restaurant"}"#,
+        ),
+        (
+            "bella-cucina",
+            r#"{"title": "Bella Cucina", "type": "restaurant"}"#,
+        ),
+        (
+            "napoli-classic",
+            r#"{"title": "Napoli Classic", "type": "restaurant"}"#,
+        ),
+        (
+            "sushi-yama",
+            r#"{"title": "Sushi Yama", "type": "restaurant"}"#,
+        ),
         ("le-petit", r#"{"title": "Le Petit", "type": "restaurant"}"#),
     ];
 
@@ -208,7 +223,10 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
     // Create locations
     let locations = vec![
         ("cbd", r#"{"title": "Melbourne CBD", "type": "location"}"#),
-        ("south-yarra", r#"{"title": "South Yarra", "type": "location"}"#),
+        (
+            "south-yarra",
+            r#"{"title": "South Yarra", "type": "location"}"#,
+        ),
         ("st-kilda", r#"{"title": "St Kilda", "type": "location"}"#),
     ];
 
@@ -227,7 +245,12 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
     // Connect restaurants to locations (located_in edge)
     db.add_edge("luigis-pizza", "cbd", 0.8, "located_in".to_string())?;
     db.add_edge("mamas-pasta", "south-yarra", 0.85, "located_in".to_string())?;
-    db.add_edge("bella-cucina", "south-yarra", 0.82, "located_in".to_string())?;
+    db.add_edge(
+        "bella-cucina",
+        "south-yarra",
+        0.82,
+        "located_in".to_string(),
+    )?;
     db.add_edge("napoli-classic", "cbd", 0.88, "located_in".to_string())?;
     db.add_edge("le-petit", "st-kilda", 0.86, "located_in".to_string())?;
     db.add_edge("sushi-yama", "cbd", 0.87, "located_in".to_string())?;

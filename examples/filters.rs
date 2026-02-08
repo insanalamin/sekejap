@@ -62,11 +62,13 @@ fn simple_filter(db: &SekejapDB) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// SQL equivalent:
 /// ```sql
-/// SELECT * FROM restaurants 
+/// SELECT * FROM restaurants
 /// WHERE cuisine = 'Italian' AND rating >= 4.5
 /// ```
 fn compound_filter_and(db: &SekejapDB) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Finding Italian high-rated restaurants (WHERE cuisine = 'Italian' AND rating >= 4.5):");
+    println!(
+        "Finding Italian high-rated restaurants (WHERE cuisine = 'Italian' AND rating >= 4.5):"
+    );
     println!("  Filter: cuisine = 'Italian' AND rating >= 4.5");
     println!("  Found 2 Italian high-rated restaurants");
 
@@ -77,7 +79,7 @@ fn compound_filter_and(db: &SekejapDB) -> Result<(), Box<dyn std::error::Error>>
 ///
 /// SQL equivalent:
 /// ```sql
-/// SELECT * FROM restaurants 
+/// SELECT * FROM restaurants
 /// WHERE cuisine = 'Italian' OR location = 'CBD'
 /// ```
 fn compound_filter_or(db: &SekejapDB) -> Result<(), Box<dyn std::error::Error>> {
@@ -150,11 +152,26 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
 
     // Create restaurants
     let restaurants = vec![
-        ("luigis-pizza", r#"{"title": "Luigi's Pizza", "type": "restaurant"}"#),
-        ("mamas-pasta", r#"{"title": "Mama's Pasta", "type": "restaurant"}"#),
-        ("bella-cucina", r#"{"title": "Bella Cucina", "type": "restaurant"}"#),
-        ("napoli-classic", r#"{"title": "Napoli Classic", "type": "restaurant"}"#),
-        ("sushi-yama", r#"{"title": "Sushi Yama", "type": "restaurant"}"#),
+        (
+            "luigis-pizza",
+            r#"{"title": "Luigi's Pizza", "type": "restaurant"}"#,
+        ),
+        (
+            "mamas-pasta",
+            r#"{"title": "Mama's Pasta", "type": "restaurant"}"#,
+        ),
+        (
+            "bella-cucina",
+            r#"{"title": "Bella Cucina", "type": "restaurant"}"#,
+        ),
+        (
+            "napoli-classic",
+            r#"{"title": "Napoli Classic", "type": "restaurant"}"#,
+        ),
+        (
+            "sushi-yama",
+            r#"{"title": "Sushi Yama", "type": "restaurant"}"#,
+        ),
         ("le-petit", r#"{"title": "Le Petit", "type": "restaurant"}"#),
     ];
 
@@ -184,7 +201,10 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
     // Create locations
     let locations = vec![
         ("cbd", r#"{"title": "Melbourne CBD", "type": "location"}"#),
-        ("south-yarra", r#"{"title": "South Yarra", "type": "location"}"#),
+        (
+            "south-yarra",
+            r#"{"title": "South Yarra", "type": "location"}"#,
+        ),
         ("st-kilda", r#"{"title": "St Kilda", "type": "location"}"#),
     ];
 
@@ -206,17 +226,39 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
 
     db.add_edge("luigis-pizza", "uber-eats", 0.9, "available_on".to_string())?;
     db.add_edge("mamas-pasta", "doordash", 0.85, "available_on".to_string())?;
-    db.add_edge("bella-cucina", "uber-eats", 0.88, "available_on".to_string())?;
-    db.add_edge("napoli-classic", "uber-eats", 0.95, "available_on".to_string())?;
+    db.add_edge(
+        "bella-cucina",
+        "uber-eats",
+        0.88,
+        "available_on".to_string(),
+    )?;
+    db.add_edge(
+        "napoli-classic",
+        "uber-eats",
+        0.95,
+        "available_on".to_string(),
+    )?;
     db.add_edge("sushi-yama", "doordash", 0.92, "available_on".to_string())?;
     db.add_edge("le-petit", "uber-eats", 0.89, "available_on".to_string())?;
 
     // Create crimes
     let crimes = vec![
-        ("theft-bicycle", r#"{"title": "Bicycle Theft", "type": "crime"}"#),
-        ("theft-motorcycle", r#"{"title": "Motorcycle Theft", "type": "crime"}"#),
-        ("theft-bag", r#"{"title": "Bag Snatching", "type": "crime"}"#),
-        ("theft-phone", r#"{"title": "Phone Theft", "type": "crime"}"#),
+        (
+            "theft-bicycle",
+            r#"{"title": "Bicycle Theft", "type": "crime"}"#,
+        ),
+        (
+            "theft-motorcycle",
+            r#"{"title": "Motorcycle Theft", "type": "crime"}"#,
+        ),
+        (
+            "theft-bag",
+            r#"{"title": "Bag Snatching", "type": "crime"}"#,
+        ),
+        (
+            "theft-phone",
+            r#"{"title": "Phone Theft", "type": "crime"}"#,
+        ),
         ("vandalism", r#"{"title": "Vandalism", "type": "crime"}"#),
     ];
 
@@ -226,7 +268,10 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
 
     // Create causes
     db.write("poverty", r#"{"title": "Poverty", "type": "cause"}"#)?;
-    db.write("unemployment", r#"{"title": "Unemployment", "type": "cause"}"#)?;
+    db.write(
+        "unemployment",
+        r#"{"title": "Unemployment", "type": "cause"}"#,
+    )?;
 
     // Connect causes to crimes
     db.add_edge("poverty", "theft-bicycle", 0.7, "causal".to_string())?;

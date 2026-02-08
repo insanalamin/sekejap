@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```rust
-//! use hsdl_sekejap::types::{EntityId, CollectionId, parse_entity_id, Collection, CollectionSchema};
+//! use sekejap::types::{EntityId, CollectionId, parse_entity_id, Collection, CollectionSchema};
 //!
 //! let entity_id = EntityId::new("news", "flood-in-gedebage-2026");
 //! assert_eq!(entity_id.as_str(), "news/flood-in-gedebage-2026");
@@ -16,7 +16,7 @@
 //! assert_eq!(entity_id.key(), "flood-in-gedebage-2026");
 //!
 //! // Create collection with schema
-//! let mut collection = Collection::new("news".to_string());
+//! let mut collection = Collection::new(CollectionId("news".to_string()));
 //! collection.set_schema(CollectionSchema::new());
 //! ```
 
@@ -99,7 +99,8 @@ impl EntityId {
     /// FIXED: Now correctly returns full format
     pub fn as_str(&self) -> &str {
         // Lazy initialization of cached string
-        self.cached_string.get_or_init(|| format!("{}/{}", self.collection, self.key))
+        self.cached_string
+            .get_or_init(|| format!("{}/{}", self.collection, self.key))
     }
 
     /// Get the collection component
@@ -251,7 +252,7 @@ impl TryFrom<String> for EdgeRef {
 /// # Example
 ///
 /// ```rust
-/// use hsdl_sekejap::types::{Collection, CollectionId, CollectionSchema, HotFields};
+/// use sekejap::types::{Collection, CollectionId, CollectionSchema, HotFields};
 ///
 /// let mut collection = Collection::new(CollectionId::new("news"));
 /// collection.set_schema(CollectionSchema::new());
@@ -260,19 +261,19 @@ impl TryFrom<String> for EdgeRef {
 pub struct Collection {
     /// Collection identifier
     pub id: CollectionId,
-    
+
     /// Optional schema definition (None = flex mode)
     #[serde(default)]
     pub schema: Option<super::schema::CollectionSchema>,
-    
+
     /// Collection metadata
     #[serde(default)]
     pub metadata: super::Props,
-    
+
     /// Created timestamp
     #[serde(default)]
     pub created_at: u64,
-    
+
     /// Last modified timestamp
     #[serde(default)]
     pub updated_at: u64,
@@ -285,7 +286,7 @@ impl Collection {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         Self {
             id,
             schema: None,
@@ -294,7 +295,7 @@ impl Collection {
             updated_at: now,
         }
     }
-    
+
     /// Set the collection schema
     pub fn set_schema(&mut self, schema: super::schema::CollectionSchema) {
         self.schema = Some(schema);
@@ -303,7 +304,7 @@ impl Collection {
             .unwrap()
             .as_millis() as u64;
     }
-    
+
     /// Clear the schema (revert to flex mode)
     pub fn clear_schema(&mut self) {
         self.schema = None;
@@ -312,42 +313,42 @@ impl Collection {
             .unwrap()
             .as_millis() as u64;
     }
-    
+
     /// Get collection ID
     pub fn id(&self) -> &CollectionId {
         &self.id
     }
-    
+
     /// Get collection name
     pub fn name(&self) -> &str {
         self.id.as_str()
     }
-    
+
     /// Check if schema is defined
     pub fn has_schema(&self) -> bool {
         self.schema.is_some()
     }
-    
+
     /// Get reference to schema
     pub fn schema(&self) -> Option<&super::schema::CollectionSchema> {
         self.schema.as_ref()
     }
-    
+
     /// Get mutable reference to schema
     pub fn schema_mut(&mut self) -> Option<&mut super::schema::CollectionSchema> {
         self.schema.as_mut()
     }
-    
+
     /// Check if this collection uses flex mode (no schema)
     pub fn is_flex_mode(&self) -> bool {
         self.schema.is_none()
     }
-    
+
     /// Get metadata
     pub fn metadata(&self) -> &super::Props {
         &self.metadata
     }
-    
+
     /// Get mutable metadata
     pub fn metadata_mut(&mut self) -> &mut super::Props {
         &mut self.metadata
@@ -396,7 +397,7 @@ mod tests {
         let id = parse_entity_id("invalid");
         assert!(id.is_none());
     }
-    
+
     #[test]
     fn test_collection_creation() {
         let collection = Collection::new(CollectionId::new("news"));
@@ -404,13 +405,13 @@ mod tests {
         assert!(collection.is_flex_mode());
         assert!(!collection.has_schema());
     }
-    
+
     #[test]
     fn test_collection_with_schema() {
         let mut collection = Collection::new(CollectionId::new("news"));
         let schema = CollectionSchema::new();
         collection.set_schema(schema);
-        
+
         assert!(collection.has_schema());
         assert!(!collection.is_flex_mode());
     }

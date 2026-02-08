@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
 
 /// Pointer to a blob in BlobStore
 /// Uses file_id, offset, and length for efficient storage and retrieval
@@ -32,7 +32,7 @@ pub struct BlobStore {
 impl BlobStore {
     pub fn new(base_dir: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
-        
+
         let file_id = 0;
         let path = base_dir.join(format!("blob_{}.dat", file_id));
         let current_file = std::fs::OpenOptions::new()
@@ -40,7 +40,7 @@ impl BlobStore {
             .write(true)
             .read(true)
             .open(&path)?;
-        
+
         Ok(Self {
             base_dir,
             current_file_id: file_id,
@@ -52,11 +52,11 @@ impl BlobStore {
     /// Write bytes to blob store and return pointer
     pub fn write(&mut self, data: &[u8]) -> std::io::Result<BlobPtr> {
         let ptr = BlobPtr::new(self.current_file_id, self.current_offset, data.len() as u64);
-        
+
         use std::io::Write;
         self.current_file.write_all(data)?;
         self.current_file.flush()?;
-        
+
         self.current_offset += data.len() as u64;
         Ok(ptr)
     }
@@ -65,13 +65,13 @@ impl BlobStore {
     pub fn read(&self, ptr: BlobPtr) -> std::io::Result<Vec<u8>> {
         let path = self.base_dir.join(format!("blob_{}.dat", ptr.file_id));
         let mut file = std::fs::File::open(&path)?;
-        
-        use std::io::{Seek, Read};
+
+        use std::io::{Read, Seek};
         file.seek(std::io::SeekFrom::Start(ptr.offset))?;
-        
+
         let mut buffer = vec![0u8; ptr.length as usize];
         file.read_exact(&mut buffer)?;
-        
+
         Ok(buffer)
     }
 }
@@ -85,10 +85,10 @@ mod tests {
     fn test_blob_write_read() {
         let temp_dir = TempDir::new().unwrap();
         let mut store = BlobStore::new(temp_dir.path().to_path_buf()).unwrap();
-        
+
         let data = b"Hello, Sekejap-DB!";
         let ptr = store.write(data).unwrap();
-        
+
         let read_data = store.read(ptr).unwrap();
         assert_eq!(data.to_vec(), read_data);
     }
@@ -97,16 +97,16 @@ mod tests {
     fn test_multiple_writes() {
         let temp_dir = TempDir::new().unwrap();
         let mut store = BlobStore::new(temp_dir.path().to_path_buf()).unwrap();
-        
+
         let data1 = vec![1u8, 2, 3];
         let data2 = vec![4u8, 5, 6];
-        
+
         let ptr1 = store.write(&data1).unwrap();
         let ptr2 = store.write(&data2).unwrap();
-        
+
         let read1 = store.read(ptr1).unwrap();
         let read2 = store.read(ptr2).unwrap();
-        
+
         assert_eq!(data1, read1);
         assert_eq!(data2, read2);
     }

@@ -124,12 +124,30 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
 
     // Create restaurants
     let restaurants = vec![
-        ("luigis-pizza", r#"{"title": "Luigi's Pizza", "type": "restaurant", "rating": 4.5}"#),
-        ("mamas-pasta", r#"{"title": "Mama's Pasta", "type": "restaurant", "rating": 3.8}"#),
-        ("bella-cucina", r#"{"title": "Bella Cucina", "type": "restaurant", "rating": 4.2}"#),
-        ("napoli-classic", r#"{"title": "Napoli Classic", "type": "restaurant", "rating": 4.8}"#),
-        ("sushi-yama", r#"{"title": "Sushi Yama", "type": "restaurant", "rating": 4.6}"#),
-        ("le-petit", r#"{"title": "Le Petit", "type": "restaurant", "rating": 4.1}"#),
+        (
+            "luigis-pizza",
+            r#"{"title": "Luigi's Pizza", "type": "restaurant", "rating": 4.5}"#,
+        ),
+        (
+            "mamas-pasta",
+            r#"{"title": "Mama's Pasta", "type": "restaurant", "rating": 3.8}"#,
+        ),
+        (
+            "bella-cucina",
+            r#"{"title": "Bella Cucina", "type": "restaurant", "rating": 4.2}"#,
+        ),
+        (
+            "napoli-classic",
+            r#"{"title": "Napoli Classic", "type": "restaurant", "rating": 4.8}"#,
+        ),
+        (
+            "sushi-yama",
+            r#"{"title": "Sushi Yama", "type": "restaurant", "rating": 4.6}"#,
+        ),
+        (
+            "le-petit",
+            r#"{"title": "Le Petit", "type": "restaurant", "rating": 4.1}"#,
+        ),
     ];
 
     for (slug, data) in &restaurants {
@@ -158,7 +176,10 @@ fn setup_sample_data(db: &mut SekejapDB) -> Result<(), Box<dyn std::error::Error
     // Create locations
     let locations = vec![
         ("cbd", r#"{"title": "Melbourne CBD", "type": "location"}"#),
-        ("south-yarra", r#"{"title": "South Yarra", "type": "location"}"#),
+        (
+            "south-yarra",
+            r#"{"title": "South Yarra", "type": "location"}"#,
+        ),
         ("st-kilda", r#"{"title": "St Kilda", "type": "location"}"#),
     ];
 

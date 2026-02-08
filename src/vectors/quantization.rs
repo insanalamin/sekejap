@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```rust
-//! use hsdl_sekejap::vectors::quantization::{quantize, dequantize, QuantizationType};
+//! use sekejap::vectors::quantization::{quantize, dequantize, QuantizationType};
 //!
 //! # fn main() {
 //! let vec = vec![0.1, 0.2, 0.3, 0.4];
@@ -95,7 +95,7 @@ impl QuantizedVector {
 /// # Example
 ///
 /// ```rust
-/// # use hsdl_sekejap::vectors::quantization::{quantize, QuantizationType};
+/// # use sekejap::vectors::quantization::{quantize, QuantizationType};
 /// let vec = vec![0.1, 0.2, 0.3, 0.4];
 /// let quantized = quantize(&vec, QuantizationType::INT8);
 /// ```
@@ -180,7 +180,7 @@ fn quantize_int8(vec: &[f32]) -> QuantizedVector {
 /// # Example
 ///
 /// ```rust
-/// # use hsdl_sekejap::vectors::quantization::{quantize, dequantize, QuantizationType};
+/// # use sekejap::vectors::quantization::{quantize, dequantize, QuantizationType};
 /// let vec = vec![0.1, 0.2, 0.3, 0.4];
 /// let quantized = quantize(&vec, QuantizationType::INT8);
 /// let decoded = dequantize(&quantized);
@@ -259,7 +259,7 @@ fn dequantize_int8(quantized: &QuantizedVector) -> Vec<f32> {
 /// # Example
 ///
 /// ```rust
-/// # use hsdl_sekejap::vectors::quantization::{quantize, quantization_error, QuantizationType};
+/// # use sekejap::vectors::quantization::{quantize, quantization_error, QuantizationType};
 /// let vec = vec![0.1, 0.2, 0.3, 0.4];
 /// let quantized = quantize(&vec, QuantizationType::INT8);
 /// let error = quantization_error(&vec, &quantized);
@@ -267,7 +267,7 @@ fn dequantize_int8(quantized: &QuantizedVector) -> Vec<f32> {
 /// ```
 pub fn quantization_error(original: &[f32], quantized: &QuantizedVector) -> f32 {
     let decoded = dequantize(quantized);
-    
+
     if decoded.len() != original.len() {
         return f32::NAN;
     }
@@ -290,7 +290,7 @@ mod tests {
         let vec = vec![0.1, 0.2, 0.3, 0.4];
         let quantized = quantize(&vec, QuantizationType::None);
         assert_eq!(quantized.quant_type, QuantizationType::None);
-        
+
         let decoded = dequantize(&quantized);
         assert_eq!(vec, decoded);
     }
@@ -309,7 +309,7 @@ mod tests {
         let vec = vec![0.0, 0.5, 1.0];
         let quantized = quantize(&vec, QuantizationType::INT8);
         let decoded = dequantize(&quantized);
-        
+
         assert_eq!(decoded.len(), vec.len());
         // Small quantization error expected
         for (orig, dec) in vec.iter().zip(decoded.iter()) {
@@ -322,7 +322,7 @@ mod tests {
         let vec = vec![0.0, 0.5, 1.0];
         let quantized = quantize(&vec, QuantizationType::INT8);
         let error = quantization_error(&vec, &quantized);
-        
+
         // Error should be small for INT8
         assert!(error < 0.01);
     }
@@ -331,7 +331,7 @@ mod tests {
     fn test_quantized_vector_dim() {
         let vec = vec![0.1; 100];
         let quantized = quantize(&vec, QuantizationType::INT8);
-        
+
         assert_eq!(quantized.dim(), 100);
         assert_eq!(quantized.data.len(), 100); // 1 byte per dimension
     }
@@ -340,7 +340,7 @@ mod tests {
     fn test_fp16_dim() {
         let vec = vec![0.1; 50];
         let quantized = quantize(&vec, QuantizationType::FP16);
-        
+
         assert_eq!(quantized.dim(), 50);
         assert_eq!(quantized.data.len(), 100); // 2 bytes per dimension
     }

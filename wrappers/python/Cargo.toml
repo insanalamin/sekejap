@@ -1,6 +1,6 @@
 [package]
 name = "sekejap-python"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A graph-first, embedded multi-model database engine"
 license = "MIT"

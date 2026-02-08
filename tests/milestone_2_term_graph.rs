@@ -16,9 +16,15 @@ fn test_flexible_node_model() {
         "type": "cuisine",
         "region": "Europe"
     }"#;
-    db.write_with_options("italian", cuisine_data,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "italian",
+        cuisine_data,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Create a restaurant node
     let restaurant_data = r#"{
@@ -26,9 +32,15 @@ fn test_flexible_node_model() {
         "type": "restaurant",
         "rating": 4.5
     }"#;
-    db.write_with_options("luigis-pizza", restaurant_data,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "luigis-pizza",
+        restaurant_data,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Connect restaurant to cuisine term
     db.add_edge("luigis-pizza", "italian", 0.9, "cuisine".to_string())
@@ -47,16 +59,31 @@ fn test_term_node_as_first_class() {
 
     // Any node can be a term
     let terms = vec![
-        ("cuisine-italian", r#"{"title": "Italian", "type": "cuisine"}"#),
-        ("cuisine-japanese", r#"{"title": "Japanese", "type": "cuisine"}"#),
-        ("location-jakarta", r#"{"title": "Jakarta", "type": "location"}"#),
+        (
+            "cuisine-italian",
+            r#"{"title": "Italian", "type": "cuisine"}"#,
+        ),
+        (
+            "cuisine-japanese",
+            r#"{"title": "Japanese", "type": "cuisine"}"#,
+        ),
+        (
+            "location-jakarta",
+            r#"{"title": "Jakarta", "type": "location"}"#,
+        ),
         ("food-pizza", r#"{"title": "Pizza", "type": "food"}"#),
     ];
 
     for (slug, data) in &terms {
-        db.write_with_options(slug, data,
-            sekejap::WriteOptions { publish_now: true, ..Default::default() }
-        ).unwrap();
+        db.write_with_options(
+            slug,
+            data,
+            sekejap::WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     assert_eq!(db.storage().len(), 4);
@@ -68,12 +95,24 @@ fn test_edge_with_metadata() {
     let mut db = SekejapDB::new(temp_dir.path()).unwrap();
 
     // Create nodes
-    db.write_with_options("cause-1", r#"{"title": "Poverty"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
-    db.write_with_options("effect-1", r#"{"title": "Crime"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "cause-1",
+        r#"{"title": "Poverty"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.write_with_options(
+        "effect-1",
+        r#"{"title": "Crime"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Add edge with weight
     db.add_edge("cause-1", "effect-1", 0.85, "causal".to_string())

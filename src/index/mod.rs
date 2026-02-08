@@ -15,13 +15,13 @@ pub use spatial::SpatialIndex;
 #[cfg(feature = "fulltext")]
 pub mod fulltext;
 #[cfg(feature = "fulltext")]
-pub use fulltext::{FulltextIndex, FulltextConfig, FulltextResult, FulltextStats};
+pub use fulltext::{FulltextConfig, FulltextIndex, FulltextResult, FulltextStats};
 
 pub mod async_indexer;
 pub use async_indexer::{AsyncIndexer, IndexJob, IndexerStats};
 
 use crate::{NodeId, SlugHash};
-use redb::{Database, ReadableTable, ReadableDatabase, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 
 /// Define the slugs table
@@ -57,7 +57,9 @@ impl SlugIndex {
         let write = self.db.begin_write().expect("Failed to begin write");
         {
             let mut table = write.open_table(SLUGS_TABLE).expect("Failed to open table");
-            table.insert(&slug_hash, &node_id).expect("Failed to insert");
+            table
+                .insert(&slug_hash, &node_id)
+                .expect("Failed to insert");
         }
         write.commit().expect("Failed to commit");
     }
@@ -126,7 +128,8 @@ impl SlugIndex {
         {
             let mut table = write.open_table(SLUGS_TABLE).expect("Failed to open table");
             // Get keys again (table is still valid after range goes out of scope)
-            let keys: Vec<SlugHash> = table.iter()
+            let keys: Vec<SlugHash> = table
+                .iter()
                 .expect("Failed to get iter")
                 .filter_map(|r| r.ok().map(|(k, _)| k.value()))
                 .collect();

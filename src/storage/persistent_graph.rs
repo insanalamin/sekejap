@@ -3,8 +3,8 @@
 //! Provides durable edge storage backed by redb.
 //! Maintains both forward and reverse edge indexes for efficient traversals.
 
-use crate::types::{EntityId, WeightedEdge, EdgeType};
 use crate::hashing::hash_slug;
+use crate::types::{EdgeType, EntityId, WeightedEdge};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 
@@ -51,7 +51,7 @@ impl PersistentGraph {
 
         // Use a single write transaction for both tables
         let write_txn = self.db.begin_write().unwrap();
-        
+
         // Add to forward edges (append to existing edges for source)
         {
             let mut forward_table = write_txn.open_table(FORWARD_EDGES).unwrap();
@@ -59,19 +59,19 @@ impl PersistentGraph {
                 Ok(Some(data)) => bincode::deserialize(data.value().as_slice()).unwrap_or_default(),
                 _ => Vec::new(),
             };
-            
+
             // Check if edge already exists
-            let exists = edges.iter().any(|e| {
-                e._from == edge._from && e._to == edge._to
-            });
-            
+            let exists = edges
+                .iter()
+                .any(|e| e._from == edge._from && e._to == edge._to);
+
             if !exists {
                 edges.push(edge.clone());
                 let data = bincode::serialize(&edges).unwrap();
                 forward_table.insert(&from_key, &data).unwrap();
             }
         }
-        
+
         // Add to reverse edges (append to existing edges for target)
         {
             let mut reverse_table = write_txn.open_table(REVERSE_EDGES).unwrap();
@@ -79,14 +79,14 @@ impl PersistentGraph {
                 Ok(Some(data)) => bincode::deserialize(data.value().as_slice()).unwrap_or_default(),
                 _ => Vec::new(),
             };
-            
+
             edges.push(edge.clone());
             let data = bincode::serialize(&edges).unwrap();
             reverse_table.insert(&to_key, &data).unwrap();
         }
-        
+
         write_txn.commit().unwrap();
-        
+
         true
     }
 
@@ -97,7 +97,9 @@ impl PersistentGraph {
 
         let key = Self::entity_id_to_key(entity_id);
         match forward_table.get(&key) {
-            Ok(Some(edge_data)) => bincode::deserialize(edge_data.value().as_slice()).unwrap_or_default(),
+            Ok(Some(edge_data)) => {
+                bincode::deserialize(edge_data.value().as_slice()).unwrap_or_default()
+            }
             _ => Vec::new(),
         }
     }
@@ -109,7 +111,9 @@ impl PersistentGraph {
 
         let key = Self::entity_id_to_key(entity_id);
         match reverse_table.get(&key) {
-            Ok(Some(edge_data)) => bincode::deserialize(edge_data.value().as_slice()).unwrap_or_default(),
+            Ok(Some(edge_data)) => {
+                bincode::deserialize(edge_data.value().as_slice()).unwrap_or_default()
+            }
             _ => Vec::new(),
         }
     }
@@ -184,7 +188,8 @@ impl PersistentGraph {
         let from_key = Self::entity_id_to_key(from);
         match forward_table.get(&from_key) {
             Ok(Some(edge_data)) => {
-                let edges: Vec<WeightedEdge> = bincode::deserialize(edge_data.value().as_slice()).unwrap_or_default();
+                let edges: Vec<WeightedEdge> =
+                    bincode::deserialize(edge_data.value().as_slice()).unwrap_or_default();
                 edges.iter().any(|e| e._to == *to)
             }
             _ => false,
@@ -206,7 +211,8 @@ impl PersistentGraph {
         let mut total = 0;
         for entry in forward_table.iter().unwrap() {
             let (_, value) = entry.unwrap();
-            let edges: Vec<WeightedEdge> = bincode::deserialize(value.value().as_slice()).unwrap_or_default();
+            let edges: Vec<WeightedEdge> =
+                bincode::deserialize(value.value().as_slice()).unwrap_or_default();
             total += edges.len() as u64;
         }
         total
@@ -218,7 +224,7 @@ impl PersistentGraph {
         let _ = txn.delete_table(FORWARD_EDGES);
         let _ = txn.delete_table(REVERSE_EDGES);
         txn.commit().unwrap();
-        
+
         // Recreate tables for future use
         let txn = self.db.begin_write().unwrap();
         let _ = txn.open_table(FORWARD_EDGES);
@@ -239,9 +245,7 @@ pub fn create_edge_from_slugs(
     let _from = EntityId::new("nodes", source_slug.to_string());
     let _to = EntityId::new("nodes", target_slug.to_string());
 
-    WeightedEdge::new(
-        _from, _to, weight, edge_type, evidence_ptr, timestamp, None,
-    )
+    WeightedEdge::new(_from, _to, weight, edge_type, evidence_ptr, timestamp, None)
 }
 
 #[cfg(test)]
@@ -299,7 +303,12 @@ mod tests {
 
         graph.add_edge(&edge1);
         graph.add_edge(&edge2);
-        assert_eq!(graph.get_edges_from(&EntityId::new("nodes", "node-a")).len(), 2);
+        assert_eq!(
+            graph
+                .get_edges_from(&EntityId::new("nodes", "node-a"))
+                .len(),
+            2
+        );
 
         assert!(graph.remove_edge(
             &EntityId::new("nodes", "node-a"),

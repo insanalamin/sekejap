@@ -15,7 +15,7 @@ use std::fmt;
 /// # Example
 ///
 /// ```rust
-/// use hsdl_sekejap::types::Point;
+/// use sekejap::types::Point;
 ///
 /// let point = Point::new(106.8456, -6.2088);  // Jakarta
 /// println!("Longitude: {}, Latitude: {}", point.x, point.y);
@@ -65,7 +65,7 @@ impl fmt::Display for Point {
 /// # Example
 ///
 /// ```rust
-/// use hsdl_sekejap::types::{Polygon, Point};
+/// use sekejap::types::{Polygon, Point};
 ///
 /// let polygon = Polygon::new(vec![
 ///     Point::new(106.8, -6.2),
@@ -94,7 +94,10 @@ impl Polygon {
 
     /// Create a polygon with holes
     pub fn with_holes(exterior: Vec<Point>, interiors: Vec<Vec<Point>>) -> Self {
-        Self { exterior, interiors }
+        Self {
+            exterior,
+            interiors,
+        }
     }
 
     /// Check if polygon is valid (at least 3 points, closed ring)
@@ -165,7 +168,7 @@ impl fmt::Display for Polygon {
 /// # Example
 ///
 /// ```rust
-/// use hsdl_sekejap::types::{Polyline, Point};
+/// use sekejap::types::{Polyline, Point};
 ///
 /// let route = Polyline::new(vec![
 ///     Point::new(106.8456, -6.2088),  // Jakarta
@@ -252,7 +255,7 @@ impl fmt::Display for Polyline {
 /// # Example
 ///
 /// ```rust
-/// use hsdl_sekejap::types::{Geometry, Point, Polygon, Polyline};
+/// use sekejap::types::{Geometry, Point, Polygon, Polyline};
 ///
 /// let point_geom = Geometry::Point(Point::new(106.8, -6.2));
 /// let polygon_geom = Geometry::Polygon(Polygon::new(vec![
@@ -332,15 +335,20 @@ pub fn distance_squared(a: &Point, b: &Point) -> f64 {
 }
 
 /// Check if a point is on a line segment (with tolerance)
-pub fn point_on_segment(point: &Point, segment_start: &Point, segment_end: &Point, tolerance: f64) -> bool {
+pub fn point_on_segment(
+    point: &Point,
+    segment_start: &Point,
+    segment_end: &Point,
+    tolerance: f64,
+) -> bool {
     // Check if point is on the line
     let _d1 = distance_squared(point, segment_start);
     let _d2 = distance_squared(point, segment_end);
     let d3 = distance_squared(segment_start, segment_end);
 
     // Use dot product to check if point is between endpoints
-    let dot = (point.x - segment_start.x) * (segment_end.x - segment_start.x) +
-              (point.y - segment_start.y) * (segment_end.y - segment_start.y);
+    let dot = (point.x - segment_start.x) * (segment_end.x - segment_start.x)
+        + (point.y - segment_start.y) * (segment_end.y - segment_start.y);
     let param = if d3 == 0.0 { 0.0 } else { dot / d3 };
 
     // Check if point is on the segment
@@ -367,7 +375,7 @@ pub fn point_on_segment(point: &Point, segment_start: &Point, segment_end: &Poin
 /// # Example
 ///
 /// ```rust
-/// use hsdl_sekejap::types::{Point, Polygon, point_in_polygon};
+/// use sekejap::types::{Point, Polygon, point_in_polygon};
 ///
 /// let polygon = Polygon::new(vec![
 ///     Point::new(0.0, 0.0),
@@ -394,8 +402,9 @@ pub fn point_in_polygon(point: &Point, polygon: &Polygon) -> bool {
         let pj = &polygon.exterior[j];
 
         // Check if ray crosses edge
-        if ((pi.y > point.y) != (pj.y > point.y)) &&
-           (point.x < (pj.x - pi.x) * (point.y - pi.y) / (pj.y - pi.y) + pi.x) {
+        if ((pi.y > point.y) != (pj.y > point.y))
+            && (point.x < (pj.x - pi.x) * (point.y - pi.y) / (pj.y - pi.y) + pi.x)
+        {
             inside = !inside;
         }
     }
@@ -403,7 +412,7 @@ pub fn point_in_polygon(point: &Point, polygon: &Polygon) -> bool {
     // Check interior rings (holes) - point must NOT be in holes
     for interior in &polygon.interiors {
         if point_in_polygon_ring(point, interior) {
-            return false;  // Point is in a hole
+            return false; // Point is in a hole
         }
     }
 
@@ -420,8 +429,9 @@ fn point_in_polygon_ring(point: &Point, ring: &[Point]) -> bool {
         let pi = &ring[i];
         let pj = &ring[j];
 
-        if ((pi.y > point.y) != (pj.y > point.y)) &&
-           (point.x < (pj.x - pi.x) * (point.y - pi.y) / (pj.y - pi.y) + pi.x) {
+        if ((pi.y > point.y) != (pj.y > point.y))
+            && (point.x < (pj.x - pi.x) * (point.y - pi.y) / (pj.y - pi.y) + pi.x)
+        {
             inside = !inside;
         }
     }
@@ -492,10 +502,18 @@ fn segments_intersect(p1: &Point, p2: &Point, p3: &Point, p4: &Point) -> bool {
     }
 
     // Special cases (collinear)
-    if o1 == 0 && on_segment(p1, p2, p3) { return true; }
-    if o2 == 0 && on_segment(p1, p2, p4) { return true; }
-    if o3 == 0 && on_segment(p3, p4, p1) { return true; }
-    if o4 == 0 && on_segment(p3, p4, p2) { return true; }
+    if o1 == 0 && on_segment(p1, p2, p3) {
+        return true;
+    }
+    if o2 == 0 && on_segment(p1, p2, p4) {
+        return true;
+    }
+    if o3 == 0 && on_segment(p3, p4, p1) {
+        return true;
+    }
+    if o4 == 0 && on_segment(p3, p4, p2) {
+        return true;
+    }
 
     false
 }
@@ -505,15 +523,18 @@ fn segments_intersect(p1: &Point, p2: &Point, p3: &Point, p4: &Point) -> bool {
 fn orientation(p: &Point, q: &Point, r: &Point) -> i32 {
     let val = (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y);
 
-    if val.abs() < 1e-10 { 0 }
-    else if val > 0.0 { 1 }
-    else { 2 }
+    if val.abs() < 1e-10 {
+        0
+    } else if val > 0.0 {
+        1
+    } else {
+        2
+    }
 }
 
 /// Check if point q lies on segment pr
 fn on_segment(p: &Point, r: &Point, q: &Point) -> bool {
-    q.x <= p.x.max(r.x) && q.x >= p.x.min(r.x) &&
-    q.y <= p.y.max(r.y) && q.y >= p.y.min(r.y)
+    q.x <= p.x.max(r.x) && q.x >= p.x.min(r.x) && q.y <= p.y.max(r.y) && q.y >= p.y.min(r.y)
 }
 
 #[cfg(test)]
@@ -530,8 +551,8 @@ mod tests {
     #[test]
     fn test_point_from_lat_lon() {
         let point = Point::from_lat_lon(-6.2088, 106.8456);
-        assert_eq!(point.x, 106.8456);  // lon
-        assert_eq!(point.y, -6.2088);  // lat
+        assert_eq!(point.x, 106.8456); // lon
+        assert_eq!(point.y, -6.2088); // lat
     }
 
     #[test]
@@ -596,10 +617,7 @@ mod tests {
 
     #[test]
     fn test_polyline_length() {
-        let line = Polyline::new(vec![
-            Point::new(0.0, 0.0),
-            Point::new(3.0, 4.0),
-        ]);
+        let line = Polyline::new(vec![Point::new(0.0, 0.0), Point::new(3.0, 4.0)]);
         assert!((line.length() - 5.0).abs() < 1e-6);
     }
 
@@ -633,17 +651,11 @@ mod tests {
         ]);
 
         // Polyline crossing the polygon
-        let crossing = Polyline::new(vec![
-            Point::new(-5.0, 5.0),
-            Point::new(15.0, 5.0),
-        ]);
+        let crossing = Polyline::new(vec![Point::new(-5.0, 5.0), Point::new(15.0, 5.0)]);
         assert!(polyline_intersects_polygon(&crossing, &polygon));
 
         // Polyline completely outside
-        let outside = Polyline::new(vec![
-            Point::new(20.0, 20.0),
-            Point::new(30.0, 30.0),
-        ]);
+        let outside = Polyline::new(vec![Point::new(20.0, 20.0), Point::new(30.0, 30.0)]);
         assert!(!polyline_intersects_polygon(&outside, &polygon));
 
         // Polyline completely inside
@@ -665,7 +677,10 @@ mod tests {
     #[test]
     fn test_geometry_bounds() {
         let point_geom = Geometry::Point(Point::new(5.0, 5.0));
-        assert_eq!(point_geom.bounds(), (Point::new(5.0, 5.0), Point::new(5.0, 5.0)));
+        assert_eq!(
+            point_geom.bounds(),
+            (Point::new(5.0, 5.0), Point::new(5.0, 5.0))
+        );
 
         let polygon = Polygon::new(vec![
             Point::new(0.0, 0.0),
@@ -683,8 +698,17 @@ mod tests {
     #[test]
     fn test_geometry_type() {
         let point_geom = Geometry::Point(Point::new(0.0, 0.0));
-        let polygon_geom = Geometry::Polygon(Polygon::new(vec![Point::new(0.0, 0.0), Point::new(1.0, 0.0), Point::new(1.0, 1.0), Point::new(0.0, 1.0), Point::new(0.0, 0.0)]));
-        let polyline_geom = Geometry::Polyline(Polyline::new(vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)]));
+        let polygon_geom = Geometry::Polygon(Polygon::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(1.0, 0.0),
+            Point::new(1.0, 1.0),
+            Point::new(0.0, 1.0),
+            Point::new(0.0, 0.0),
+        ]));
+        let polyline_geom = Geometry::Polyline(Polyline::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(1.0, 1.0),
+        ]));
 
         assert_eq!(point_geom.geometry_type(), "Point");
         assert_eq!(polygon_geom.geometry_type(), "Polygon");

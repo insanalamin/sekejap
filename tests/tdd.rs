@@ -6,11 +6,8 @@
 //! core components of the Sekejap-DB knowledge graph database.
 
 use sekejap::{
-    EntityId, CollectionId, Collection, CollectionSchema,
-    WeightedEdge, EdgePayload, WriteOptions,
-    SekejapDB, atoms::*,
-    sekejapql::SekejapQL,
-    index::SlugIndex,
+    Collection, CollectionId, CollectionSchema, EdgePayload, EntityId, SekejapDB, WeightedEdge,
+    WriteOptions, atoms::*, index::SlugIndex, sekejapql::SekejapQL,
 };
 use tempfile::TempDir;
 
@@ -54,7 +51,7 @@ mod entity_id_tests {
         let id1 = EntityId::new("news", "test-001");
         let id2 = EntityId::new("news", "test-001");
         let id3 = EntityId::new("news", "test-002");
-        
+
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
     }
@@ -62,11 +59,11 @@ mod entity_id_tests {
     #[test]
     fn test_entity_id_hash() {
         use std::collections::HashMap;
-        
+
         let mut map = HashMap::new();
         let id = EntityId::new("news", "article-001");
         map.insert(id.clone(), "value");
-        
+
         assert_eq!(map.get(&id), Some(&"value"));
     }
 }
@@ -88,7 +85,7 @@ mod collection_tests {
         let mut collection = Collection::new(CollectionId::new("news"));
         let schema = CollectionSchema::new();
         collection.set_schema(schema);
-        
+
         assert!(collection.has_schema());
         assert!(!collection.is_flex_mode());
     }
@@ -96,9 +93,14 @@ mod collection_tests {
     #[test]
     fn test_collection_metadata() {
         let mut collection = Collection::new(CollectionId::new("news"));
-        collection.metadata_mut().set("description", serde_json::json!("News articles"));
-        
-        assert_eq!(collection.metadata().get_str("description").unwrap(), "News articles");
+        collection
+            .metadata_mut()
+            .set("description", serde_json::json!("News articles"));
+
+        assert_eq!(
+            collection.metadata().get_str("description").unwrap(),
+            "News articles"
+        );
     }
 }
 
@@ -121,7 +123,7 @@ mod weighted_edge_tests {
             1700000000000,
             None,
         );
-        
+
         assert_eq!(edge.source_collection(), "news");
         assert_eq!(edge.target_collection(), "terms");
         assert_eq!(edge.source_key(), "event-001");
@@ -136,7 +138,7 @@ mod weighted_edge_tests {
             .with_title("Causal relationship")
             .with_prop("confidence", serde_json::json!(0.95))
             .with_prop("method", serde_json::json!("regression_analysis"));
-        
+
         let edge = WeightedEdge::new_with_payload(
             EntityId::new("crime", "theft-001"),
             EntityId::new("causes", "poverty"),
@@ -147,7 +149,7 @@ mod weighted_edge_tests {
             None,
             Some(payload),
         );
-        
+
         assert_eq!(edge._type, "caused_by");
         assert!(edge.payload.is_some());
         assert_eq!(
@@ -167,13 +169,13 @@ mod weighted_edge_tests {
             1700000000000,
             Some(1700000100000),
         );
-        
+
         // Before valid range
         assert!(!edge.is_valid_at(1699999999999));
-        
+
         // Inside valid range
         assert!(edge.is_valid_at(1700000005000));
-        
+
         // After valid range
         assert!(!edge.is_valid_at(1700000100001));
     }
@@ -189,7 +191,7 @@ mod weighted_edge_tests {
             1700000000000,
             None,
         );
-        
+
         assert!(edge.meets_threshold(0.5));
         assert!(edge.meets_threshold(0.7));
         assert!(!edge.meets_threshold(0.8));
@@ -206,7 +208,7 @@ mod weighted_edge_tests {
             1700000000000,
             None,
         );
-        
+
         let display = format!("{}", edge);
         assert!(display.contains("->"));
         assert!(display.contains("weight=0.90"));
@@ -226,8 +228,12 @@ mod atom_tests {
         // Jakarta to Bogor (actual distance ~43km based on coordinates)
         let dist = haversine_distance(-6.2088, 106.8456, -6.5950, 106.8170);
         // Allow 5km tolerance
-        assert!((dist - 43.0).abs() < 5.0, "Distance should be ~43km, got: {:.2}km", dist);
-        
+        assert!(
+            (dist - 43.0).abs() < 5.0,
+            "Distance should be ~43km, got: {:.2}km",
+            dist
+        );
+
         // Test zero distance
         let zero_dist = haversine_distance(-6.2088, 106.8456, -6.2088, 106.8456);
         assert!(zero_dist.abs() < 0.1, "Zero distance should be ~0");
@@ -240,11 +246,17 @@ mod atom_tests {
             let vec1 = vec![1.0, 0.0, 0.0];
             let vec2 = vec![1.0, 0.0, 0.0];
             let sim = cosine_similarity(&vec1, &vec2);
-            assert!((sim - 1.0).abs() < 0.001, "Identical vectors should have similarity 1.0");
-            
+            assert!(
+                (sim - 1.0).abs() < 0.001,
+                "Identical vectors should have similarity 1.0"
+            );
+
             let vec3 = vec![0.0, 1.0, 0.0];
             let sim2 = cosine_similarity(&vec1, &vec3);
-            assert!(sim2 < 0.5, "Perpendicular vectors should have low similarity");
+            assert!(
+                sim2 < 0.5,
+                "Perpendicular vectors should have low similarity"
+            );
         }
     }
 }
@@ -261,21 +273,44 @@ mod graph_traversal_tests {
     fn test_bfs_traversal() {
         let temp_dir = TempDir::new().unwrap();
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         // Setup: west-java -> bandung, west-java -> jakarta
-        db.write_with_options("west-java", r#"{"title": "West Java"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        db.write_with_options("bandung", r#"{"title": "Bandung"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        db.write_with_options("jakarta", r#"{"title": "Jakarta"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        
-        db.add_edge("west-java", "bandung", 0.8, "Hierarchy".to_string()).unwrap();
-        db.add_edge("west-java", "jakarta", 0.9, "Hierarchy".to_string()).unwrap();
-        
+        db.write_with_options(
+            "west-java",
+            r#"{"title": "West Java"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.write_with_options(
+            "bandung",
+            r#"{"title": "Bandung"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.write_with_options(
+            "jakarta",
+            r#"{"title": "Jakarta"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        db.add_edge("west-java", "bandung", 0.8, "Hierarchy".to_string())
+            .unwrap();
+        db.add_edge("west-java", "jakarta", 0.9, "Hierarchy".to_string())
+            .unwrap();
+
         // Traverse from west-java (forward direction)
         let nodes = traverse_bfs(&db, "west-java", 2);
-        
+
         // Should find west-java (start) + bandung + jakarta = 3 nodes
         // traverse_bfs includes the starting node
         assert_eq!(nodes.len(), 3);
@@ -285,20 +320,27 @@ mod graph_traversal_tests {
     fn test_traversal_depth_limit() {
         let temp_dir = TempDir::new().unwrap();
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         // Setup chain: a -> b -> c -> d
         for i in ['a', 'b', 'c', 'd'] {
-            db.write_with_options(&i.to_string(), r#"{"title": "Test"}"#,
-                WriteOptions { publish_now: true, ..Default::default() }).unwrap();
+            db.write_with_options(
+                &i.to_string(),
+                r#"{"title": "Test"}"#,
+                WriteOptions {
+                    publish_now: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
         db.add_edge("a", "b", 1.0, "next".to_string()).unwrap();
         db.add_edge("b", "c", 1.0, "next".to_string()).unwrap();
         db.add_edge("c", "d", 1.0, "next".to_string()).unwrap();
-        
+
         // With depth 2, should find a, b, c
         let nodes = traverse_bfs(&db, "a", 2);
         assert_eq!(nodes.len(), 3);
-        
+
         // With depth 1, should find a, b
         let nodes = traverse_bfs(&db, "a", 1);
         assert_eq!(nodes.len(), 2);
@@ -317,22 +359,37 @@ mod sekejapql_tests {
     fn test_simple_filter_query() {
         let temp_dir = TempDir::new().unwrap();
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         // Write directly to Tier 2 for query tests
-        db.write_with_options("italian", r#"{"title": "Italian"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        db.write_with_options("restaurant-1", r#"{"title": "Luigi's Pizza"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        db.add_edge("restaurant-1", "italian", 0.9, "related".to_string()).unwrap();
-        
+        db.write_with_options(
+            "italian",
+            r#"{"title": "Italian"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.write_with_options(
+            "restaurant-1",
+            r#"{"title": "Luigi's Pizza"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.add_edge("restaurant-1", "italian", 0.9, "related".to_string())
+            .unwrap();
+
         let engine = SekejapQL::new(&db);
-        
+
         // First verify we can get all nodes
         let all_query = r#"{}"#;
         let all_result = engine.execute(all_query).unwrap();
         // Should find italian, restaurant-1 = 2 nodes
         assert_eq!(all_result.nodes.len(), 2, "Expected 2 nodes in DB");
-        
+
         // Now test the filter - restaurant-1 has edge TO italian
         // Note: edgeType is case-sensitive, using lowercase "related"
         let query = r#"{
@@ -340,24 +397,28 @@ mod sekejapql_tests {
                 {"type": "edge_to", "target": "italian", "edgeType": "related"}
             ]
         }"#;
-        
+
         let result = engine.execute(query).unwrap();
-        
+
         // Should find node that has an edge to "italian" (restaurant-1)
-        assert_eq!(result.nodes.len(), 1, "Expected 1 node with edge to italian");
+        assert_eq!(
+            result.nodes.len(),
+            1,
+            "Expected 1 node with edge to italian"
+        );
     }
 
     #[test]
     fn test_security_limits() {
         let temp_dir = TempDir::new().unwrap();
         let db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         let engine = SekejapQL::builder(&db)
             .max_nodes(5)
             .timeout_ms(1000)
             .read_only(true)
             .build();
-        
+
         // Engine created successfully with custom limits
         // Security limits are enforced during query execution
     }
@@ -366,18 +427,41 @@ mod sekejapql_tests {
     fn test_traversal_query() {
         let temp_dir = TempDir::new().unwrap();
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         // Write directly to Tier 2 for query tests
-        db.write_with_options("west-java", r#"{"title": "West Java"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        db.write_with_options("bandung", r#"{"title": "Bandung"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        db.write_with_options("jakarta", r#"{"title": "Jakarta"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        
-        db.add_edge("west-java", "bandung", 0.8, "Hierarchy".to_string()).unwrap();
-        db.add_edge("west-java", "jakarta", 0.9, "Hierarchy".to_string()).unwrap();
-        
+        db.write_with_options(
+            "west-java",
+            r#"{"title": "West Java"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.write_with_options(
+            "bandung",
+            r#"{"title": "Bandung"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.write_with_options(
+            "jakarta",
+            r#"{"title": "Jakarta"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        db.add_edge("west-java", "bandung", 0.8, "Hierarchy".to_string())
+            .unwrap();
+        db.add_edge("west-java", "jakarta", 0.9, "Hierarchy".to_string())
+            .unwrap();
+
         let engine = SekejapQL::new(&db);
         let query = r#"{
             "traversal": {
@@ -386,9 +470,9 @@ mod sekejapql_tests {
                 "maxDepth": 2
             }
         }"#;
-        
+
         let result = engine.execute(query).unwrap();
-        
+
         // Should find west-java (start) + bandung + jakarta = 3 nodes
         // Traversal includes the starting node
         assert_eq!(result.nodes.len(), 3);
@@ -398,19 +482,26 @@ mod sekejapql_tests {
     fn test_limit_and_offset() {
         let temp_dir = TempDir::new().unwrap();
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         // Create multiple nodes
         for i in 1..=10 {
-            db.write_with_options(&format!("node-{}", i), &format!(r#"{{"title": "Node {}"}}"#, i),
-                WriteOptions { publish_now: true, ..Default::default() }).unwrap();
+            db.write_with_options(
+                &format!("node-{}", i),
+                &format!(r#"{{"title": "Node {}"}}"#, i),
+                WriteOptions {
+                    publish_now: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
-        
+
         let engine = SekejapQL::new(&db);
         let query = r#"{
             "limit": 5,
             "offset": 2
         }"#;
-        
+
         let result = engine.execute(query).unwrap();
         assert_eq!(result.nodes.len(), 5);
     }
@@ -516,11 +607,18 @@ mod database_crud_tests {
     fn test_write_and_read() {
         let temp_dir = TempDir::new().unwrap();
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         // Use publish_now to write directly to Tier 2 for immediate reading
-        db.write_with_options("article-1", r#"{"title": "Flood in Jakarta", "content": "Heavy rain caused flooding"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        
+        db.write_with_options(
+            "article-1",
+            r#"{"title": "Flood in Jakarta", "content": "Heavy rain caused flooding"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
         let result = db.read("article-1").unwrap();
         assert!(result.is_some());
     }
@@ -529,15 +627,30 @@ mod database_crud_tests {
     fn test_add_edge() {
         let temp_dir = TempDir::new().unwrap();
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         // Use publish_now to write directly to Tier 2
-        db.write_with_options("source", r#"{"title": "Source"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        db.write_with_options("target", r#"{"title": "Target"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
-        
-        db.add_edge("source", "target", 0.8, "related".to_string()).unwrap();
-        
+        db.write_with_options(
+            "source",
+            r#"{"title": "Source"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.write_with_options(
+            "target",
+            r#"{"title": "Target"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        db.add_edge("source", "target", 0.8, "related".to_string())
+            .unwrap();
+
         // Verify edge was added by traversing
         let edges = get_edges_from(&db, "source");
         assert_eq!(edges.len(), 1);
@@ -548,12 +661,19 @@ mod database_crud_tests {
     fn test_delete() {
         let temp_dir = TempDir::new().unwrap();
         let mut db = SekejapDB::new(temp_dir.path()).unwrap();
-        
+
         // Use publish_now to write directly to Tier 2
-        db.write_with_options("test-node", r#"{"title": "Test"}"#,
-            WriteOptions { publish_now: true, ..Default::default() }).unwrap();
+        db.write_with_options(
+            "test-node",
+            r#"{"title": "Test"}"#,
+            WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(db.read("test-node").unwrap().is_some());
-        
+
         db.delete("test-node").unwrap();
         assert!(db.read("test-node").unwrap().is_none());
     }

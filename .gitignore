@@ -60,6 +60,8 @@ ENV/
 /data/
 /data/*
 !/data/.gitkeep
+/blobs/
+/fulltext/
 *.db
 *.wal
 *.shm

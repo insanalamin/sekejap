@@ -8,7 +8,7 @@
 
 use crate::NodeId;
 use crate::types::geo::GeoFeature;
-use rstar::{RTree, Point};
+use rstar::{Point, RTree};
 
 /// Spatial point for R-tree indexing (latitude, longitude)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,7 +59,7 @@ impl Point for SpatialPoint {
 /// # Example
 ///
 /// ```rust,ignore
-/// use hsdl_sekejap::index::SpatialIndex;
+/// use sekejap::index::SpatialIndex;
 ///
 /// let mut index = SpatialIndex::new();
 /// index.insert_point(1, -6.2088, 106.8456);  // Bandung
@@ -109,15 +109,17 @@ impl SpatialIndex {
     /// # Returns
     ///
     /// Vector of node IDs within the radius
-    pub fn find_within_radius(&self, center_lat: f64, center_lon: f64, radius_km: f64) -> Vec<NodeId> {
+    pub fn find_within_radius(
+        &self,
+        center_lat: f64,
+        center_lon: f64,
+        radius_km: f64,
+    ) -> Vec<NodeId> {
         // Use R-tree iteration and filter by Haversine distance
         self.rtree
             .iter()
             .filter(|sp| {
-                let distance = haversine_distance(
-                    center_lat, center_lon,
-                    sp.point[0], sp.point[1]
-                );
+                let distance = haversine_distance(center_lat, center_lon, sp.point[0], sp.point[1]);
                 distance <= radius_km
             })
             .map(|sp| sp.node_id)
@@ -136,13 +138,11 @@ impl SpatialIndex {
     ///
     /// Vector of (node_id, distance_km) tuples, sorted by distance
     pub fn find_k_nearest(&self, center_lat: f64, center_lon: f64, k: usize) -> Vec<(NodeId, f64)> {
-        let mut results: Vec<_> = self.rtree
+        let mut results: Vec<_> = self
+            .rtree
             .iter()
             .map(|sp| {
-                let distance = haversine_distance(
-                    center_lat, center_lon,
-                    sp.point[0], sp.point[1]
-                );
+                let distance = haversine_distance(center_lat, center_lon, sp.point[0], sp.point[1]);
                 (sp.node_id, distance)
             })
             .collect();
@@ -178,8 +178,8 @@ impl SpatialIndex {
             }
 
             // Ray casting algorithm
-            let intersect = ((yi > lat) != (yj > lat))
-                && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+            let intersect =
+                ((yi > lat) != (yj > lat)) && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi);
 
             if intersect {
                 inside = !inside;
@@ -202,12 +202,7 @@ impl SpatialIndex {
     /// # Returns
     ///
     /// Vector of node IDs whose polygon contains the point
-    pub fn find_containing_polygon<F>(
-        &self,
-        lat: f64,
-        lon: f64,
-        get_polygon: F,
-    ) -> Vec<NodeId>
+    pub fn find_containing_polygon<F>(&self, lat: f64, lon: f64, get_polygon: F) -> Vec<NodeId>
     where
         F: Fn(NodeId) -> Option<Vec<[f64; 2]>>,
     {
@@ -270,8 +265,7 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let dlon = (lon2 - lon1).to_radians();
 
     let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos()
-        * (dlon / 2.0).sin().powi(2);
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
 
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
 
@@ -316,9 +310,9 @@ mod tests {
 
         // Bandung coordinates
         index.insert_point(1, -6.2088, 106.8456); // Bandung center
-        index.insert_point(2, -6.3, 107.0);      // Near Bandung (~15km away)
-        index.insert_point(3, -6.6, 106.8);      // ~44km away
-        index.insert_point(4, -5.0, 105.0);      // ~150km away
+        index.insert_point(2, -6.3, 107.0); // Near Bandung (~15km away)
+        index.insert_point(3, -6.6, 106.8); // ~44km away
+        index.insert_point(4, -5.0, 105.0); // ~150km away
 
         // Search within 20km radius
         let results = index.find_within_radius(-6.2088, 106.8456, 20.0);
@@ -334,8 +328,8 @@ mod tests {
 
         // Add points at different distances
         index.insert_point(1, -6.2088, 106.8456); // Center
-        index.insert_point(2, -6.3, 107.0);      // ~15km
-        index.insert_point(3, -6.6, 106.8);      // ~44km
+        index.insert_point(2, -6.3, 107.0); // ~15km
+        index.insert_point(3, -6.6, 106.8); // ~44km
 
         // Find 2 nearest
         let nearest = index.find_k_nearest(-6.2088, 106.8456, 2);
@@ -350,11 +344,7 @@ mod tests {
         let index = SpatialIndex::new();
 
         // Simple triangle
-        let polygon = [
-            [0.0, 0.0],
-            [5.0, 0.0],
-            [2.5, 5.0],
-        ];
+        let polygon = [[0.0, 0.0], [5.0, 0.0], [2.5, 5.0]];
 
         // Point inside triangle
         assert!(index.is_point_in_polygon(2.5, 2.5, &polygon));
@@ -382,7 +372,11 @@ mod tests {
     fn test_haversine_distance() {
         // Jakarta to Bogor (~43km)
         let dist = haversine_distance(-6.2088, 106.8456, -6.5950, 106.8170);
-        assert!((dist - 43.0).abs() < 5.0, "Distance should be ~43km, got: {:.2}km", dist);
+        assert!(
+            (dist - 43.0).abs() < 5.0,
+            "Distance should be ~43km, got: {:.2}km",
+            dist
+        );
 
         // Same point
         let zero_dist = haversine_distance(-6.2088, 106.8456, -6.2088, 106.8456);

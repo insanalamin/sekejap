@@ -3,8 +3,8 @@
 //! Tests backup/restore functionality for data durability.
 
 use sekejap::SekejapDB;
-use tempfile::TempDir;
 use std::fs;
+use tempfile::TempDir;
 
 #[test]
 fn test_backup_and_restore() {
@@ -19,9 +19,15 @@ fn test_backup_and_restore() {
     ];
 
     for (slug, data) in &events {
-        db.write_with_options(slug, data,
-            sekejap::WriteOptions { publish_now: true, ..Default::default() }
-        ).unwrap();
+        db.write_with_options(
+            slug,
+            data,
+            sekejap::WriteOptions {
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     // Add edges
@@ -55,13 +61,26 @@ fn test_backup_preserves_edges() {
     let mut db = SekejapDB::new(temp_dir.path()).unwrap();
 
     // Create nodes and edges
-    db.write_with_options("cause", r#"{"title": "Cause"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
-    db.write_with_options("effect", r#"{"title": "Effect"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
-    db.add_edge("cause", "effect", 0.85, "causal".to_string()).unwrap();
+    db.write_with_options(
+        "cause",
+        r#"{"title": "Cause"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.write_with_options(
+        "effect",
+        r#"{"title": "Effect"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.add_edge("cause", "effect", 0.85, "causal".to_string())
+        .unwrap();
 
     // Backup
     let backup_path = temp_dir.path().join("backup_edges.json");
@@ -85,9 +104,15 @@ fn test_backup_format() {
     let temp_dir = TempDir::new().unwrap();
     let mut db = SekejapDB::new(temp_dir.path()).unwrap();
 
-    db.write_with_options("test", r#"{"title": "Test"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "test",
+        r#"{"title": "Test"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Backup
     let backup_path = temp_dir.path().join("backup_format.json");
@@ -108,18 +133,30 @@ fn test_multiple_backups() {
     let mut db = SekejapDB::new(temp_dir.path()).unwrap();
 
     // Initial data
-    db.write_with_options("v1", r#"{"title": "Version 1"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "v1",
+        r#"{"title": "Version 1"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // First backup
     let backup1 = temp_dir.path().join("backup1.json");
     db.backup(&backup1).unwrap();
 
     // Add more data
-    db.write_with_options("v2", r#"{"title": "Version 2"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "v2",
+        r#"{"title": "Version 2"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Second backup
     let backup2 = temp_dir.path().join("backup2.json");

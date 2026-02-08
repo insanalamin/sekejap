@@ -13,9 +13,9 @@
 //! # Usage
 //!
 //! ```rust
-//! use hsdl_sekejap::graph::bloom::BloomFilter;
+//! use sekejap::graph::bloom::BloomFilter;
 //!
-//! let mut filter = BloomFilter::new(10000, 0.01); // 10K elements, 1% FPR
+//! let mut filter = BloomFilter::new(); // Default configuration
 //! filter.add_edge(1, 2);
 //! assert!(filter.has_edge(1, 2));  // Always true for added edges
 //! assert!(!filter.has_edge(1, 3)); // Probably false (may be false positive)
@@ -23,8 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 /// Configuration for Bloom filter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,7 +56,8 @@ impl BloomConfig {
         let bit_array_size = ((expected_elements as f64 * (-fpr.ln())) / ln2_sq).ceil() as usize;
 
         // Calculate optimal number of hash functions: k = (m/n) * ln(2)
-        let num_hashes = ((bit_array_size as f64 / expected_elements as f64) * std::f64::consts::LN_2)
+        let num_hashes = ((bit_array_size as f64 / expected_elements as f64)
+            * std::f64::consts::LN_2)
             .ceil() as usize;
 
         // Ensure at least 1 hash function
@@ -208,9 +209,7 @@ impl BloomFilter {
 
     /// Get memory usage in bytes
     pub fn memory_usage(&self) -> usize {
-        self.bit_array.len()
-            + std::mem::size_of::<BloomConfig>()
-            + std::mem::size_of::<usize>()
+        self.bit_array.len() + std::mem::size_of::<BloomConfig>() + std::mem::size_of::<usize>()
     }
 
     /// Clear the filter

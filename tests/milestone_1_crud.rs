@@ -49,10 +49,15 @@ fn test_read_event() {
         "tags": ["test", "sample"]
     }"#;
 
-    db.write_with_options("test-event", data, sekejap::WriteOptions {
-        publish_now: true,
-        ..Default::default()
-    }).unwrap();
+    db.write_with_options(
+        "test-event",
+        data,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Read from Tier 2
     let result = db.read("test-event").unwrap();
@@ -74,14 +79,26 @@ fn test_update_event() {
     let temp_dir = TempDir::new().unwrap();
     let mut db = SekejapDB::new(temp_dir.path()).unwrap();
 
-    db.write_with_options("test-event", r#"{"title": "Original"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "test-event",
+        r#"{"title": "Original"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Update
-    db.write_with_options("test-event", r#"{"title": "Updated"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "test-event",
+        r#"{"title": "Updated"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Read updated
     let result = db.read("test-event").unwrap().unwrap();
@@ -93,9 +110,15 @@ fn test_delete_event() {
     let temp_dir = TempDir::new().unwrap();
     let mut db = SekejapDB::new(temp_dir.path()).unwrap();
 
-    db.write_with_options("test-event", r#"{"title": "To Delete"}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "test-event",
+        r#"{"title": "To Delete"}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Delete
     db.delete("test-event").unwrap();
@@ -105,7 +128,6 @@ fn test_delete_event() {
     assert!(result.is_none());
 }
 
-
 #[test]
 fn test_write_with_coordinates() {
     let temp_dir = TempDir::new().unwrap();
@@ -113,14 +135,18 @@ fn test_write_with_coordinates() {
 
     let data = r#"{"title": "Location Event"}"#;
 
-    let node_id = db.write_with_options("location-1", data,
-        sekejap::WriteOptions {
-            latitude: -6.2088,
-            longitude: 106.8456,
-            publish_now: true,
-            ..Default::default()
-        }
-    ).unwrap();
+    let node_id = db
+        .write_with_options(
+            "location-1",
+            data,
+            sekejap::WriteOptions {
+                latitude: -6.2088,
+                longitude: 106.8456,
+                publish_now: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     assert!(node_id > 0);
 }
@@ -131,14 +157,26 @@ fn test_mvcc_versioning() {
     let mut db = SekejapDB::new(temp_dir.path()).unwrap();
 
     // First write
-    db.write_with_options("test", r#"{"title": "V1", "version": 1}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "test",
+        r#"{"title": "V1", "version": 1}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Second write (update)
-    db.write_with_options("test", r#"{"title": "V2", "version": 2}"#,
-        sekejap::WriteOptions { publish_now: true, ..Default::default() }
-    ).unwrap();
+    db.write_with_options(
+        "test",
+        r#"{"title": "V2", "version": 2}"#,
+        sekejap::WriteOptions {
+            publish_now: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Read should return latest
     let result = db.read("test").unwrap().unwrap();

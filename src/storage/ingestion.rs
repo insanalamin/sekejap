@@ -1,7 +1,7 @@
 //! Ingestion Buffer (Tier 1)
 //! Hyperminimalist implementation using in-memory HashMap for now
 
-use crate::{NodeId, SlugHash, NodeHeader};
+use crate::{NodeHeader, NodeId, SlugHash};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -66,7 +66,10 @@ impl IngestionBuffer {
     /// Get node by slug hash (for tier-agnostic resolution)
     pub fn get_by_slug(&self, slug_hash: SlugHash) -> Option<NodeHeader> {
         let nodes = self.nodes.lock().unwrap();
-        nodes.values().find(|node| node.slug_hash == slug_hash).cloned()
+        nodes
+            .values()
+            .find(|node| node.slug_hash == slug_hash)
+            .cloned()
     }
 }
 
@@ -81,13 +84,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let buffer = IngestionBuffer::new(temp_dir.path().to_path_buf()).unwrap();
 
-        let node = NodeHeader::new(
-            123u128,
-            456,
-            789,
-            BlobPtr::new(0, 100, 200),
-            1700000000000,
-        );
+        let node = NodeHeader::new(123u128, 456, 789, BlobPtr::new(0, 100, 200), 1700000000000);
 
         buffer.upsert(node.clone());
         assert_eq!(buffer.len(), 1);
@@ -101,21 +98,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let buffer = IngestionBuffer::new(temp_dir.path().to_path_buf()).unwrap();
 
-        let node1 = NodeHeader::new(
-            123u128,
-            456,
-            789,
-            BlobPtr::new(0, 100, 200),
-            1700000000000,
-        );
+        let node1 = NodeHeader::new(123u128, 456, 789, BlobPtr::new(0, 100, 200), 1700000000000);
 
-        let node2 = NodeHeader::new(
-            123u128,
-            999,
-            888,
-            BlobPtr::new(0, 300, 400),
-            1700000000001,
-        );
+        let node2 = NodeHeader::new(123u128, 999, 888, BlobPtr::new(0, 300, 400), 1700000000001);
 
         buffer.upsert(node1);
         buffer.upsert(node2);

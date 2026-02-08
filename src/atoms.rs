@@ -13,7 +13,7 @@
 //! # Basic Usage
 //!
 //! ```rust,no_run
-//! use hsdl_sekejap::{SekejapDB, atoms::*};
+//! use sekejap::{SekejapDB, atoms::*};
 //!
 //! # fn example(db: &SekejapDB) {
 //! // Atom 1: Get all nodes with hierarchy edges
@@ -36,7 +36,7 @@
 //! | `is_point_in_polygon` | O(m) | m = polygon vertices |
 //! | `cosine_similarity` | O(d) | d = vector dimension |
 
-use crate::{EntityId, SekejapDB, EdgeType, NodeHeader};
+use crate::{EdgeType, EntityId, NodeHeader, SekejapDB};
 
 /// Get a node by its slug
 ///
@@ -58,7 +58,7 @@ use crate::{EntityId, SekejapDB, EdgeType, NodeHeader};
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// if let Some(node) = get_node(&db, "jakarta-city") {
@@ -90,7 +90,7 @@ pub fn get_node(db: &SekejapDB, slug: &str) -> Option<NodeHeader> {
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// // Get all nodes with hierarchy edges (e.g., administrative relationships)
@@ -98,18 +98,20 @@ pub fn get_node(db: &SekejapDB, slug: &str) -> Option<NodeHeader> {
 /// ```
 pub fn get_nodes_by_edge_type(db: &SekejapDB, edge_type: EdgeType) -> Vec<NodeHeader> {
     let graph = db.graph();
-    
+
     // Collect all entity IDs from storage by checking their entity_id field
     let all_nodes: Vec<NodeHeader> = db.storage().all();
-    
+
     // Find all nodes that have edges of this type
     all_nodes
         .into_iter()
         .filter_map(|node| {
             // Use the node's entity_id if available, otherwise create one from slug
-            let entity_id = node.entity_id.clone()
+            let entity_id = node
+                .entity_id
+                .clone()
                 .unwrap_or_else(|| EntityId::new("nodes", ""));
-            
+
             let edges = graph.get_edges_from(&entity_id);
             if edges.iter().any(|e| e._type == edge_type) {
                 Some(node)
@@ -141,29 +143,38 @@ pub fn get_nodes_by_edge_type(db: &SekejapDB, edge_type: EdgeType) -> Vec<NodeHe
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// // Get all nodes with hierarchy edges pointing to a specific target
 /// let children = get_nodes_with_edge_to(&db, "west-java", "hierarchy".to_string());
 /// ```
-pub fn get_nodes_with_edge_to(db: &SekejapDB, target_slug: &str, edge_type: EdgeType) -> Vec<NodeHeader> {
+pub fn get_nodes_with_edge_to(
+    db: &SekejapDB,
+    target_slug: &str,
+    edge_type: EdgeType,
+) -> Vec<NodeHeader> {
     let target_entity_id = EntityId::new("nodes".to_string(), target_slug.to_string());
-    
+
     let graph = db.graph();
-    
+
     // Collect all nodes from storage
     let all_nodes: Vec<NodeHeader> = db.storage().all();
-    
+
     // Find all nodes that point to target with specific edge type
     all_nodes
         .into_iter()
         .filter_map(|node| {
-            let entity_id = node.entity_id.clone()
+            let entity_id = node
+                .entity_id
+                .clone()
                 .unwrap_or_else(|| EntityId::new("nodes", ""));
-            
+
             let edges = graph.get_edges_from(&entity_id);
-            if edges.iter().any(|e| e._to == target_entity_id && e._type == edge_type) {
+            if edges
+                .iter()
+                .any(|e| e._to == target_entity_id && e._type == edge_type)
+            {
                 Some(node)
             } else {
                 None
@@ -190,7 +201,7 @@ pub fn get_nodes_with_edge_to(db: &SekejapDB, target_slug: &str, edge_type: Edge
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// let edges = get_edges_from(&db, "bogor-city");
@@ -221,7 +232,7 @@ pub fn get_edges_from(db: &SekejapDB, source_slug: &str) -> Vec<crate::WeightedE
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// let edges = get_edges_to(&db, "nanggung-village");
@@ -253,7 +264,7 @@ pub fn get_edges_to(db: &SekejapDB, target_slug: &str) -> Vec<crate::WeightedEdg
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// # let node = get_node(&db, "jakarta-city").unwrap();
@@ -286,7 +297,7 @@ pub fn has_metadata_key(_node: &NodeHeader, _key: &str, _value: &str) -> bool {
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// # let node = get_node(&db, "jakarta-city").unwrap();
@@ -322,7 +333,7 @@ pub fn get_metadata(_db: &SekejapDB, _node: &NodeHeader, _key: &str) -> Option<S
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// # let node = get_node(&db, "bogor-city-boundary").unwrap();
@@ -331,7 +342,7 @@ pub fn get_metadata(_db: &SekejapDB, _node: &NodeHeader, _key: &str) -> Option<S
 /// }
 /// ```
 #[cfg(feature = "spatial")]
-pub fn is_point_in_polygon(lat: f64, lon: f64, node: &NodeHeader) -> bool {
+pub fn is_point_in_polygon(_lat: f64, _lon: f64, _node: &NodeHeader) -> bool {
     // TODO: Implement ray casting algorithm
     // This would:
     // 1. Get polygon coordinates from metadata
@@ -359,22 +370,21 @@ pub fn is_point_in_polygon(lat: f64, lon: f64, node: &NodeHeader) -> bool {
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::atoms::*;
+/// # use sekejap::atoms::*;
 /// let distance = haversine_distance(-6.2088, 106.8456, -6.5950, 106.8170);
 /// println!("Distance: {:.2} km", distance);
 /// ```
 pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const EARTH_RADIUS_KM: f64 = 6371.0;
-    
+
     let dlat = (lat2 - lat1).to_radians();
     let dlon = (lon2 - lon1).to_radians();
-    
+
     let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos()
-        * (dlon / 2.0).sin().powi(2);
-    
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    
+
     EARTH_RADIUS_KM * c
 }
 
@@ -398,7 +408,7 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// // Find all cities within 50km of Jakarta
@@ -406,23 +416,15 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// println!("Found {} nearby cities", nearby.len());
 /// ```
 #[cfg(feature = "spatial")]
-pub fn find_within_radius(
-    db: &SekejapDB,
-    lat: f64,
-    lon: f64,
-    radius_km: f64,
-) -> Vec<NodeHeader> {
-    // Get all nodes (would use spatial index in production)
-    let all_nodes: Vec<NodeHeader> = db.storage().all();
-    
-    all_nodes
-        .into_iter()
-        .filter(|_| {
-            // NodeHeader doesn't have coordinates field directly
-            // For now, skip filtering - TODO: get coordinates from payload
-            false
-        })
-        .collect()
+pub fn find_within_radius(db: &SekejapDB, lat: f64, lon: f64, radius_km: f64) -> Vec<NodeHeader> {
+    if let Ok(node_ids) = db.search_spatial(lat, lon, radius_km) {
+        node_ids
+            .into_iter()
+            .filter_map(|id| db.storage().get_by_id(id, None))
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Calculate cosine similarity between two vectors (requires "vector" feature)
@@ -443,7 +445,7 @@ pub fn find_within_radius(
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::atoms::*;
+/// # use sekejap::atoms::*;
 /// let vec1 = vec![0.1, 0.2, 0.3];
 /// let vec2 = vec![0.2, 0.3, 0.4];
 /// let similarity = cosine_similarity(&vec1, &vec2);
@@ -454,19 +456,16 @@ pub fn cosine_similarity(vec1: &[f32], vec2: &[f32]) -> f32 {
     if vec1.len() != vec2.len() {
         return 0.0;
     }
-    
-    let dot_product: f32 = vec1.iter()
-        .zip(vec2.iter())
-        .map(|(a, b)| a * b)
-        .sum();
-    
+
+    let dot_product: f32 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
+
     let mag1: f32 = vec1.iter().map(|x| x * x).sum::<f32>().sqrt();
     let mag2: f32 = vec2.iter().map(|x| x * x).sum::<f32>().sqrt();
-    
+
     if mag1 == 0.0 || mag2 == 0.0 {
         return 0.0;
     }
-    
+
     dot_product / (mag1 * mag2)
 }
 
@@ -485,12 +484,12 @@ pub fn cosine_similarity(vec1: &[f32], vec2: &[f32]) -> f32 {
 ///
 /// # Performance
 ///
-/// O(n * d) - n = total nodes, d = vector dimension
+/// O(log N) - Uses HNSW index
 ///
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// let query = vec![0.1, 0.2, 0.3, 0.4];
@@ -506,30 +505,27 @@ pub fn find_similar_vectors(
     top_k: usize,
     threshold: f32,
 ) -> Vec<(NodeHeader, f32)> {
-    // Get all nodes with vectors
-    let all_nodes: Vec<NodeHeader> = db.storage().all();
-    
-    let mut similarities: Vec<(NodeHeader, f32)> = all_nodes
-        .into_iter()
-        .filter_map(|node| {
-            // TODO: Get vectors from node payload
-            let node_vectors: Option<Vec<f32>> = None;
-            
-            node_vectors.and_then(|v| {
-                let score = cosine_similarity(query_vector, &v);
-                if score >= threshold {
-                    Some((node, score))
-                } else {
-                    None
-                }
+    if let Ok(results) = db.search_vector(query_vector, top_k) {
+        results
+            .into_iter()
+            .filter(|(_, dist)| {
+                // Convert distance back to similarity for threshold check
+                // Assuming Cosine distance: dist = 1.0 - sim => sim = 1.0 - dist
+                // Note: This logic depends on the metric used in index.
+                // For now, assume generic "smaller is better" distance, but return similarity.
+                // If using Cosine (default), sim = 1.0 - dist.
+                let sim = 1.0 - dist;
+                sim >= threshold
             })
-        }).collect();
-    
-    // Sort by similarity (descending)
-    similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    
-    // Return top-k
-    similarities.into_iter().take(top_k).collect()
+            .filter_map(|(id, dist)| {
+                db.storage()
+                    .get_by_id(id, None)
+                    .map(|node| (node, 1.0 - dist))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Traverse graph in BFS pattern
@@ -551,48 +547,44 @@ pub fn find_similar_vectors(
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// // Find all villages in Bogor regency
 /// let hierarchy = traverse_bfs(&db, "bogor-regency", 3);
 /// println!("Found {} administrative units", hierarchy.len());
 /// ```
-pub fn traverse_bfs(
-    db: &SekejapDB,
-    start_slug: &str,
-    max_depth: usize,
-) -> Vec<NodeHeader> {
+pub fn traverse_bfs(db: &SekejapDB, start_slug: &str, max_depth: usize) -> Vec<NodeHeader> {
     let start_entity_id = EntityId::new("nodes".to_string(), start_slug.to_string());
     let start_slug_hash = crate::hash_slug(start_slug);
     let graph = db.graph();
-    
+
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
     let mut result = Vec::new();
-    
+
     queue.push_back((start_entity_id.clone(), 0));
     visited.insert(start_entity_id.clone());
-    
+
     // Get the start node and add to results
     if let Some(start_node) = db.storage().get_by_slug(start_slug_hash) {
         result.push(start_node);
     }
-    
+
     while let Some((entity_id, depth)) = queue.pop_front() {
         if depth >= max_depth {
             continue;
         }
-        
+
         for edge in graph.get_edges_from(&entity_id) {
             let target_id = edge._to.clone();
             let target_slug = target_id.key();
             let target_slug_hash = crate::hash_slug(target_slug);
-            
+
             if !visited.contains(&target_id) {
                 visited.insert(target_id.clone());
                 queue.push_back((target_id.clone(), depth + 1));
-                
+
                 // Find node by slug hash (more efficient than entity_id matching)
                 if let Some(node) = db.storage().get_by_slug(target_slug_hash) {
                     result.push(node);
@@ -600,7 +592,7 @@ pub fn traverse_bfs(
             }
         }
     }
-    
+
     result
 }
 
@@ -623,7 +615,7 @@ pub fn traverse_bfs(
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use hsdl_sekejap::{SekejapDB, atoms::*};
+/// # use sekejap::{SekejapDB, atoms::*};
 /// # use std::path::Path;
 /// # let db = SekejapDB::new(Path::new("./data")).unwrap();
 /// // Find root causes of a crime
@@ -632,22 +624,21 @@ pub fn traverse_bfs(
 ///     println!("Potential cause: {:?}", cause);
 /// }
 /// ```
-pub fn traverse_backward(
-    db: &SekejapDB,
-    start_slug: &str,
-    max_depth: usize,
-) -> Vec<NodeHeader> {
+pub fn traverse_backward(db: &SekejapDB, start_slug: &str, max_depth: usize) -> Vec<NodeHeader> {
     let start_entity_id = EntityId::new("nodes".to_string(), start_slug.to_string());
-    
+
     let graph = db.graph();
-    let result = graph.backward_bfs(&start_entity_id, max_depth, 0.0, None);
-    
+    let result = graph.backward_bfs(&start_entity_id, max_depth, 0.0, None, None);
+
     // Find nodes by entity_id
     let all_nodes: Vec<NodeHeader> = db.storage().all();
-    
-    result.path.into_iter()
+
+    result
+        .path
+        .into_iter()
         .filter_map(|entity_id| {
-            all_nodes.iter()
+            all_nodes
+                .iter()
                 .find(|node| node.entity_id.as_ref() == Some(&entity_id))
                 .cloned()
         })
@@ -663,8 +654,12 @@ mod tests {
         // Jakarta to Bogor (actual distance ~43km based on coordinates)
         let dist = haversine_distance(-6.2088, 106.8456, -6.5950, 106.8170);
         // Allow 5km tolerance
-        assert!((dist - 43.0).abs() < 5.0, "Distance should be ~43km, got: {:.2}km", dist);
-        
+        assert!(
+            (dist - 43.0).abs() < 5.0,
+            "Distance should be ~43km, got: {:.2}km",
+            dist
+        );
+
         // Test zero distance
         let zero_dist = haversine_distance(-6.2088, 106.8456, -6.2088, 106.8456);
         assert!(zero_dist.abs() < 0.1, "Zero distance should be ~0");
@@ -676,10 +671,16 @@ mod tests {
         let vec1 = vec![1.0, 0.0, 0.0];
         let vec2 = vec![1.0, 0.0, 0.0];
         let sim = cosine_similarity(&vec1, &vec2);
-        assert!((sim - 1.0).abs() < 0.001, "Identical vectors should have similarity 1.0");
-        
+        assert!(
+            (sim - 1.0).abs() < 0.001,
+            "Identical vectors should have similarity 1.0"
+        );
+
         let vec3 = vec![0.0, 1.0, 0.0];
         let sim2 = cosine_similarity(&vec1, &vec3);
-        assert!(sim2 < 0.5, "Perpendicular vectors should have low similarity");
+        assert!(
+            sim2 < 0.5,
+            "Perpendicular vectors should have low similarity"
+        );
     }
 }

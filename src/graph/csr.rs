@@ -87,7 +87,7 @@ impl CsrMatrix {
     pub fn with_config(config: CsrConfig) -> Self {
         let initial_node_cap = config.initial_node_capacity;
         let initial_edge_cap = config.initial_edge_capacity;
-        
+
         let mut row_ptr = Vec::with_capacity(initial_node_cap + 1);
         row_ptr.push(0); // Row 0 starts at index 0
 

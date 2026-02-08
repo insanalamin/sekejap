@@ -13,7 +13,7 @@
 //! # Usage
 //!
 //! ```rust
-//! use hsdl_sekejap::graph::bitmap::Bitmap;
+//! use sekejap::graph::bitmap::Bitmap;
 //!
 //! let mut frontier = Bitmap::new(1000);
 //! frontier.set(1);
@@ -21,7 +21,7 @@
 //! frontier.set(3);
 //!
 //! let mut visited = Bitmap::new(1000);
-//! visited.or_assign(&frontier);
+//! visited.union_assign(&frontier);
 //!
 //! let next_frontier = frontier.difference(&visited);
 //! ```
@@ -333,22 +333,19 @@ impl Bitmap {
 
     /// Iterate over set bits
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.words
-            .iter()
-            .enumerate()
-            .flat_map(|(word_idx, &word)| {
-                if word == 0 {
-                    return Vec::new();
-                }
-                let mut bits = Vec::new();
-                let mut w = word;
-                while w != 0 {
-                    let bit = w.trailing_zeros() as usize;
-                    bits.push(word_idx * 64 + bit);
-                    w &= w - 1; // Clear lowest set bit
-                }
-                bits
-            })
+        self.words.iter().enumerate().flat_map(|(word_idx, &word)| {
+            if word == 0 {
+                return Vec::new();
+            }
+            let mut bits = Vec::new();
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                bits.push(word_idx * 64 + bit);
+                w &= w - 1; // Clear lowest set bit
+            }
+            bits
+        })
     }
 
     /// Convert to Vec<usize>

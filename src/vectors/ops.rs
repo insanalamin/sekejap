@@ -36,7 +36,7 @@ use crate::vectors::VectorSearchResult;
 /// # Example
 ///
 /// ```rust,ignore
-/// use hsdl_sekejap::vectors::ops::brute_force_search;
+/// use sekejap::vectors::ops::brute_force_search;
 ///
 /// // In practice, call via:
 /// // db.query().vector_search(query_vec, k).execute()
