@@ -1,11 +1,12 @@
 [package]
 name = "sekejap-python"
-version = "0.1.3"
-edition = "2024"
-description = "A graph-first, embedded multi-model database engine"
-license = "MIT"
-repository = "https://github.com/insanalamin/sekejap"
-homepage = "https://sekejap.mecha.id"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
 documentation = "https://github.com/insanalamin/sekejap#readme"
 keywords = ["database", "graph", "vector", "multi-model"]
 classifiers = [

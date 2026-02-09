@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # --- 1. Publish Rust Crate ---
+  publish-rust:
+    name: Publish to Crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish to Crates.io
+        run: cargo publish --token ${CRATES_TOKEN} --all-features
+        env:
+          CRATES_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  # --- 2. Build and Publish Python Wheels ---
+  publish-python:
+    name: Build & Publish Python Wheels
+    runs-on: ubuntu-latest
+    # --- REQUIRED FOR OIDC TRUSTED PUBLISHING ---
+    permissions:
+      id-token: write
+    environment:
+      name: release
+      url: https://pypi.org/p/sekejap
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build Wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          working-directory: wrappers/python
+          
+      - name: Publish to PyPI via Trusted Publisher
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wrappers/python/dist
+          skip-existing: true

@@ -1,11 +1,22 @@
-[package]
-name = "sekejap"
-version = "0.1.3"
+[workspace]
+members = [".", "wrappers/python"]
+
+[workspace.package]
+version = "0.1.4"
 edition = "2024"
-description = "A graph-first, embedded multi-model database engine"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
 homepage = "https://sekejap.mecha.id"
+description = "A graph-first, embedded multi-model database engine"
+
+[package]
+name = "sekejap"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 documentation = "https://github.com/insanalamin/sekejap#readme"
 keywords = ["database", "graph", "vector", "spatial", "multi-model"]
 categories = ["database", "embedded", "data-structures"]
