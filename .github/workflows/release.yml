@@ -10,6 +10,8 @@ jobs:
   publish-rust:
     name: Publish to Crates.io
     runs-on: ubuntu-latest
+    environment:
+      name: release
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -23,12 +25,10 @@ jobs:
   publish-python:
     name: Build & Publish Python Wheels
     runs-on: ubuntu-latest
-    # --- REQUIRED FOR OIDC TRUSTED PUBLISHING ---
     permissions:
       id-token: write
     environment:
       name: release
-      url: https://pypi.org/p/sekejap
     strategy:
       matrix:
         target: [x86_64, aarch64]
@@ -41,7 +41,8 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          # Limit to stable Python versions to avoid 3.14-dev errors
+          args: --release --out dist -i python3.8 -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
           working-directory: wrappers/python
           
       - name: Publish to PyPI via Trusted Publisher
