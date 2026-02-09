@@ -320,15 +320,15 @@ def run_sekejap_benchmark(nodes, companies):
         parent_map[node["id"]] = f"node/{node['id']}"
         
         # Add edge to parent if exists
-        if node["parent_id"]:
-            parent_slug = parent_map.get(node["parent_id"])
-            if parent_slug:
-                edge_data = json.dumps({
-                    "_from": parent_slug,
-                    "_to": f"node/{node['id']}",
-                    "_type": "contains",
-                })
-                db.write(f"edge_{parent_slug}_{node['id']}", edge_data)
+        # if node["parent_id"]:
+        #     parent_slug = parent_map.get(node["parent_id"])
+        #     if parent_slug:
+        #         edge_data = json.dumps({
+        #             "_from": parent_slug,
+        #             "_to": f"node/{node['id']}",
+        #             "_type": "contains",
+        #         })
+        #         db.write(f"edge_{parent_slug}_{node['id']}", edge_data)
     elapsed = (time.perf_counter() - start) * 1000
     results.append({"name": "Insert Nodes", "ms": elapsed})
     

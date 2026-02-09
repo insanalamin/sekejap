@@ -386,7 +386,7 @@ mod sekejapql_tests {
 
         // First verify we can get all nodes
         let all_query = r#"{}"#;
-        let all_result = engine.execute(all_query).unwrap();
+        let all_result = engine.query(all_query).unwrap();
         // Should find italian, restaurant-1 = 2 nodes
         assert_eq!(all_result.nodes.len(), 2, "Expected 2 nodes in DB");
 
@@ -398,7 +398,7 @@ mod sekejapql_tests {
             ]
         }"#;
 
-        let result = engine.execute(query).unwrap();
+        let result = engine.query(query).unwrap();
 
         // Should find node that has an edge to "italian" (restaurant-1)
         assert_eq!(
@@ -471,7 +471,7 @@ mod sekejapql_tests {
             }
         }"#;
 
-        let result = engine.execute(query).unwrap();
+        let result = engine.query(query).unwrap();
 
         // Should find west-java (start) + bandung + jakarta = 3 nodes
         // Traversal includes the starting node
@@ -502,7 +502,7 @@ mod sekejapql_tests {
             "offset": 2
         }"#;
 
-        let result = engine.execute(query).unwrap();
+        let result = engine.query(query).unwrap();
         assert_eq!(result.nodes.len(), 5);
     }
 }

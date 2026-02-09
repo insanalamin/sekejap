@@ -55,10 +55,15 @@ impl BlobStore {
 
         use std::io::Write;
         self.current_file.write_all(data)?;
-        self.current_file.flush()?;
+        // REMOVED: self.current_file.flush()?; - Let the OS buffer for "Sekejap" speed
 
         self.current_offset += data.len() as u64;
         Ok(ptr)
+    }
+
+    /// Force a physical disk synchronization (fsync)
+    pub fn sync(&mut self) -> std::io::Result<()> {
+        self.current_file.sync_all()
     }
 
     /// Read bytes from blob store using pointer

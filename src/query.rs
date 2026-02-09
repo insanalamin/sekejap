@@ -61,8 +61,10 @@ impl<'db> Query<'db> {
 
     /// Filter by exact slug
     pub fn by_slug(mut self, slug: &str) -> Self {
-        use crate::hash_slug;
-        self.filters.slug_hash = Some(hash_slug(slug));
+        use crate::{hash_slug, EntityId};
+        let entity_id = EntityId::parse(slug)
+            .unwrap_or_else(|_| EntityId::new("nodes".to_string(), slug.to_string()));
+        self.filters.slug_hash = Some(hash_slug(&entity_id.to_string()));
         self
     }
 
