@@ -36,3 +36,12 @@ impl BatchUpsert for PersistentStorage {
         PersistentStorage::upsert_batch(self, nodes)
     }
 }
+
+impl BatchUpsert for SingleStorage {
+    fn upsert_batch(
+        &self,
+        nodes: &[crate::types::NodeHeader],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        SingleStorage::upsert_batch(self, nodes)
+    }
+}

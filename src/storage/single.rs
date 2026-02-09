@@ -76,6 +76,14 @@ impl SingleStorage {
         }
     }
 
+    /// Insert or update a batch of nodes
+    pub fn upsert_batch(&self, nodes: &[NodeHeader]) -> Result<(), Box<dyn std::error::Error>> {
+        for node in nodes {
+            self.upsert(node.clone());
+        }
+        Ok(())
+    }
+
     /// Get current version of node by slug hash
     ///
     /// # Arguments

@@ -186,9 +186,9 @@ impl FulltextIndex {
     ) -> Result<Vec<FulltextResult>, Box<dyn std::error::Error>> {
         let searcher = self.reader.searcher();
 
-        // Create query parser for searchable fields
+        // Create query parser for searchable fields (include attributes for dynamic searching)
         let query_parser =
-            QueryParser::for_index(&self.index, vec![self.title_field, self.content_field]);
+            QueryParser::for_index(&self.index, vec![self.title_field, self.content_field, self.attributes_field]);
 
         // Parse query (handle parse errors gracefully)
         let query = match query_parser.parse_query(query) {
@@ -265,7 +265,7 @@ impl FulltextIndex {
         let searcher = self.reader.searcher();
 
         let mut query_parser =
-            QueryParser::for_index(&self.index, vec![self.title_field, self.content_field]);
+            QueryParser::for_index(&self.index, vec![self.title_field, self.content_field, self.attributes_field]);
 
         // Set field boosts
         query_parser.set_field_boost(self.title_field, title_boost);

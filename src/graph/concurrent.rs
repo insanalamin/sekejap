@@ -95,6 +95,45 @@ impl ConcurrentGraph {
         }
     }
 
+    /// Update the weight of an edge
+    pub fn update_edge_weight(&self, from: &EntityId, to: &EntityId, weight: f32, edge_type: Option<&str>) -> bool {
+        let mut updated = false;
+
+        // Update in forward adjacency list
+        if let Some(mut edges) = self.edges.get_mut(from) {
+            for edge in edges.iter_mut() {
+                if edge._from == *from && edge._to == *to {
+                    if let Some(ref et) = edge_type {
+                        if edge._type == **et {
+                            edge.weight = weight;
+                            updated = true;
+                        }
+                    } else {
+                        edge.weight = weight;
+                        updated = true;
+                    }
+                }
+            }
+        }
+
+        // Update in reverse adjacency list
+        if let Some(mut rev_edges) = self.reverse_edges.get_mut(to) {
+            for edge in rev_edges.iter_mut() {
+                if edge._from == *from && edge._to == *to {
+                    if let Some(ref et) = edge_type {
+                        if edge._type == **et {
+                            edge.weight = weight;
+                        }
+                    } else {
+                        edge.weight = weight;
+                    }
+                }
+            }
+        }
+
+        updated
+    }
+
     /// Remove a specific edge
     ///
     /// # Arguments
