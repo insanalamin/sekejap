@@ -1,0 +1,99 @@
+# ============================================
+# Rust / Cargo
+# ============================================
+./target
+Cargo.lock
+*.pdb
+*.rlib
+*.so
+*.dylib
+*.dll
+
+# rust-analyzer
+/rls
+
+# ============================================
+# Python / PyO3
+# ============================================
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+.pytest_cache/
+.coverage
+cover/
+htmlcov/
+
+# Python virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# maturin develop
+*.so
+*.pyd
+
+# ============================================
+# IDE & Editors
+# ============================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ============================================
+# macOS
+# ============================================
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ============================================
+# Project Data (runtime data)
+# ============================================
+/data/
+/data/*
+!/data/.gitkeep
+/blobs/
+/fulltext/
+*.db
+*.wal
+*.shm
+
+# ============================================
+# Temporary Files
+# ============================================
+*.tmp
+*.log
+*.bak
+*~
+.tmp/
+temp/
+result.md
+
+# ============================================
+# Testing
+# ============================================
+/coverage/
+/cargo-test/
+test-results/
+
+# ============================================
+# Secrets (never commit)
+# ============================================
+*.env
+.env.local
+*.pem
+*.key
+target/.rustc_info.json
+target
+
+/unused
+
+/scenarios

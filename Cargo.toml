@@ -1,0 +1,82 @@
+[workspace]
+members = [".", "wrappers/python", "wrappers/browser"]
+
+[workspace.package]
+version = "0.2.2"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/insanalamin/sekejap"
+homepage = "https://sekejap.mecha.id"
+description = "A graph-first, embedded multi-model database engine"
+
+[package]
+name = "sekejap"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://github.com/insanalamin/sekejap#readme"
+keywords = ["database", "graph", "vector", "spatial", "multi-model"]
+categories = ["database", "embedded", "data-structures"]
+
+[dependencies]
+memmap2 = "0.9"
+bytemuck = { version = "1.14.0", features = ["derive"] }
+dashmap = "6.1.0"
+smallvec = "1.13.2"
+crc32fast = "1.4.0"
+seahash = "4.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+roaring = "0.10"
+bincode = "1.3"
+crossbeam-epoch = "0.9"
+ahash = "0.8"
+rstar = "0.12.0"
+parking_lot = "0.12.3"
+rand = "0.8"
+rayon = "1.10"
+tantivy = { version = "0.25", optional = true }
+seekstorm = { version = "2.3", optional = true, default-features = false }
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[features]
+default = []
+
+# ==========================================
+# Full-Text Search Adapters
+# ==========================================
+# Production-ready: Tantivy (mature, portable, no special compiler flags)
+fulltext = ["dep:tantivy"]
+fulltext-tantivy = ["dep:tantivy"]
+
+# ==========================================
+# SeekStorm (EXPERIMENTAL - Requires CPU Features)
+# ==========================================
+# SeekStorm is 2-3x faster than Tantivy but requires:
+#   RUSTFLAGS="-C target-cpu=native" (or "-C target-feature=+aes,+sse2")
+#
+# Why not default: Breaks portability on older CPUs without AES support
+# When to use: High-performance deployments on modern hardware (2013+)
+#
+# ⚠️  Do NOT enable both tantivy and seekstorm features together!
+#     Pick one adapter per build.
+#
+# Usage:
+#   RUSTFLAGS="-C target-cpu=native" cargo build --features fulltext-seekstorm
+#
+fulltext-seekstorm = ["dep:seekstorm", "seekstorm?/zh"]  # With Chinese language support
+fulltext-seekstorm-fast = ["dep:seekstorm"]              # Minimal features
+
+# ==========================================
+# Other Features
+# ==========================================
+# Parallel graph traversal with Rayon
+parallel = []
+
+[package.metadata.docs.rs]
+all-features = true

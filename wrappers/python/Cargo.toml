@@ -1,0 +1,53 @@
+[package]
+name = "sekejap-python"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+documentation = "https://github.com/insanalamin/sekejap#readme"
+keywords = ["database", "graph", "vector", "multi-model"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[lib]
+name = "sekejap"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# SekejapDB core (same workspace)
+sekejap = { path = "../..", default-features = false }
+
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module", "auto-initialize"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+pyo3-build-config = "0.22"
+
+[features]
+default = ["fulltext"]
+fulltext = ["sekejap/fulltext"]
+
+[tool.maturin]
+module-name = "sekejap"
+package-name = "sekejap"
+
+#[project.metadata]
+#name = "sekejap"

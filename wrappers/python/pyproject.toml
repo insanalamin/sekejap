@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin"]
+build-backend = "maturin"
+
+[project]
+name = "sekejap"  # Keep name as it defines the PyPI identity
+dynamic = ["version", "description"]
+requires-python = ">=3.8"
+
+[project.urls]
+homepage = "https://sekejap.mecha.id"
+repository = "https://github.com/insanalamin/sekejap"
+
+[tool.maturin]
+module-name = "sekejap"
+bindings = "pyo3"

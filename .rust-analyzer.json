@@ -1,0 +1,9 @@
+{
+  "cargo": {
+    "features": ["vector", "spatial", "fulltext", "all"]
+  },
+  "check": {
+    "command": "check",
+    "features": ["all"]
+  }
+}
