@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/browser"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
