@@ -20,6 +20,7 @@ jobs:
         run: cargo publish --all-features
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          RUSTFLAGS: "-C target-feature=+aes,+sse2"
 
   # --- 2. Build and Publish Python Wheels ---
   publish-python:
