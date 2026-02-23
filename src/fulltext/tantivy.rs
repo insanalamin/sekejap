@@ -3,13 +3,13 @@
 //! Mature full-text search engine with rich ecosystem.
 //! Larger binary (~15MB) but more features.
 
-use super::{FullTextAdapter, SearchHit};
-use tantivy::schema::*;
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument};
-use tantivy::query::QueryParser;
-use tantivy::collector::TopDocs;
+use super::{FullTextAdapter, SearchHit, SearchOptions};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::*;
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument};
 
 /// Tantivy-based fulltext index adapter
 pub struct TantivyAdapter {
@@ -51,7 +51,12 @@ impl TantivyAdapter {
 }
 
 impl FullTextAdapter for TantivyAdapter {
-    fn add_document(&self, title: &str, content: &str, id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn add_document(
+        &self,
+        title: &str,
+        content: &str,
+        id: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = self.writer.lock().unwrap();
         let mut doc = TantivyDocument::default();
         doc.add_u64(self.id_field, id);
@@ -61,26 +66,41 @@ impl FullTextAdapter for TantivyAdapter {
         Ok(())
     }
 
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, Box<dyn std::error::Error>> {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        options: Option<&SearchOptions>,
+    ) -> Result<Vec<SearchHit>, Box<dyn std::error::Error>> {
         let reader = self.reader.lock().unwrap();
         let searcher = reader.searcher();
 
-        let query_parser = QueryParser::for_index(
-            &self.index,
-            vec![self.title_field, self.content_field]
-        );
+        let mut query_parser =
+            QueryParser::for_index(&self.index, vec![self.title_field, self.content_field]);
+        if let Some(opts) = options {
+            query_parser.set_field_boost(self.title_field, opts.title_weight);
+            query_parser.set_field_boost(self.content_field, opts.content_weight);
+        }
 
         let parsed_query = query_parser.parse_query(query)?;
         let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit))?;
 
-        let hits: Vec<SearchHit> = top_docs.into_iter().filter_map(|(score, doc_address)| {
-            searcher.doc::<TantivyDocument>(doc_address).ok().and_then(|doc| {
-                doc.get_first(self.id_field).and_then(|v| v.as_u64()).map(|id| SearchHit {
-                    id,
-                    score: score as f32,
-                })
+        let hits: Vec<SearchHit> = top_docs
+            .into_iter()
+            .filter_map(|(score, doc_address)| {
+                searcher
+                    .doc::<TantivyDocument>(doc_address)
+                    .ok()
+                    .and_then(|doc| {
+                        doc.get_first(self.id_field)
+                            .and_then(|v| v.as_u64())
+                            .map(|id| SearchHit {
+                                id,
+                                score: score as f32,
+                            })
+                    })
             })
-        }).collect();
+            .collect();
 
         Ok(hits)
     }

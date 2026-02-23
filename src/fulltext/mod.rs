@@ -16,9 +16,9 @@
 
 use std::path::Path;
 
-#[cfg(feature = "fulltext-tantivy")]
+#[cfg(any(feature = "fulltext", feature = "fulltext-tantivy"))]
 mod tantivy;
-#[cfg(feature = "fulltext-tantivy")]
+#[cfg(any(feature = "fulltext", feature = "fulltext-tantivy"))]
 pub use tantivy::TantivyAdapter;
 
 #[cfg(feature = "fulltext-seekstorm")]
@@ -33,27 +33,65 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchOptions {
+    pub title_weight: f32,
+    pub content_weight: f32,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            title_weight: 1.0,
+            content_weight: 1.0,
+        }
+    }
+}
+
 /// Trait for full-text search adapters
 pub trait FullTextAdapter: Send + Sync {
     /// Add a document with title, content, and unique id (slug_hash)
-    fn add_document(&self, title: &str, content: &str, id: u64) -> Result<(), Box<dyn std::error::Error>>;
-    
+    fn add_document(
+        &self,
+        title: &str,
+        content: &str,
+        id: u64,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
     /// Search for documents matching query, returning top-k hits
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, Box<dyn std::error::Error>>;
-    
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        options: Option<&SearchOptions>,
+    ) -> Result<Vec<SearchHit>, Box<dyn std::error::Error>>;
+
     /// Commit pending writes to disk
     fn commit(&self) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 /// Create fulltext adapter. Priority: Tantivy > SeekStorm > Error.
-pub fn create_default_adapter(path: &Path) -> Result<Box<dyn FullTextAdapter>, Box<dyn std::error::Error>> {
-    #[cfg(feature = "fulltext-tantivy")]
-    { return Ok(Box::new(TantivyAdapter::new(path)?)); }
-    
-    #[cfg(all(feature = "fulltext-seekstorm", not(feature = "fulltext-tantivy")))]
-    { return Ok(Box::new(SeekStormAdapter::new(path)?)); }
-    
-    #[cfg(not(any(feature = "fulltext-seekstorm", feature = "fulltext-tantivy")))]
+pub fn create_default_adapter(
+    path: &Path,
+) -> Result<Box<dyn FullTextAdapter>, Box<dyn std::error::Error>> {
+    #[cfg(any(feature = "fulltext", feature = "fulltext-tantivy"))]
+    {
+        return Ok(Box::new(TantivyAdapter::new(path)?));
+    }
+
+    #[cfg(all(
+        feature = "fulltext-seekstorm",
+        not(any(feature = "fulltext", feature = "fulltext-tantivy"))
+    ))]
+    {
+        return Ok(Box::new(SeekStormAdapter::new(path)?));
+    }
+
+    #[cfg(not(any(
+        feature = "fulltext",
+        feature = "fulltext-seekstorm",
+        feature = "fulltext-tantivy"
+    )))]
     {
         Err("No fulltext feature enabled. Use 'fulltext-tantivy' (recommended) or 'fulltext-seekstorm' (requires RUSTFLAGS).".into())
     }

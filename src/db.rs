@@ -1,22 +1,24 @@
-use crate::arena::{DurableArena, BlobArena};
-use crate::types::{NodeSlot, EdgeSlot, VectorSlot, SpatialNode, CollectionSchema, Hit, AggOp, Step, Outcome};
-use crate::hnsw::{HyperHNSW, CosineDistance, ArenaVectorStore};
-use crate::stores::{NodeStore, EdgeStore, SchemaStore};
-use crate::set::Set;
-use crate::sekejapql::SekejapQL;
-use crate::mmap_hash::MmapHashIndex;
+use crate::arena::{BlobArena, DurableArena};
 use crate::collection_bitmap::CollectionBitmapIndex;
-use crate::index::{HashIndex, RangeIndex, PropertyIndex};
 #[cfg(feature = "fulltext")]
 use crate::fulltext::FullTextAdapter;
+use crate::hnsw::{ArenaVectorStore, CosineDistance, HyperHNSW};
+use crate::index::{HashIndex, PropertyIndex, RangeIndex};
+use crate::mmap_hash::MmapHashIndex;
+use crate::sekejapql::QueryCompiler;
+use crate::set::Set;
+use crate::stores::{EdgeStore, NodeStore, SchemaStore};
+use crate::types::{
+    AggOp, CollectionSchema, EdgeSlot, Hit, NodeSlot, Outcome, SpatialNode, Step, VectorSlot,
+};
 use dashmap::DashMap;
-use smallvec::SmallVec;
-use std::path::Path;
-use std::sync::Arc;
 use rstar::RTree;
 use serde_json::Value;
+use smallvec::SmallVec;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicUsize, Ordering, AtomicU64};
 
 pub struct SekejapDB {
     /// Capacity passed to new() — stored so init_hnsw() can size the vector arena.
@@ -59,13 +61,15 @@ impl SekejapDB {
             edges: DurableArena::new(&base_path.join("edges.mmap"), count * 3)?,
             // Vector arena starts empty — expanded only when init_hnsw() is called.
             // This avoids pre-allocating N×512B (25 GB at 50M) for non-vector workloads.
-            vectors: parking_lot::RwLock::new(
-                DurableArena::new(&base_path.join("vectors.mmap"), 0)?
-            ),
+            vectors: parking_lot::RwLock::new(DurableArena::new(
+                &base_path.join("vectors.mmap"),
+                0,
+            )?),
             blobs: BlobArena::new(&base_path.join("blobs.mmap"), blob_mb)?,
-            slug_index: Arc::new(parking_lot::RwLock::new(
-                MmapHashIndex::new(&base_path.join("slug_index.mhash"), slug_cap)?
-            )),
+            slug_index: Arc::new(parking_lot::RwLock::new(MmapHashIndex::new(
+                &base_path.join("slug_index.mhash"),
+                slug_cap,
+            )?)),
             adj_fwd: DashMap::with_capacity(count),
             adj_rev: DashMap::with_capacity(count),
             collections: DashMap::new(),
@@ -97,7 +101,9 @@ impl SekejapDB {
             let mut slug_w = self.slug_index.write();
             for i in 0..node_count {
                 let slot = self.nodes.read_at(i);
-                if slot.flags == 0 { continue; }
+                if slot.flags == 0 {
+                    continue;
+                }
                 slug_w.insert(slot.slug_hash, i as u32);
                 self.collection_counts
                     .entry(slot.collection_hash)
@@ -105,12 +111,16 @@ impl SekejapDB {
                     .fetch_add(1, Ordering::Relaxed);
                 bm_pairs.push((slot.collection_hash, i as u32));
                 if slot.lat != 0.0 || slot.lon != 0.0 {
-                    spatial_nodes.push(SpatialNode { id: i as u32, coords: [slot.lat, slot.lon] });
+                    spatial_nodes.push(SpatialNode {
+                        id: i as u32,
+                        coords: [slot.lat, slot.lon],
+                    });
                 }
             }
         }
 
-        self.collection_bitmaps.rebuild_from_iter(bm_pairs.into_iter());
+        self.collection_bitmaps
+            .rebuild_from_iter(bm_pairs.into_iter());
 
         if !spatial_nodes.is_empty() {
             *self.spatial.write() = RTree::bulk_load(spatial_nodes);
@@ -119,8 +129,13 @@ impl SekejapDB {
         let edge_count = self.edges.write_head.load(Ordering::Acquire);
         for i in 0..edge_count {
             let edge = self.edges.read_at(i);
-            if edge.flags == 0 { continue; }
-            self.adj_fwd.entry(edge.from_node).or_default().push(i as u32);
+            if edge.flags == 0 {
+                continue;
+            }
+            self.adj_fwd
+                .entry(edge.from_node)
+                .or_default()
+                .push(i as u32);
             self.adj_rev.entry(edge.to_node).or_default().push(i as u32);
         }
 
@@ -137,9 +152,13 @@ impl SekejapDB {
         let node_count = self.nodes.write_head.load(Ordering::Acquire);
         for i in 0..node_count {
             let slot = self.nodes.read_at(i);
-            if slot.flags == 0 { continue; }
+            if slot.flags == 0 {
+                continue;
+            }
             let bytes = self.blobs.read(slot.blob_offset, slot.blob_len);
-            let Ok(json) = serde_json::from_slice::<Value>(bytes) else { continue };
+            let Ok(json) = serde_json::from_slice::<Value>(bytes) else {
+                continue;
+            };
 
             for entry in self.field_hash_indexes.iter() {
                 if let Some(v) = json.get(entry.key().as_str()) {
@@ -157,7 +176,9 @@ impl SekejapDB {
     /// Resolve arena index → original slug string (read from blob _id field).
     pub fn slug_from_idx(&self, idx: u32) -> Option<String> {
         let slot = self.nodes.read_at(idx as u64);
-        if slot.flags == 0 { return None; }
+        if slot.flags == 0 {
+            return None;
+        }
         let bytes = self.blobs.read(slot.blob_offset, slot.blob_len);
         let json: Value = serde_json::from_slice(bytes).ok()?;
         json.get("_id")?.as_str().map(|s| s.to_string())
@@ -166,7 +187,8 @@ impl SekejapDB {
     pub fn init_hnsw(&self, m: usize) {
         // Expand the vector arena to full node capacity (lazy allocation).
         // First call allocates node_capacity × 512 B on disk; subsequent calls are no-ops.
-        self.vectors.write()
+        self.vectors
+            .write()
             .resize(self.node_capacity)
             .expect("failed to resize vector arena");
         let store = ArenaVectorStore::new(&*self.vectors.read(), 128);
@@ -182,9 +204,15 @@ impl SekejapDB {
     }
 
     // --- Resource Accessors (Public API) ---
-    pub fn nodes(&self) -> NodeStore<'_> { NodeStore::new(self) }
-    pub fn edges(&self) -> EdgeStore<'_> { EdgeStore::new(self) }
-    pub fn schema(&self) -> SchemaStore<'_> { SchemaStore::new(self) }
+    pub fn nodes(&self) -> NodeStore<'_> {
+        NodeStore::new(self)
+    }
+    pub fn edges(&self) -> EdgeStore<'_> {
+        EdgeStore::new(self)
+    }
+    pub fn schema(&self) -> SchemaStore<'_> {
+        SchemaStore::new(self)
+    }
 
     pub fn parse_entity_id(slug: &str) -> (u64, u64) {
         let full_hash = seahash::hash(slug.as_bytes());
@@ -197,36 +225,51 @@ impl SekejapDB {
     }
 
     fn now_raw() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     pub fn update_timestamp(&self) {
-        self.cached_timestamp.store(Self::now_raw(), Ordering::Relaxed);
+        self.cached_timestamp
+            .store(Self::now_raw(), Ordering::Relaxed);
     }
 
     // --- Internal Methods (called by stores) ---
 
     /// Write with explicit slug (USES PROVIDED SLUG)
-    pub(crate) fn write_internal(&self, slug: &str, data: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    pub(crate) fn write_internal(
+        &self,
+        slug: &str,
+        data: &str,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
         let value: Value = serde_json::from_str(data)?;
         self.write_with_value(slug, data, &value)
     }
 
     /// Write with auto-detected slug from JSON
-    pub(crate) fn write_json_internal(&self, json_data: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    pub(crate) fn write_json_internal(
+        &self,
+        json_data: &str,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
         let value: Value = serde_json::from_str(json_data)?;
 
         if value.get("_from").is_some() && value.get("_to").is_some() {
             let from = value["_from"].as_str().ok_or("Missing _from")?;
             let to = value["_to"].as_str().ok_or("Missing _to")?;
             let edge_type = value["_type"].as_str().unwrap_or("related");
-            let weight = value.get("weight")
+            let weight = value
+                .get("weight")
                 .or_else(|| value.get("props").and_then(|p| p.get("weight")))
-                .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
             self.add_edge_internal(from, to, weight, edge_type)?;
             Ok(0)
         } else {
-            let slug = value.get("_id").and_then(|v| v.as_str())
+            let slug = value
+                .get("_id")
+                .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| {
                     let c = value.get("_collection")?.as_str()?;
@@ -239,7 +282,10 @@ impl SekejapDB {
     }
 
     /// Batch write
-    pub(crate) fn write_batch_internal(&self, items: &[(&str, &str)]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    pub(crate) fn write_batch_internal(
+        &self,
+        items: &[(&str, &str)],
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         let mut indices = Vec::with_capacity(items.len());
         for &(slug, data) in items {
             let idx = self.write_internal(slug, data)?;
@@ -249,7 +295,12 @@ impl SekejapDB {
     }
 
     /// Internal write with parsed value (single-item path — indexes inline)
-    fn write_with_value(&self, slug: &str, _raw: &str, value: &Value) -> Result<u32, Box<dyn std::error::Error>> {
+    fn write_with_value(
+        &self,
+        slug: &str,
+        _raw: &str,
+        value: &Value,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
         let (collection_hash, slug_hash) = Self::parse_entity_id(slug);
         let (lat, lon) = Self::extract_coords(value);
 
@@ -263,15 +314,61 @@ impl SekejapDB {
         let final_raw = serde_json::to_string(&final_value)?;
 
         let (b_off, b_len) = self.blobs.append(final_raw.as_bytes());
-        let n_idx = self.nodes.write_head.fetch_add(1, Ordering::Relaxed);
+        let existing_idx = { self.slug_index.read().get(slug_hash) };
+        let is_new = existing_idx.is_none();
+        let n_idx = existing_idx
+            .map(|idx| idx as u64)
+            .unwrap_or_else(|| self.nodes.write_head.fetch_add(1, Ordering::Relaxed));
+
+        if !is_new {
+            let old_slot = self.nodes.read_at(n_idx);
+            if old_slot.flags != 0 {
+                if old_slot.lat != 0.0 || old_slot.lon != 0.0 {
+                    self.spatial.write().remove(&SpatialNode {
+                        id: n_idx as u32,
+                        coords: [old_slot.lat, old_slot.lon],
+                    });
+                }
+                for entry in self.field_hash_indexes.iter() {
+                    entry.value().remove(n_idx as u32);
+                }
+                for entry in self.field_range_indexes.iter() {
+                    entry.value().remove(n_idx as u32);
+                }
+                if old_slot.collection_hash != collection_hash {
+                    self.collection_bitmaps
+                        .remove(old_slot.collection_hash, n_idx as u32);
+                    if let Some(count) = self.collection_counts.get(&old_slot.collection_hash) {
+                        count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    self.collection_bitmaps
+                        .insert(collection_hash, n_idx as u32);
+                    self.collection_counts
+                        .entry(collection_hash)
+                        .or_insert_with(|| AtomicUsize::new(0))
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else {
+            self.collection_bitmaps
+                .insert(collection_hash, n_idx as u32);
+            self.collection_counts
+                .entry(collection_hash)
+                .or_insert_with(|| AtomicUsize::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
         let vec_present = Self::write_vector_if_present(&self.vectors, n_idx, value);
 
         let slot = NodeSlot {
             crc32: crc32fast::hash(final_raw.as_bytes()),
             slug_hash,
             collection_hash,
-            flags: 1, lat, lon,
-            blob_offset: b_off, blob_len: b_len,
+            flags: 1,
+            lat,
+            lon,
+            blob_offset: b_off,
+            blob_len: b_len,
             vec_slot: if vec_present { n_idx as u32 } else { u32::MAX },
             ..Default::default()
         };
@@ -279,14 +376,17 @@ impl SekejapDB {
 
         if vec_present {
             if let Some(ref hnsw) = *self.hnsw.read() {
-                hnsw.insert_index(n_idx as u32, 32).map_err(|_e: String| "HNSW insert failed".to_string())?;
+                hnsw.insert_index(n_idx as u32, 32)
+                    .map_err(|_e: String| "HNSW insert failed".to_string())?;
             }
         }
 
         #[cfg(feature = "fulltext")]
         if let Some(ref ft) = *self.fulltext.read() {
             let title = value.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            let content = value.get("content").and_then(|v| v.as_str())
+            let content = value
+                .get("content")
+                .and_then(|v| v.as_str())
                 .or_else(|| value.get("body").and_then(|v| v.as_str()))
                 .unwrap_or("");
             if !title.is_empty() || !content.is_empty() {
@@ -297,16 +397,12 @@ impl SekejapDB {
         // Update slug index (exclusive write)
         self.slug_index.write().insert(slug_hash, n_idx as u32);
 
-        // Update collection bitmap
-        self.collection_bitmaps.insert(collection_hash, n_idx as u32);
-
         if lat != 0.0 || lon != 0.0 {
-            self.spatial.write().insert(SpatialNode { id: n_idx as u32, coords: [lat, lon] });
+            self.spatial.write().insert(SpatialNode {
+                id: n_idx as u32,
+                coords: [lat, lon],
+            });
         }
-        self.collection_counts
-            .entry(collection_hash)
-            .or_insert_with(|| AtomicUsize::new(0))
-            .fetch_add(1, Ordering::Relaxed);
 
         // Index hot fields
         for entry in self.field_hash_indexes.iter() {
@@ -320,7 +416,8 @@ impl SekejapDB {
             }
         }
 
-        self.nodes.commit(n_idx + 1);
+        let committed = self.nodes.write_head.load(Ordering::Acquire).max(n_idx + 1);
+        self.nodes.commit(committed);
         self.blobs.commit();
         Ok(n_idx as u32)
     }
@@ -331,7 +428,12 @@ impl SekejapDB {
 
     /// Write node to arena + slug_index. NO spatial, NO HNSW, NO per-item commit.
     /// Returns (arena_index, has_vector, lat, lon).
-    fn write_node_deferred(&self, slug: &str, raw: &str, value: &Value) -> Result<(u32, bool, f32, f32), Box<dyn std::error::Error>> {
+    fn write_node_deferred(
+        &self,
+        slug: &str,
+        raw: &str,
+        value: &Value,
+    ) -> Result<(u32, bool, f32, f32), Box<dyn std::error::Error>> {
         let (collection_hash, slug_hash) = Self::parse_entity_id(slug);
         let (lat, lon) = Self::extract_coords(value);
         let (b_off, b_len) = self.blobs.append(raw.as_bytes());
@@ -340,16 +442,22 @@ impl SekejapDB {
 
         let slot = NodeSlot {
             crc32: crc32fast::hash(raw.as_bytes()),
-            slug_hash, collection_hash,
-            flags: 1, lat, lon,
-            blob_offset: b_off, blob_len: b_len,
+            slug_hash,
+            collection_hash,
+            flags: 1,
+            lat,
+            lon,
+            blob_offset: b_off,
+            blob_len: b_len,
             vec_slot: if vec_present { n_idx as u32 } else { u32::MAX },
             ..Default::default()
         };
         self.nodes.write_at(n_idx, &slot);
         self.slug_index.write().insert(slug_hash, n_idx as u32);
-        self.collection_bitmaps.insert(collection_hash, n_idx as u32);
-        self.collection_counts.entry(collection_hash)
+        self.collection_bitmaps
+            .insert(collection_hash, n_idx as u32);
+        self.collection_counts
+            .entry(collection_hash)
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
 
@@ -369,21 +477,36 @@ impl SekejapDB {
     }
 
     /// Add edge without per-item commit.
-    fn add_edge_deferred(&self, source_slug: &str, target_slug: &str, weight: f32, edge_type: &str) -> Result<(), String> {
+    fn add_edge_deferred(
+        &self,
+        source_slug: &str,
+        target_slug: &str,
+        weight: f32,
+        edge_type: &str,
+    ) -> Result<(), String> {
         let (_, src_hash) = Self::parse_entity_id(source_slug);
         let (_, dst_hash) = Self::parse_entity_id(target_slug);
         let type_hash = seahash::hash(edge_type.as_bytes());
-        let src_idx = self.slug_index.read().get(src_hash)
+        let src_idx = self
+            .slug_index
+            .read()
+            .get(src_hash)
             .ok_or_else(|| format!("Source not found: {}", source_slug))?;
-        let dst_idx = self.slug_index.read().get(dst_hash)
+        let dst_idx = self
+            .slug_index
+            .read()
+            .get(dst_hash)
             .ok_or_else(|| format!("Target not found: {}", target_slug))?;
 
         let e_idx = self.edges.write_head.fetch_add(1, Ordering::Relaxed);
         let edge = EdgeSlot {
-            from_node: src_idx, to_node: dst_idx, weight,
+            from_node: src_idx,
+            to_node: dst_idx,
+            weight,
             edge_type_hash: type_hash,
             timestamp: self.cached_timestamp.load(Ordering::Relaxed),
-            flags: 1, ..Default::default()
+            flags: 1,
+            ..Default::default()
         };
         self.edges.write_at(e_idx, &edge);
         self.adj_fwd.entry(src_idx).or_default().push(e_idx as u32);
@@ -392,14 +515,20 @@ impl SekejapDB {
     }
 
     /// Batch ingest nodes: deferred arena writes → bulk spatial → single commit.
-    pub(crate) fn ingest_nodes_batch(&self, items: &[(&str, &str)]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    pub(crate) fn ingest_nodes_batch(
+        &self,
+        items: &[(&str, &str)],
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         let (indices, _) = self.ingest_nodes_raw(items)?;
         self.build_hnsw_batch()?;
         Ok(indices)
     }
 
     /// Phase 1+2+3: Raw data ingestion (arena + spatial). NO HNSW.
-    pub(crate) fn ingest_nodes_raw(&self, items: &[(&str, &str)]) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
+    pub(crate) fn ingest_nodes_raw(
+        &self,
+        items: &[(&str, &str)],
+    ) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
         // Sequential batch insert (slug_index needs exclusive write lock per insert;
         // DashMap is gone — serialised writes are acceptable for batch path).
         let mut node_meta: Vec<(u32, bool, f32, f32)> = Vec::with_capacity(items.len());
@@ -415,9 +544,13 @@ impl SekejapDB {
         self.blobs.commit();
 
         // Bulk-load spatial R-Tree
-        let mut spatial_nodes: Vec<SpatialNode> = node_meta.iter()
+        let mut spatial_nodes: Vec<SpatialNode> = node_meta
+            .iter()
             .filter(|(_, _, lat, lon)| *lat != 0.0 || *lon != 0.0)
-            .map(|&(idx, _, lat, lon)| SpatialNode { id: idx, coords: [lat, lon] })
+            .map(|&(idx, _, lat, lon)| SpatialNode {
+                id: idx,
+                coords: [lat, lon],
+            })
             .collect();
         if !spatial_nodes.is_empty() {
             {
@@ -430,7 +563,8 @@ impl SekejapDB {
         }
 
         let all_indices: Vec<u32> = node_meta.iter().map(|&(idx, _, _, _)| idx).collect();
-        let vec_indices: Vec<u32> = node_meta.iter()
+        let vec_indices: Vec<u32> = node_meta
+            .iter()
             .filter(|(_, has_vec, _, _)| *has_vec)
             .map(|&(idx, _, _, _)| idx)
             .collect();
@@ -472,12 +606,18 @@ impl SekejapDB {
     }
 
     /// Batch ingest edges: deferred writes → parallel → single commit
-    pub(crate) fn ingest_edges_batch(&self, edges: &[(&str, &str, &str, f32)]) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn ingest_edges_batch(
+        &self,
+        edges: &[(&str, &str, &str, f32)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use rayon::prelude::*;
-        edges.par_iter().try_for_each(|&(src, dst, etype, weight)| {
-            self.add_edge_deferred(src, dst, weight, etype)
-                .map_err(|e| e.to_string())
-        }).map_err(|e: String| -> Box<dyn std::error::Error> { e.into() })?;
+        edges
+            .par_iter()
+            .try_for_each(|&(src, dst, etype, weight)| {
+                self.add_edge_deferred(src, dst, weight, etype)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e: String| -> Box<dyn std::error::Error> { e.into() })?;
         let edge_count = self.edges.write_head.load(Ordering::Acquire);
         self.edges.commit(edge_count);
         Ok(())
@@ -489,18 +629,30 @@ impl SekejapDB {
 
     fn extract_coords(value: &Value) -> (f32, f32) {
         if let Some(coords) = value.get("coordinates") {
-            (coords["lat"].as_f64().unwrap_or(0.0) as f32,
-             coords["lon"].as_f64().unwrap_or(0.0) as f32)
+            (
+                coords["lat"].as_f64().unwrap_or(0.0) as f32,
+                coords["lon"].as_f64().unwrap_or(0.0) as f32,
+            )
         } else if let Some(loc) = value.get("geo").and_then(|g| g.get("loc")) {
-            (loc["lat"].as_f64().unwrap_or(0.0) as f32,
-             loc["lon"].as_f64().unwrap_or(0.0) as f32)
+            (
+                loc["lat"].as_f64().unwrap_or(0.0) as f32,
+                loc["lon"].as_f64().unwrap_or(0.0) as f32,
+            )
         } else {
             (0.0, 0.0)
         }
     }
 
-    fn write_vector_if_present(vectors: &parking_lot::RwLock<DurableArena<VectorSlot>>, n_idx: u64, value: &Value) -> bool {
-        if let Some(vec_arr) = value.get("vectors").and_then(|v| v.get("dense")).and_then(|v| v.as_array()) {
+    fn write_vector_if_present(
+        vectors: &parking_lot::RwLock<DurableArena<VectorSlot>>,
+        n_idx: u64,
+        value: &Value,
+    ) -> bool {
+        if let Some(vec_arr) = value
+            .get("vectors")
+            .and_then(|v| v.get("dense"))
+            .and_then(|v| v.as_array())
+        {
             let mut data = [0.0f32; 128];
             for (i, v) in vec_arr.iter().take(128).enumerate() {
                 data[i] = v.as_f64().unwrap_or(0.0) as f32;
@@ -521,20 +673,34 @@ impl SekejapDB {
         let (_, slug_hash) = Self::parse_entity_id(slug);
         let idx = self.slug_index.read().get(slug_hash)?;
         let slot = self.nodes.read_at(idx as u64);
-        if slot.flags == 0 { return None; }
+        if slot.flags == 0 {
+            return None;
+        }
         let bytes = self.blobs.read(slot.blob_offset, slot.blob_len);
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
 
     /// Add edge internal
-    pub(crate) fn add_edge_internal(&self, source_slug: &str, target_slug: &str, weight: f32, edge_type: &str) -> Result<(), String> {
+    pub(crate) fn add_edge_internal(
+        &self,
+        source_slug: &str,
+        target_slug: &str,
+        weight: f32,
+        edge_type: &str,
+    ) -> Result<(), String> {
         let (_, src_hash) = Self::parse_entity_id(source_slug);
         let (_, dst_hash) = Self::parse_entity_id(target_slug);
         let type_hash = seahash::hash(edge_type.as_bytes());
 
-        let src_idx = self.slug_index.read().get(src_hash)
+        let src_idx = self
+            .slug_index
+            .read()
+            .get(src_hash)
             .ok_or_else(|| format!("Source not found: {}", source_slug))?;
-        let dst_idx = self.slug_index.read().get(dst_hash)
+        let dst_idx = self
+            .slug_index
+            .read()
+            .get(dst_hash)
             .ok_or_else(|| format!("Target not found: {}", target_slug))?;
 
         let e_idx = self.edges.write_head.fetch_add(1, Ordering::Relaxed);
@@ -569,9 +735,15 @@ impl SekejapDB {
         let (_, dst_hash) = Self::parse_entity_id(target_slug);
         let type_hash = seahash::hash(edge_type.as_bytes());
 
-        let src_idx = self.slug_index.read().get(src_hash)
+        let src_idx = self
+            .slug_index
+            .read()
+            .get(src_hash)
             .ok_or_else(|| format!("Source not found: {}", source_slug))?;
-        let dst_idx = self.slug_index.read().get(dst_hash)
+        let dst_idx = self
+            .slug_index
+            .read()
+            .get(dst_hash)
             .ok_or_else(|| format!("Target not found: {}", target_slug))?;
 
         let e_idx = self.edges.write_head.fetch_add(1, Ordering::Relaxed);
@@ -618,7 +790,11 @@ impl SekejapDB {
     /// Delete internal
     pub(crate) fn delete_internal(&self, slug: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (_, slug_hash) = Self::parse_entity_id(slug);
-        if let Some(idx) = self.slug_index.read().get(slug_hash) {
+        let idx_opt = {
+            let slug_r = self.slug_index.read();
+            slug_r.get(slug_hash)
+        };
+        if let Some(idx) = idx_opt {
             let mut slot = self.nodes.read_at(idx as u64);
             let collection_hash = slot.collection_hash;
             slot.flags = 0;
@@ -640,12 +816,25 @@ impl SekejapDB {
     }
 
     /// Delete edge internal
-    pub(crate) fn delete_edge_internal(&self, source: &str, target: &str, etype: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn delete_edge_internal(
+        &self,
+        source: &str,
+        target: &str,
+        etype: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (_, src_hash) = Self::parse_entity_id(source);
         let (_, dst_hash) = Self::parse_entity_id(target);
         let type_hash = seahash::hash(etype.as_bytes());
-        let src_idx = self.slug_index.read().get(src_hash).ok_or("Source not found")?;
-        let dst_idx = self.slug_index.read().get(dst_hash).ok_or("Target not found")?;
+        let src_idx = self
+            .slug_index
+            .read()
+            .get(src_hash)
+            .ok_or("Source not found")?;
+        let dst_idx = self
+            .slug_index
+            .read()
+            .get(dst_hash)
+            .ok_or("Target not found")?;
 
         if let Some(edges) = self.adj_fwd.get(&src_idx) {
             for &e_idx in edges.iter() {
@@ -661,16 +850,59 @@ impl SekejapDB {
     }
 
     /// Define collection internal
-    pub(crate) fn define_collection_internal(&self, name: &str, json: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn define_collection_internal(
+        &self,
+        name: &str,
+        json: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let v: Value = serde_json::from_str(json)?;
         let hash = seahash::hash(name.as_bytes());
-        let hot = &v["hot_fields"];
+        let hot = if v["hot_fields"].is_object() {
+            &v["hot_fields"]
+        } else {
+            &v["hot"]
+        };
         let col_schema = CollectionSchema {
-            vector_fields: hot["vector"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default(),
-            spatial_fields: hot["spatial"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default(),
-            fulltext_fields: hot["fulltext"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default(),
-            hash_indexed_fields: hot["hash_index"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default(),
-            range_indexed_fields: hot["range_index"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default(),
+            vector_fields: hot["vector"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            spatial_fields: hot["spatial"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            fulltext_fields: hot["fulltext"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            hash_indexed_fields: hot["hash_index"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            range_indexed_fields: hot["range_index"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
 
         // Activate field indexes for newly defined hot fields
@@ -692,13 +924,45 @@ impl SekejapDB {
     /// Count collection internal
     pub(crate) fn count_collection_internal(&self, collection: &str) -> usize {
         let col_hash = seahash::hash(collection.as_bytes());
-        self.collection_counts.get(&col_hash).map(|v| v.load(Ordering::Relaxed)).unwrap_or(0)
+        self.collection_counts
+            .get(&col_hash)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     // --- Helper Methods ---
 
-    pub(crate) fn resolve_hits(&self, bitmap: &roaring::RoaringBitmap, with_payload: bool) -> Vec<Hit> {
-        bitmap.iter().map(|idx| self.resolve_single_hit(idx, with_payload)).collect()
+    pub(crate) fn resolve_hits(
+        &self,
+        bitmap: &roaring::RoaringBitmap,
+        with_payload: bool,
+    ) -> Vec<Hit> {
+        let mut out = Vec::with_capacity(bitmap.len() as usize);
+        let slug_r = self.slug_index.read();
+        for idx in bitmap.iter() {
+            let slot = self.nodes.read_at(idx as u64);
+            if slot.flags == 0 {
+                continue;
+            }
+            if slug_r.get(slot.slug_hash) != Some(idx) {
+                continue;
+            }
+            out.push(Hit {
+                idx,
+                slug_hash: slot.slug_hash,
+                collection_hash: slot.collection_hash,
+                payload: if with_payload {
+                    let bytes = self.blobs.read(slot.blob_offset, slot.blob_len);
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                } else {
+                    None
+                },
+                lat: slot.lat,
+                lon: slot.lon,
+                score: None,
+            });
+        }
+        out
     }
 
     pub(crate) fn resolve_single_hit(&self, idx: u32, with_payload: bool) -> Hit {
@@ -710,18 +974,28 @@ impl SekejapDB {
             payload: if with_payload {
                 let bytes = self.blobs.read(slot.blob_offset, slot.blob_len);
                 Some(String::from_utf8_lossy(bytes).into_owned())
-            } else { None },
+            } else {
+                None
+            },
             lat: slot.lat,
             lon: slot.lon,
+            score: None,
         }
     }
 
-    pub(crate) fn aggregate_field(&self, bitmap: &roaring::RoaringBitmap, field: &str, op: AggOp) -> Result<f64, Box<dyn std::error::Error>> {
+    pub(crate) fn aggregate_field(
+        &self,
+        bitmap: &roaring::RoaringBitmap,
+        field: &str,
+        op: AggOp,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
         let mut sum = 0.0;
         let mut count = 0usize;
         for idx in bitmap.iter() {
             let slot = self.nodes.read_at(idx as u64);
-            if slot.flags == 0 { continue; }
+            if slot.flags == 0 {
+                continue;
+            }
             let bytes = self.blobs.read(slot.blob_offset, slot.blob_len);
             if let Ok(json) = serde_json::from_slice::<Value>(bytes) {
                 if let Some(num) = json.get(field).and_then(|v| v.as_f64()) {
@@ -762,7 +1036,9 @@ impl SekejapDB {
         let mut nodes = Vec::new();
         for i in 0..count {
             let slot = self.nodes.read_at(i);
-            if slot.flags == 0 { continue; }
+            if slot.flags == 0 {
+                continue;
+            }
             let bytes = self.blobs.read(slot.blob_offset, slot.blob_len);
             let json: Value = serde_json::from_slice(bytes)?;
             if let Some(id) = json.get("_id").and_then(|v| v.as_str()) {
@@ -775,13 +1051,17 @@ impl SekejapDB {
         let edge_count = self.edges.write_head.load(Ordering::Relaxed);
         for i in 0..edge_count {
             let edge = self.edges.read_at(i);
-            if edge.flags == 0 { continue; }
+            if edge.flags == 0 {
+                continue;
+            }
 
             // Decode edge metadata payload
             let meta_json: Option<String> = match edge.meta_kind {
                 1 => {
                     let len = edge.meta_len as usize;
-                    std::str::from_utf8(&edge.meta[..len]).ok().map(|s| s.to_string())
+                    std::str::from_utf8(&edge.meta[..len])
+                        .ok()
+                        .map(|s| s.to_string())
                 }
                 2 => {
                     let offset = u64::from_le_bytes(edge.meta[..8].try_into().unwrap_or([0u8; 8]));
@@ -792,10 +1072,12 @@ impl SekejapDB {
                 _ => None,
             };
 
-            let from_slug = idx_to_slug.get(edge.from_node as usize)
+            let from_slug = idx_to_slug
+                .get(edge.from_node as usize)
                 .and_then(|s| s.as_deref())
                 .unwrap_or("");
-            let to_slug = idx_to_slug.get(edge.to_node as usize)
+            let to_slug = idx_to_slug
+                .get(edge.to_node as usize)
                 .and_then(|s| s.as_deref())
                 .unwrap_or("");
 
@@ -824,7 +1106,9 @@ impl SekejapDB {
         if let Some(nodes) = backup["nodes"].as_array() {
             for node in nodes {
                 let json = serde_json::to_string(node)?;
-                let slug = node.get("_id").and_then(|v| v.as_str())
+                let slug = node
+                    .get("_id")
+                    .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .or_else(|| {
                         let c = node.get("_collection")?.as_str()?;
@@ -897,28 +1181,28 @@ impl SekejapDB {
         Ok(())
     }
 
-    // --- SekejapQL Methods (JSON Pipeline Query Language) ---
+    // --- Unified Query/Mutate Interface ---
 
-    pub fn query_json(&self, json: &str) -> Result<Outcome<Vec<Hit>>, Box<dyn std::error::Error>> {
-        let parser = SekejapQL::new();
+    pub fn query(&self, json: &str) -> Result<Outcome<Vec<Hit>>, Box<dyn std::error::Error>> {
+        let parser = QueryCompiler::new();
         let steps = parser.parse_pipeline_direct(json)?;
         let set = Set::from_steps(self, steps);
         set.collect()
     }
 
-    pub fn query_json_count(&self, json: &str) -> Result<Outcome<usize>, Box<dyn std::error::Error>> {
-        let parser = SekejapQL::new();
+    pub fn query_count(&self, json: &str) -> Result<Outcome<usize>, Box<dyn std::error::Error>> {
+        let parser = QueryCompiler::new();
         let steps = parser.parse_pipeline_direct(json)?;
         let set = Set::from_steps(self, steps);
         set.count()
     }
 
-    pub fn explain_json(&self, json: &str) -> Result<Vec<Step>, Box<dyn std::error::Error>> {
-        let parser = SekejapQL::new();
+    pub fn explain(&self, json: &str) -> Result<Vec<Step>, Box<dyn std::error::Error>> {
+        let parser = QueryCompiler::new();
         parser.parse_pipeline_direct(json)
     }
 
-    pub fn mutate_json(&self, json: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    pub fn mutate(&self, json: &str) -> Result<Value, Box<dyn std::error::Error>> {
         let doc: Value = serde_json::from_str(json)?;
         let op = doc["mutation"].as_str().ok_or("Missing 'mutation' field")?;
         match op {
@@ -983,5 +1267,257 @@ impl SekejapDB {
             }
             _ => Err(format!("Unknown mutation: {}", op).into()),
         }
+    }
+
+    pub fn describe(&self) -> Value {
+        #[cfg(feature = "fulltext")]
+        let fulltext_enabled = self.fulltext.read().is_some();
+        #[cfg(not(feature = "fulltext"))]
+        let fulltext_enabled = false;
+
+        let nodes_write_head = self.nodes.write_head.load(Ordering::Acquire);
+        let edges_write_head = self.edges.write_head.load(Ordering::Acquire);
+        let vector_enabled = self.hnsw.read().is_some();
+        let vector_slots_used = self.vectors.read().write_head.load(Ordering::Acquire);
+        let spatial_indexed_nodes = self.spatial.read().size();
+        let graph_forward_buckets = self.adj_fwd.len();
+        let graph_backward_buckets = self.adj_rev.len();
+
+        let hash_fields: Vec<String> = self
+            .field_hash_indexes
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        let range_fields: Vec<String> = self
+            .field_range_indexes
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+
+        let collections: Vec<Value> = self
+            .collections
+            .iter()
+            .map(|entry| {
+                let hash = *entry.key();
+                let schema = entry.value();
+                let count = self
+                    .collection_counts
+                    .get(&hash)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+
+                let hash_ready: Vec<Value> = schema
+                    .hash_indexed_fields
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "field": field,
+                            "ready": self.field_hash_indexes.contains_key(field)
+                        })
+                    })
+                    .collect();
+
+                let range_ready: Vec<Value> = schema
+                    .range_indexed_fields
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "field": field,
+                            "ready": self.field_range_indexes.contains_key(field)
+                        })
+                    })
+                    .collect();
+
+                serde_json::json!({
+                    "hash": hash,
+                    "count": count,
+                    "schema": {
+                        "vector_fields": schema.vector_fields,
+                        "spatial_fields": schema.spatial_fields,
+                        "fulltext_fields": schema.fulltext_fields,
+                        "hash_indexed_fields": schema.hash_indexed_fields,
+                        "range_indexed_fields": schema.range_indexed_fields
+                    },
+                    "indexes": {
+                        "graph": {
+                            "collection_bitmap_ready": true,
+                            "adjacency_forward_ready": count == 0 || graph_forward_buckets > 0,
+                            "adjacency_backward_ready": count == 0 || graph_backward_buckets > 0,
+                            "nodes": count
+                        },
+                        "vector": {
+                            "hnsw_ready": vector_enabled,
+                            "fields": schema.vector_fields,
+                            "vector_slots_used_global": vector_slots_used
+                        },
+                        "spatial": {
+                            "rtree_ready": true,
+                            "fields": schema.spatial_fields,
+                            "indexed_nodes_global": spatial_indexed_nodes
+                        },
+                        "fulltext": {
+                            "feature_enabled": cfg!(feature = "fulltext"),
+                            "adapter_ready": fulltext_enabled,
+                            "fields": schema.fulltext_fields
+                        },
+                        "payload": {
+                            "hash_ready": hash_ready,
+                            "range_ready": range_ready
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "graph": {
+                "nodes_write_head": nodes_write_head,
+                "edges_write_head": edges_write_head,
+                "adjacency_forward_buckets": graph_forward_buckets,
+                "adjacency_backward_buckets": graph_backward_buckets,
+                "collection_bitmap_ready": true
+            },
+            "vector": {
+                "enabled": vector_enabled,
+                "vector_slots_used": vector_slots_used,
+                "index_impl": "hnsw"
+            },
+            "spatial": {
+                "enabled": true,
+                "indexed_nodes": spatial_indexed_nodes,
+                "index_impl": "rtree"
+            },
+            "fulltext": {
+                "feature_enabled": cfg!(feature = "fulltext"),
+                "enabled": fulltext_enabled
+            },
+            "indexes": {
+                "hash_fields": hash_fields,
+                "range_fields": range_fields
+            },
+            "collections": collections
+        })
+    }
+
+    pub fn describe_collection(&self, name: &str) -> Value {
+        #[cfg(feature = "fulltext")]
+        let fulltext_enabled = self.fulltext.read().is_some();
+        #[cfg(not(feature = "fulltext"))]
+        let fulltext_enabled = false;
+
+        let hash = seahash::hash(name.as_bytes());
+        let count = self
+            .collection_counts
+            .get(&hash)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0);
+
+        let schema_entry = self.collections.get(&hash);
+        let exists = schema_entry.is_some();
+
+        let (schema_json, hash_ready, range_ready, vector_fields, spatial_fields, fulltext_fields) =
+            if let Some(schema) = schema_entry {
+                let hash_ready: Vec<Value> = schema
+                    .hash_indexed_fields
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "field": field,
+                            "ready": self.field_hash_indexes.contains_key(field)
+                        })
+                    })
+                    .collect();
+                let range_ready: Vec<Value> = schema
+                    .range_indexed_fields
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "field": field,
+                            "ready": self.field_range_indexes.contains_key(field)
+                        })
+                    })
+                    .collect();
+
+                (
+                    serde_json::json!({
+                        "vector_fields": schema.vector_fields,
+                        "spatial_fields": schema.spatial_fields,
+                        "fulltext_fields": schema.fulltext_fields,
+                        "hash_indexed_fields": schema.hash_indexed_fields,
+                        "range_indexed_fields": schema.range_indexed_fields
+                    }),
+                    hash_ready,
+                    range_ready,
+                    schema.vector_fields.clone(),
+                    schema.spatial_fields.clone(),
+                    schema.fulltext_fields.clone(),
+                )
+            } else {
+                (
+                    serde_json::json!({}),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+
+        serde_json::json!({
+            "name": name,
+            "hash": hash,
+            "count": count,
+            "exists": exists,
+            "schema": schema_json,
+            "indexes": {
+                "graph": {
+                    "collection_bitmap_ready": true,
+                    "adjacency_forward_ready": count == 0 || self.adj_fwd.len() > 0,
+                    "adjacency_backward_ready": count == 0 || self.adj_rev.len() > 0,
+                    "nodes": count
+                },
+                "vector": {
+                    "hnsw_ready": self.hnsw.read().is_some(),
+                    "fields": vector_fields,
+                    "vector_slots_used_global": self.vectors.read().write_head.load(Ordering::Acquire)
+                },
+                "spatial": {
+                    "rtree_ready": true,
+                    "fields": spatial_fields,
+                    "indexed_nodes_global": self.spatial.read().size()
+                },
+                "fulltext": {
+                    "feature_enabled": cfg!(feature = "fulltext"),
+                    "adapter_ready": fulltext_enabled,
+                    "fields": fulltext_fields
+                },
+                "payload": {
+                    "hash_ready": hash_ready,
+                    "range_ready": range_ready
+                }
+            }
+        })
+    }
+    #[deprecated(note = "Use query")]
+    pub fn query_json(&self, json: &str) -> Result<Outcome<Vec<Hit>>, Box<dyn std::error::Error>> {
+        self.query(json)
+    }
+
+    #[deprecated(note = "Use query_count")]
+    pub fn query_json_count(
+        &self,
+        json: &str,
+    ) -> Result<Outcome<usize>, Box<dyn std::error::Error>> {
+        self.query_count(json)
+    }
+
+    #[deprecated(note = "Use explain")]
+    pub fn explain_json(&self, json: &str) -> Result<Vec<Step>, Box<dyn std::error::Error>> {
+        self.explain(json)
+    }
+
+    #[deprecated(note = "Use mutate")]
+    pub fn mutate_json(&self, json: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        self.mutate(json)
     }
 }

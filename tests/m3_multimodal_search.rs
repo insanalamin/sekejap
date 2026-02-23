@@ -9,8 +9,8 @@
 //! cargo test tc_3_5 -- --nocapture
 
 use sekejap::SekejapDB;
-use tempfile::TempDir;
 use serde_json::json;
+use tempfile::TempDir;
 
 fn setup_db() -> (SekejapDB, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -36,7 +36,8 @@ mod tc_3_1_vector_similarity {
             let payload = json!({
                 "_id": slug,
                 "vectors": {"dense": vec_data}
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
@@ -47,7 +48,10 @@ mod tc_3_1_vector_similarity {
             assert!(retrieved.is_some(), "Node {} should exist", slug);
         }
 
-        println!("[TC-3.1] Vector data structure: {} nodes stored", nodes.len());
+        println!(
+            "[TC-3.1] Vector data structure: {} nodes stored",
+            nodes.len()
+        );
     }
 
     #[test]
@@ -60,7 +64,8 @@ mod tc_3_1_vector_similarity {
                 "dense": [0.1, 0.2, 0.3, 0.4],
                 "sparse": {"0": 0.5, "1": 0.3}
             }
-        }).to_string();
+        })
+        .to_string();
 
         db.nodes().put_json(&payload).unwrap();
         db.flush().unwrap();
@@ -81,31 +86,36 @@ mod tc_3_2_spatial_radius {
         let (db, _dir) = setup_db();
 
         // Create nodes at various distances from a center point
-        let center = (-6.2088, 106.8456);  // Jakarta
+        let center = (-6.2088, 106.8456); // Jakarta
         let nodes = vec![
-            ("loc/very-close", -6.2080, 106.8460),   // ~100m
-            ("loc/close", -6.2050, 106.8480),          // ~400m
-            ("loc/far", -6.1900, 106.8600),            // ~2.5km
-            ("loc/very-far", -6.1500, 106.9000),       // ~10km
+            ("loc/very-close", -6.2080, 106.8460), // ~100m
+            ("loc/close", -6.2050, 106.8480),      // ~400m
+            ("loc/far", -6.1900, 106.8600),        // ~2.5km
+            ("loc/very-far", -6.1500, 106.9000),   // ~10km
         ];
 
         for (slug, lat, lon) in &nodes {
             let payload = json!({
                 "_id": slug,
                 "coordinates": {"lat": lat, "lon": lon}
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
 
         // Query within 1km
-        let outcome = db.nodes()
+        let outcome = db
+            .nodes()
             .all()
             .near(center.0, center.1, 1.0)
             .collect()
             .unwrap();
 
-        println!("[TC-3.2] 1km radius query found: {} nodes", outcome.data.len());
+        println!(
+            "[TC-3.2] 1km radius query found: {} nodes",
+            outcome.data.len()
+        );
         // Should find very-close and close (within 1km)
         assert!(outcome.data.len() >= 2);
     }
@@ -118,24 +128,22 @@ mod tc_3_2_spatial_radius {
         let payload1 = json!({
             "_id": "loc/center",
             "coordinates": {"lat": 0.0, "lon": 0.0}
-        }).to_string();
+        })
+        .to_string();
         db.nodes().put_json(&payload1).unwrap();
 
         // Node at 1km boundary (approximately 0.009 degrees)
         let payload2 = json!({
             "_id": "loc/boundary",
             "coordinates": {"lat": 0.009, "lon": 0.009}
-        }).to_string();
+        })
+        .to_string();
         db.nodes().put_json(&payload2).unwrap();
 
         db.flush().unwrap();
 
         // Query with 1km radius from center
-        let outcome = db.nodes()
-            .all()
-            .near(0.0, 0.0, 1.0)
-            .collect()
-            .unwrap();
+        let outcome = db.nodes().all().near(0.0, 0.0, 1.0).collect().unwrap();
 
         println!("[TC-3.2] Boundary test found: {} nodes", outcome.data.len());
         assert!(outcome.data.len() >= 1);
@@ -148,7 +156,8 @@ mod tc_3_2_spatial_radius {
         let payload = json!({
             "_id": "loc/test",
             "coordinates": {"lat": -6.2088, "lon": 106.8456}
-        }).to_string();
+        })
+        .to_string();
         db.nodes().put_json(&payload).unwrap();
         db.flush().unwrap();
 
@@ -183,16 +192,14 @@ mod tc_3_3_time_window_filter {
                 "_id": slug,
                 "timestamp": timestamp,
                 "event": format!("Event at {}", timestamp)
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
 
         // Query all nodes
-        let outcome = db.nodes()
-            .all()
-            .collect()
-            .unwrap();
+        let outcome = db.nodes().all().collect().unwrap();
 
         println!("[TC-3.3] Total nodes: {}", outcome.data.len());
         assert!(outcome.data.len() >= 4);
@@ -229,14 +236,15 @@ mod tc_3_4_hybrid_vector_spatial_time {
         let (db, _dir) = setup_db();
 
         let center = (-6.2088, 106.8456);
-        
+
         // Node with all attributes
         let payload1 = json!({
             "_id": "hybrid/complete",
             "coordinates": {"lat": -6.2080, "lon": 106.8460},
             "vectors": {"dense": vec![0.9, 0.1, 0.0]},
             "timestamp": "2024-06-15T10:00:00Z"
-        }).to_string();
+        })
+        .to_string();
         db.nodes().put_json(&payload1).unwrap();
 
         // Node without vector
@@ -244,7 +252,8 @@ mod tc_3_4_hybrid_vector_spatial_time {
             "_id": "hybrid/no-vector",
             "coordinates": {"lat": -6.2080, "lon": 106.8460},
             "timestamp": "2024-06-15T10:00:00Z"
-        }).to_string();
+        })
+        .to_string();
         db.nodes().put_json(&payload2).unwrap();
 
         db.flush().unwrap();
@@ -272,15 +281,17 @@ mod tc_3_4_hybrid_vector_spatial_time {
                 "_id": slug,
                 "coordinates": {"lat": lat, "lon": lon},
                 "date": date
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
 
         // Spatial filter
-        let outcome = db.nodes()
+        let outcome = db
+            .nodes()
             .all()
-            .near(-6.2, 106.8, 100.0)  // Jakarta area
+            .near(-6.2, 106.8, 100.0) // Jakarta area
             .collect()
             .unwrap();
 
@@ -309,7 +320,8 @@ mod tc_3_5_temporal_spatial_bucketing {
                 "_id": slug,
                 "date": date,
                 "coordinates": {"lat": lat, "lon": lon}
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
@@ -336,15 +348,17 @@ mod tc_3_5_temporal_spatial_bucketing {
             let payload = json!({
                 "_id": slug,
                 "coordinates": {"lat": lat, "lon": lon}
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
 
         // Query by region (spatial bucket)
-        let outcome = db.nodes()
+        let outcome = db
+            .nodes()
             .all()
-            .near(-6.2, 106.8, 500.0)  // 500km
+            .near(-6.2, 106.8, 500.0) // 500km
             .collect()
             .unwrap();
 
@@ -362,13 +376,14 @@ mod tc_3_5_temporal_spatial_bucketing {
             let date = format!("2024-06-{:02}T12:00:00Z", day + 1);
             let lat = -6.2 + (day as f32 * 0.01);
             let lon = 106.8 + (day as f32 * 0.01);
-            
+
             let payload = json!({
                 "_id": format!("daily/day-{}", day),
                 "date": date,
                 "coordinates": {"lat": lat, "lon": lon},
                 "value": day * 10
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();

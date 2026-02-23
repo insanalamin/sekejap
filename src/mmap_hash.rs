@@ -27,9 +27,9 @@ const HEADER_SIZE: usize = 64;
 const SLOT_SIZE: usize = 16; // u64 key + u32 value + u32 probe_dist
 
 // Header offsets (all little-endian u64)
-const OFF_MAGIC:    usize = 0;
+const OFF_MAGIC: usize = 0;
 const OFF_CAPACITY: usize = 8;
-const OFF_COUNT:    usize = 16;
+const OFF_COUNT: usize = 16;
 
 /// In-memory representation of a hash slot (for arithmetic)
 #[derive(Clone, Copy, Default, Debug)]
@@ -104,8 +104,8 @@ impl MmapHashIndex {
         let off = Self::slot_off(slot_idx);
         let b = &self.mmap[off..off + SLOT_SIZE];
         HashSlot {
-            key:        u64::from_le_bytes(b[0..8].try_into().unwrap()),
-            value:      u32::from_le_bytes(b[8..12].try_into().unwrap()),
+            key: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+            value: u32::from_le_bytes(b[8..12].try_into().unwrap()),
             probe_dist: u32::from_le_bytes(b[12..16].try_into().unwrap()),
         }
     }
@@ -128,18 +128,26 @@ impl MmapHashIndex {
 
     /// O(1) lookup. Call under `RwLock::read()`.
     pub fn get(&self, key: u64) -> Option<u32> {
-        if key == 0 || key == u64::MAX { return None; }
+        if key == 0 || key == u64::MAX {
+            return None;
+        }
         let mask = self.capacity - 1;
         let mut pos = key & mask;
         let mut probe_dist = 0u32;
 
         loop {
             let slot = self.read_slot(pos);
-            if slot.key == 0 { return None; }
-            if slot.key == key { return Some(slot.value); }
+            if slot.key == 0 {
+                return None;
+            }
+            if slot.key == key {
+                return Some(slot.value);
+            }
             // Robin Hood invariant: a slot with lower probe_dist than ours can't have been
             // displaced past us, so the key isn't here.
-            if slot.probe_dist < probe_dist { return None; }
+            if slot.probe_dist < probe_dist {
+                return None;
+            }
             probe_dist += 1;
             pos = (pos + 1) & mask;
         }
@@ -147,10 +155,16 @@ impl MmapHashIndex {
 
     /// O(1) amortised insert (Robin Hood). Call under `RwLock::write()`.
     pub fn insert(&mut self, key: u64, value: u32) {
-        if key == 0 || key == u64::MAX { return; }
+        if key == 0 || key == u64::MAX {
+            return;
+        }
         let mask = self.capacity - 1;
         let mut pos = key & mask;
-        let mut incoming = HashSlot { key, value, probe_dist: 0 };
+        let mut incoming = HashSlot {
+            key,
+            value,
+            probe_dist: 0,
+        };
         let mut count_bumped = false;
 
         loop {
@@ -211,23 +225,33 @@ impl MmapHashIndex {
 
     /// O(1) remove (marks tombstone). Call under `RwLock::write()`.
     pub fn remove(&mut self, key: u64) {
-        if key == 0 || key == u64::MAX { return; }
+        if key == 0 || key == u64::MAX {
+            return;
+        }
         let mask = self.capacity - 1;
         let mut pos = key & mask;
         let mut probe_dist = 0u32;
 
         loop {
             let slot = self.read_slot(pos);
-            if slot.key == 0 { return; }
+            if slot.key == 0 {
+                return;
+            }
             if slot.key == key {
-                let tomb = HashSlot { key: u64::MAX, value: 0, probe_dist: 0 };
+                let tomb = HashSlot {
+                    key: u64::MAX,
+                    value: 0,
+                    probe_dist: 0,
+                };
                 self.write_slot(pos, &tomb);
                 let n = self.count.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
                 // Note: fetch_sub returns old value, so saturating_sub(1) gives new value
                 self.persist_count(n);
                 return;
             }
-            if slot.probe_dist < probe_dist { return; }
+            if slot.probe_dist < probe_dist {
+                return;
+            }
             probe_dist += 1;
             pos = (pos + 1) & mask;
         }

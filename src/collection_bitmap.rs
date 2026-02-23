@@ -46,7 +46,8 @@ impl CollectionBitmapIndex {
     /// Insert a node index into a collection bitmap (write path).
     /// Marks the collection dirty so it will be flushed.
     pub fn insert(&self, collection_hash: u64, node_idx: u32) {
-        let bm = self.bitmaps
+        let bm = self
+            .bitmaps
             .entry(collection_hash)
             .or_insert_with(|| Arc::new(parking_lot::RwLock::new(RoaringBitmap::new())));
         bm.write().insert(node_idx);
@@ -104,7 +105,8 @@ impl CollectionBitmapIndex {
             if let Some(bm) = self.bitmaps.get(&hash) {
                 let path = self.rbm_path(hash);
                 let file = fs::File::create(&path)?;
-                bm.read().serialize_into(file)
+                bm.read()
+                    .serialize_into(file)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             }
         }
@@ -120,7 +122,8 @@ impl CollectionBitmapIndex {
         self.dirty.clear();
 
         for (collection_hash, node_idx) in iter {
-            let bm = self.bitmaps
+            let bm = self
+                .bitmaps
                 .entry(collection_hash)
                 .or_insert_with(|| Arc::new(parking_lot::RwLock::new(RoaringBitmap::new())));
             bm.write().insert(node_idx);

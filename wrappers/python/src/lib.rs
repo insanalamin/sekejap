@@ -1,4 +1,10 @@
 //! Python bindings for Sekejap-DB v0.2.0 using PyO3
+//! Canonical high-level interface:
+//! - `query(json)`
+//! - `query_count(json)`
+//! - `mutate(json)`
+//!
+//! The JSON contract is the same as Rust core query/mutate APIs.
 //!
 //! A graph-first, embedded multi-model database engine.
 
@@ -22,26 +28,50 @@ struct PyHit {
     payload: Option<String>,
     lat: f32,
     lon: f32,
+    score: Option<f32>,
 }
 
 #[pymethods]
 impl PyHit {
     #[getter]
-    fn idx(&self) -> u32 { self.idx }
+    fn idx(&self) -> u32 {
+        self.idx
+    }
     #[getter]
-    fn slug_hash(&self) -> u64 { self.slug_hash }
+    fn slug_hash(&self) -> u64 {
+        self.slug_hash
+    }
     #[getter]
-    fn collection_hash(&self) -> u64 { self.collection_hash }
+    fn collection_hash(&self) -> u64 {
+        self.collection_hash
+    }
     #[getter]
-    fn payload(&self) -> Option<String> { self.payload.clone() }
+    fn payload(&self) -> Option<String> {
+        self.payload.clone()
+    }
     #[getter]
-    fn lat(&self) -> f32 { self.lat }
+    fn lat(&self) -> f32 {
+        self.lat
+    }
     #[getter]
-    fn lon(&self) -> f32 { self.lon }
+    fn lon(&self) -> f32 {
+        self.lon
+    }
+    #[getter]
+    fn score(&self) -> Option<f32> {
+        self.score
+    }
 
     fn __repr__(&self) -> String {
-        let preview = self.payload.as_deref().map(|s| &s[..s.len().min(50)]).unwrap_or("None");
-        format!("Hit(idx={}, payload={:?})", self.idx, preview)
+        let preview = self
+            .payload
+            .as_deref()
+            .map(|s| &s[..s.len().min(50)])
+            .unwrap_or("None");
+        format!(
+            "Hit(idx={}, score={:?}, payload={:?})",
+            self.idx, self.score, preview
+        )
     }
 }
 
@@ -68,16 +98,24 @@ impl PySekejapDB {
                 db: Some(Arc::new(RwLock::new(db))),
                 path: path.to_string(),
             }),
-            Err(e) => Err(PyIOError::new_err(format!("Failed to open database: {}", e))),
+            Err(e) => Err(PyIOError::new_err(format!(
+                "Failed to open database: {}",
+                e
+            ))),
         }
     }
 
     // ---- Node operations ----
 
     fn put(&self, slug: &str, json: &str) -> PyResult<u32> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.nodes().put(slug, json).map_err(|e| PyIOError::new_err(e.to_string()))
+        db.nodes()
+            .put(slug, json)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     fn get(&self, slug: &str) -> Option<String> {
@@ -87,213 +125,444 @@ impl PySekejapDB {
     }
 
     fn remove(&self, slug: &str) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.nodes().remove(slug).map_err(|e| PyIOError::new_err(e.to_string()))
+        db.nodes()
+            .remove(slug)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     fn ingest_nodes(&self, items: Vec<(String, String)>) -> PyResult<Vec<u32>> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let refs: Vec<(&str, &str)> = items.iter().map(|(s, j)| (s.as_str(), j.as_str())).collect();
-        db.nodes().ingest(&refs).map_err(|e| PyIOError::new_err(e.to_string()))
+        let refs: Vec<(&str, &str)> = items
+            .iter()
+            .map(|(s, j)| (s.as_str(), j.as_str()))
+            .collect();
+        db.nodes()
+            .ingest(&refs)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     // ---- Edge operations ----
 
     fn link(&self, source: &str, target: &str, edge_type: &str, weight: f32) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.edges().link(source, target, edge_type, weight).map_err(|e| PyIOError::new_err(e.to_string()))
+        db.edges()
+            .link(source, target, edge_type, weight)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     fn unlink(&self, source: &str, target: &str, edge_type: &str) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.edges().unlink(source, target, edge_type).map_err(|e| PyIOError::new_err(e.to_string()))
+        db.edges()
+            .unlink(source, target, edge_type)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
-    fn link_meta(&self, source: &str, target: &str, edge_type: &str, weight: f32, meta: &str) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+    fn link_meta(
+        &self,
+        source: &str,
+        target: &str,
+        edge_type: &str,
+        weight: f32,
+        meta: &str,
+    ) -> PyResult<()> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.edges().link_meta(source, target, edge_type, weight, meta).map_err(|e| PyIOError::new_err(e.to_string()))
+        db.edges()
+            .link_meta(source, target, edge_type, weight, meta)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     // ---- Schema operations ----
 
     fn define_collection(&self, name: &str, json: &str) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.schema().define(name, json).map_err(|e| PyIOError::new_err(e.to_string()))
+        db.schema()
+            .define(name, json)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     fn count_collection(&self, collection: &str) -> usize {
-        let db = match self.db.as_ref() { Some(d) => d, None => return 0 };
-        let db = match db.read() { Ok(d) => d, Err(_) => return 0 };
+        let db = match self.db.as_ref() {
+            Some(d) => d,
+            None => return 0,
+        };
+        let db = match db.read() {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
         db.schema().count(collection)
     }
 
-    // ---- Query: SekejapQL (JSON pipeline) ----
+    // ---- Query: JSON pipeline ----
 
-    /// Execute a SekejapQL JSON pipeline, returns JSON string of Hit array
-    fn query_json(&self, json: &str) -> PyResult<String> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+    /// Execute a JSON query pipeline, returns JSON string of Hit array.
+    fn query(&self, json: &str) -> PyResult<String> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+
         let proper_json = convert_shorthand_query(json);
-        
-        let result = db.query_json(&proper_json).map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let hits: Vec<serde_json::Value> = result.data.into_iter().map(|h| {
-            serde_json::json!({
-                "idx": h.idx,
-                "slug_hash": h.slug_hash,
-                "collection_hash": h.collection_hash,
-                "payload": h.payload,
-                "lat": h.lat,
-                "lon": h.lon
+
+        let result = db
+            .query(&proper_json)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let hits: Vec<serde_json::Value> = result
+            .data
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "idx": h.idx,
+                    "slug_hash": h.slug_hash,
+                    "collection_hash": h.collection_hash,
+                    "payload": h.payload,
+                    "lat": h.lat,
+                    "lon": h.lon,
+                    "score": h.score
+                })
             })
-        }).collect();
+            .collect();
         serde_json::to_string(&hits).map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
-    /// Execute a SekejapQL JSON pipeline, returns count only
-    fn query_json_count(&self, json: &str) -> PyResult<usize> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+    /// Execute a JSON query pipeline, returns count only.
+    fn query_count(&self, json: &str) -> PyResult<usize> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         let proper_json = convert_shorthand_query(json);
 
-        let result = db.query_json_count(&proper_json).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let result = db
+            .query_count(&proper_json)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(result.data)
     }
 
     /// Execute a JSON mutation (put, link, remove, etc.), returns JSON response
-    fn mutate_json(&self, json: &str) -> PyResult<String> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+    fn mutate(&self, json: &str) -> PyResult<String> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let result = db.mutate_json(json).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let result = db
+            .mutate(json)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
         serde_json::to_string(&result).map_err(|e| PyIOError::new_err(e.to_string()))
+    }
+
+    /// Backward-compatible alias for `query`.
+    fn query_json(&self, json: &str) -> PyResult<String> {
+        self.query(json)
+    }
+
+    /// Backward-compatible alias for `query_count`.
+    fn query_json_count(&self, json: &str) -> PyResult<usize> {
+        self.query_count(json)
+    }
+
+    /// Backward-compatible alias for `mutate`.
+    fn mutate_json(&self, json: &str) -> PyResult<String> {
+        self.mutate(json)
     }
 
     // ---- Query: Rust Set pipeline (typed) ----
 
     fn one(&self, slug: &str) -> PyResult<Option<PyHit>> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let outcome = db.nodes().one(slug).first()
+        let outcome = db
+            .nodes()
+            .one(slug)
+            .first()
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(outcome.data.map(|h| PyHit {
-            idx: h.idx, slug_hash: h.slug_hash, collection_hash: h.collection_hash,
-            payload: h.payload, lat: h.lat, lon: h.lon,
+            idx: h.idx,
+            slug_hash: h.slug_hash,
+            collection_hash: h.collection_hash,
+            payload: h.payload,
+            lat: h.lat,
+            lon: h.lon,
+            score: h.score,
         }))
     }
 
     fn collection(&self, name: &str) -> PyResult<Vec<PyHit>> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let outcome = db.nodes().collection(name).collect()
+        let outcome = db
+            .nodes()
+            .collection(name)
+            .collect()
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(outcome.data.into_iter().map(|h| PyHit {
-            idx: h.idx, slug_hash: h.slug_hash, collection_hash: h.collection_hash,
-            payload: h.payload, lat: h.lat, lon: h.lon,
-        }).collect())
+        Ok(outcome
+            .data
+            .into_iter()
+            .map(|h| PyHit {
+                idx: h.idx,
+                slug_hash: h.slug_hash,
+                collection_hash: h.collection_hash,
+                payload: h.payload,
+                lat: h.lat,
+                lon: h.lon,
+                score: h.score,
+            })
+            .collect())
     }
 
     #[pyo3(signature = (slug, edge_type, max_hops=1))]
     fn forward(&self, slug: &str, edge_type: &str, max_hops: u32) -> PyResult<Vec<PyHit>> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let outcome = db.nodes().one(slug)
+        let outcome = db
+            .nodes()
+            .one(slug)
             .forward(edge_type)
             .hops(max_hops)
             .collect()
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(outcome.data.into_iter().map(|h| PyHit {
-            idx: h.idx, slug_hash: h.slug_hash, collection_hash: h.collection_hash,
-            payload: h.payload, lat: h.lat, lon: h.lon,
-        }).collect())
+        Ok(outcome
+            .data
+            .into_iter()
+            .map(|h| PyHit {
+                idx: h.idx,
+                slug_hash: h.slug_hash,
+                collection_hash: h.collection_hash,
+                payload: h.payload,
+                lat: h.lat,
+                lon: h.lon,
+                score: h.score,
+            })
+            .collect())
     }
 
     #[pyo3(signature = (slug, edge_type, max_hops=1))]
     fn backward(&self, slug: &str, edge_type: &str, max_hops: u32) -> PyResult<Vec<PyHit>> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let outcome = db.nodes().one(slug)
+        let outcome = db
+            .nodes()
+            .one(slug)
             .backward(edge_type)
             .hops(max_hops)
             .collect()
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(outcome.data.into_iter().map(|h| PyHit {
-            idx: h.idx, slug_hash: h.slug_hash, collection_hash: h.collection_hash,
-            payload: h.payload, lat: h.lat, lon: h.lon,
-        }).collect())
+        Ok(outcome
+            .data
+            .into_iter()
+            .map(|h| PyHit {
+                idx: h.idx,
+                slug_hash: h.slug_hash,
+                collection_hash: h.collection_hash,
+                payload: h.payload,
+                lat: h.lat,
+                lon: h.lon,
+                score: h.score,
+            })
+            .collect())
     }
 
     fn near(&self, lat: f32, lon: f32, radius_km: f32) -> PyResult<Vec<PyHit>> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let outcome = db.nodes().all()
+        let outcome = db
+            .nodes()
+            .all()
             .near(lat, lon, radius_km)
             .collect()
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(outcome.data.into_iter().map(|h| PyHit {
-            idx: h.idx, slug_hash: h.slug_hash, collection_hash: h.collection_hash,
-            payload: h.payload, lat: h.lat, lon: h.lon,
-        }).collect())
+        Ok(outcome
+            .data
+            .into_iter()
+            .map(|h| PyHit {
+                idx: h.idx,
+                slug_hash: h.slug_hash,
+                collection_hash: h.collection_hash,
+                payload: h.payload,
+                lat: h.lat,
+                lon: h.lon,
+                score: h.score,
+            })
+            .collect())
+    }
+
+    fn init_fulltext(&self) -> PyResult<()> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let path = Path::new(&self.path);
+        db.init_fulltext(path);
+        Ok(())
+    }
+
+    fn matching(&self, text: &str) -> PyResult<Vec<PyHit>> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
+        #[cfg(feature = "fulltext")]
+        {
+            let outcome = db
+                .nodes()
+                .all()
+                .matching(text)
+                .collect()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            Ok(outcome
+                .data
+                .into_iter()
+                .map(|h| PyHit {
+                    idx: h.idx,
+                    slug_hash: h.slug_hash,
+                    collection_hash: h.collection_hash,
+                    payload: h.payload,
+                    lat: h.lat,
+                    lon: h.lon,
+                    score: h.score,
+                })
+                .collect())
+        }
+        #[cfg(not(feature = "fulltext"))]
+        {
+            Err(PyIOError::new_err("Fulltext feature not enabled"))
+        }
     }
 
     #[pyo3(signature = (m=16))]
     fn init_hnsw(&self, m: usize) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
         db.init_hnsw(m);
         Ok(())
     }
 
     fn build_hnsw(&self) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.nodes().build_hnsw().map_err(|e| PyIOError::new_err(e.to_string()))
+        db.nodes()
+            .build_hnsw()
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     fn similar(&self, query: Vec<f32>, k: usize) -> PyResult<Vec<PyHit>> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let outcome = db.nodes().all()
+        let outcome = db
+            .nodes()
+            .all()
             .similar(&query, k)
             .collect()
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(outcome.data.into_iter().map(|h| PyHit {
-            idx: h.idx, slug_hash: h.slug_hash, collection_hash: h.collection_hash,
-            payload: h.payload, lat: h.lat, lon: h.lon,
-        }).collect())
+        Ok(outcome
+            .data
+            .into_iter()
+            .map(|h| PyHit {
+                idx: h.idx,
+                slug_hash: h.slug_hash,
+                collection_hash: h.collection_hash,
+                payload: h.payload,
+                lat: h.lat,
+                lon: h.lon,
+                score: h.score,
+            })
+            .collect())
     }
 
     // ---- Persistence ----
 
     fn backup(&self, path: &str) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.backup(Path::new(path)).map_err(|e| PyIOError::new_err(e.to_string()))
+        db.backup(Path::new(path))
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     fn restore(&self, path: &str) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
-        db.restore(Path::new(path)).map_err(|e| PyIOError::new_err(e.to_string()))
+        db.restore(Path::new(path))
+            .map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     fn flush(&self) -> PyResult<()> {
-        let db = self.db.as_ref().ok_or_else(|| PyIOError::new_err("Database not open"))?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| PyIOError::new_err("Database not open"))?;
         let db = db.read().map_err(|e| PyIOError::new_err(e.to_string()))?;
         db.flush().map_err(|e| PyIOError::new_err(e.to_string()))
     }
 
     // ---- Lifecycle ----
 
-    fn close(&mut self) { self.db.take(); }
+    fn close(&mut self) {
+        self.db.take();
+    }
 
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
 
     fn __exit__(&mut self, _exc_type: PyObject, _exc_value: PyObject, _traceback: PyObject) {
         self.close();
@@ -308,26 +577,27 @@ impl PySekejapDB {
 // Helper functions
 // ============================================================
 
-/// Convert shorthand query format to proper SekejapQL format
+/// Convert shorthand query format to proper pipeline format
 fn convert_shorthand_query(json: &str) -> String {
     let val: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(_) => return json.to_string(),
     };
-    
+
     // If already has "pipeline", return as-is
     if let Some(obj) = val.as_object() {
         if obj.contains_key("pipeline") {
             return json.to_string();
         }
     }
-    
+
     // If it's an array, convert each step
     if let Some(arr) = val.as_array() {
         let steps: Vec<serde_json::Value> = arr.iter().map(convert_step).collect();
-        return serde_json::to_string(&serde_json::json!({"pipeline": steps})).unwrap_or_else(|_| json.to_string());
+        return serde_json::to_string(&serde_json::json!({"pipeline": steps}))
+            .unwrap_or_else(|_| json.to_string());
     }
-    
+
     json.to_string()
 }
 
@@ -338,9 +608,9 @@ fn convert_step(step: &serde_json::Value) -> serde_json::Value {
         if obj.contains_key("op") {
             return step.clone();
         }
-        
+
         let mut converted = serde_json::Map::new();
-        
+
         for (key, value) in obj.iter() {
             match key.as_str() {
                 "collection" => {
@@ -375,7 +645,7 @@ fn convert_step(step: &serde_json::Value) -> serde_json::Value {
                 }
             }
         }
-        
+
         serde_json::Value::Object(converted)
     } else {
         step.clone()
@@ -401,11 +671,15 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
 #[pyfunction]
 fn cosine_similarity(v1: Vec<f32>, v2: Vec<f32>) -> f32 {
-    if v1.len() != v2.len() || v1.is_empty() { return 0.0; }
+    if v1.len() != v2.len() || v1.is_empty() {
+        return 0.0;
+    }
     let dot: f32 = v1.iter().zip(v2.iter()).map(|(a, b)| a * b).sum();
     let n1: f32 = v1.iter().map(|x| x * x).sum::<f32>().sqrt();
     let n2: f32 = v2.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if n1 == 0.0 || n2 == 0.0 { return 0.0; }
+    if n1 == 0.0 || n2 == 0.0 {
+        return 0.0;
+    }
     dot / (n1 * n2)
 }
 

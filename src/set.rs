@@ -1,19 +1,21 @@
 use crate::db::SekejapDB;
-use crate::types::{Step, Hit, EdgeHit, Outcome, Trace, StepReport, Plan, AggOp};
 use crate::index::PropertyIndex;
-use smallvec::SmallVec;
+use crate::types::{AggOp, EdgeHit, Hit, Outcome, Plan, Step, StepReport, Trace};
 use roaring::RoaringBitmap;
-use std::time::Instant;
+use rstar::AABB;
 use serde_json::Value;
+use smallvec::SmallVec;
+use std::collections::HashMap;
+use std::time::Instant;
 
 #[cfg(feature = "fulltext")]
-use crate::fulltext::SearchHit;
+use crate::fulltext::{SearchHit, SearchOptions};
 
 pub struct Set<'db> {
     db: &'db SekejapDB,
     steps: SmallVec<[Step; 8]>,
     // Post-bitmap processing (applied at terminal time)
-    sort_by: Option<(String, bool)>,   // (field, ascending)
+    sort_by: Option<(String, bool)>, // (field, ascending)
     skip_n: usize,
     select_fields: Option<Vec<String>>,
 }
@@ -62,46 +64,125 @@ fn project_fields(payload: &str, fields: &[String]) -> String {
     let Some(obj) = val.as_object() else {
         return payload.to_string();
     };
-    let projected: serde_json::Map<String, Value> = fields.iter()
+    let projected: serde_json::Map<String, Value> = fields
+        .iter()
         .filter_map(|f| obj.get(f).map(|v| (f.clone(), v.clone())))
         .collect();
     serde_json::to_string(&projected).unwrap_or_else(|_| payload.to_string())
+}
+
+fn inject_score(payload: Option<String>, score: f32) -> Option<String> {
+    let mut obj = payload
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !obj.is_object() {
+        obj = serde_json::json!({ "_value": obj });
+    }
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("_score".to_string(), Value::from(score));
+    }
+    serde_json::to_string(&obj).ok()
+}
+
+fn point_in_polygon(lat: f32, lon: f32, polygon: &[[f32; 2]]) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = polygon.len() - 1;
+    for i in 0..polygon.len() {
+        let yi = polygon[i][0];
+        let xi = polygon[i][1];
+        let yj = polygon[j][0];
+        let xj = polygon[j][1];
+        let intersects = ((yi > lat) != (yj > lat))
+            && (lon < (xj - xi) * (lat - yi) / ((yj - yi).max(f32::EPSILON)) + xi);
+        if intersects {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 impl<'db> Set<'db> {
     pub(crate) fn new(db: &'db SekejapDB, starter: Step) -> Self {
         let mut steps = SmallVec::new();
         steps.push(starter);
-        Self { db, steps, sort_by: None, skip_n: 0, select_fields: None }
+        Self {
+            db,
+            steps,
+            sort_by: None,
+            skip_n: 0,
+            select_fields: None,
+        }
     }
 
     pub fn forward(mut self, edge_type: &str) -> Self {
-        self.steps.push(Step::Forward(seahash::hash(edge_type.as_bytes())));
+        self.steps
+            .push(Step::Forward(seahash::hash(edge_type.as_bytes())));
         self
     }
     pub fn backward(mut self, edge_type: &str) -> Self {
-        self.steps.push(Step::Backward(seahash::hash(edge_type.as_bytes())));
+        self.steps
+            .push(Step::Backward(seahash::hash(edge_type.as_bytes())));
         self
     }
     /// Parallel forward traversal using Rayon (for deep/hops > 3)
     pub fn forward_parallel(mut self, edge_type: &str) -> Self {
-        self.steps.push(Step::ForwardParallel(seahash::hash(edge_type.as_bytes())));
+        self.steps
+            .push(Step::ForwardParallel(seahash::hash(edge_type.as_bytes())));
         self
     }
     /// Parallel backward traversal using Rayon (for deep/hops > 3)
     pub fn backward_parallel(mut self, edge_type: &str) -> Self {
-        self.steps.push(Step::BackwardParallel(seahash::hash(edge_type.as_bytes())));
+        self.steps
+            .push(Step::BackwardParallel(seahash::hash(edge_type.as_bytes())));
         self
     }
     pub fn hops(mut self, n: u32) -> Self {
         self.steps.push(Step::Hops(n));
         self
     }
-    pub fn leaves(mut self) -> Self { self.steps.push(Step::Leaves); self }
-    pub fn roots(mut self) -> Self { self.steps.push(Step::Roots); self }
+    pub fn leaves(mut self) -> Self {
+        self.steps.push(Step::Leaves);
+        self
+    }
+    pub fn roots(mut self) -> Self {
+        self.steps.push(Step::Roots);
+        self
+    }
 
     pub fn near(mut self, lat: f32, lon: f32, radius_km: f32) -> Self {
         self.steps.push(Step::Near(lat, lon, radius_km));
+        self
+    }
+    pub fn spatial_within_bbox(
+        mut self,
+        min_lat: f32,
+        min_lon: f32,
+        max_lat: f32,
+        max_lon: f32,
+    ) -> Self {
+        self.steps
+            .push(Step::SpatialWithinBbox(min_lat, min_lon, max_lat, max_lon));
+        self
+    }
+    pub fn spatial_intersects_bbox(
+        mut self,
+        min_lat: f32,
+        min_lon: f32,
+        max_lat: f32,
+        max_lon: f32,
+    ) -> Self {
+        self.steps.push(Step::SpatialIntersectsBbox(
+            min_lat, min_lon, max_lat, max_lon,
+        ));
+        self
+    }
+    pub fn spatial_within_polygon(mut self, polygon: Vec<[f32; 2]>) -> Self {
+        self.steps.push(Step::SpatialWithinPolygon(polygon));
         self
     }
     pub fn similar(mut self, query: &[f32], k: usize) -> Self {
@@ -110,7 +191,28 @@ impl<'db> Set<'db> {
     }
     #[cfg(feature = "fulltext")]
     pub fn matching(mut self, text: &str) -> Self {
-        self.steps.push(Step::Matching(text.to_string()));
+        self.steps.push(Step::Matching {
+            text: text.to_string(),
+            limit: 1000,
+            title_weight: 1.0,
+            content_weight: 1.0,
+        });
+        self
+    }
+    #[cfg(feature = "fulltext")]
+    pub fn matching_weighted(
+        mut self,
+        text: &str,
+        limit: usize,
+        title_weight: f32,
+        content_weight: f32,
+    ) -> Self {
+        self.steps.push(Step::Matching {
+            text: text.to_string(),
+            limit,
+            title_weight,
+            content_weight,
+        });
         self
     }
 
@@ -119,7 +221,8 @@ impl<'db> Set<'db> {
         self
     }
     pub fn where_between(mut self, field: &str, lo: f64, hi: f64) -> Self {
-        self.steps.push(Step::WhereBetween(field.to_string(), lo, hi));
+        self.steps
+            .push(Step::WhereBetween(field.to_string(), lo, hi));
         self
     }
     pub fn where_gt(mut self, field: &str, threshold: f64) -> Self {
@@ -135,11 +238,13 @@ impl<'db> Set<'db> {
         self
     }
     pub fn where_lte(mut self, field: &str, threshold: f64) -> Self {
-        self.steps.push(Step::WhereLte(field.to_string(), threshold));
+        self.steps
+            .push(Step::WhereLte(field.to_string(), threshold));
         self
     }
     pub fn where_gte(mut self, field: &str, threshold: f64) -> Self {
-        self.steps.push(Step::WhereGte(field.to_string(), threshold));
+        self.steps
+            .push(Step::WhereGte(field.to_string(), threshold));
         self
     }
 
@@ -182,14 +287,24 @@ impl<'db> Set<'db> {
         let skip_n = self.skip_n;
         let select_fields = self.select_fields.clone();
 
-        let (bitmap, trace) = self.execute_pipeline()?;
+        let (bitmap, trace, score_map) = self.execute_pipeline()?;
         let mut hits = self.db.resolve_hits(&bitmap, true);
 
-        if let Some((ref field, ascending)) = sort_by {
+        if sort_by.is_none() && !score_map.is_empty() {
+            hits.sort_unstable_by(|a, b| {
+                let sa = score_map.get(&a.idx).copied().unwrap_or(0.0);
+                let sb = score_map.get(&b.idx).copied().unwrap_or(0.0);
+                sb.total_cmp(&sa)
+            });
+        } else if let Some((ref field, ascending)) = sort_by {
             let field = field.clone();
             hits.sort_unstable_by(|a, b| {
                 let cmp = extract_sort_key(a, &field).cmp_key(&extract_sort_key(b, &field));
-                if ascending { cmp } else { cmp.reverse() }
+                if ascending {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
             });
         }
 
@@ -204,23 +319,33 @@ impl<'db> Set<'db> {
                 }
             }
         }
+        for hit in &mut hits {
+            if let Some(score) = score_map.get(&hit.idx).copied() {
+                hit.score = Some(score);
+                hit.payload = inject_score(hit.payload.clone(), score);
+            }
+        }
 
         Ok(Outcome { data: hits, trace })
     }
 
     /// Collect edges outgoing from the candidate set, including metadata.
     pub fn edge_collect(self) -> Result<Outcome<Vec<EdgeHit>>, Box<dyn std::error::Error>> {
-        let (bitmap, trace) = self.execute_pipeline()?;
+        let (bitmap, trace, _) = self.execute_pipeline()?;
         let mut hits = Vec::new();
 
         for from_idx in bitmap.iter() {
             let from_slot = self.db.nodes.read_at(from_idx as u64);
-            if from_slot.flags == 0 { continue; }
+            if from_slot.flags == 0 {
+                continue;
+            }
 
             if let Some(edge_indices) = self.db.adj_fwd.get(&from_idx) {
                 for &e_idx in edge_indices.iter() {
                     let edge = self.db.edges.read_at(e_idx as u64);
-                    if edge.flags == 0 { continue; }
+                    if edge.flags == 0 {
+                        continue;
+                    }
 
                     let to_slot = self.db.nodes.read_at(edge.to_node as u64);
 
@@ -231,12 +356,16 @@ impl<'db> Set<'db> {
                                 .map(|s| s.to_string())
                         }
                         2 => {
-                            let offset = u64::from_le_bytes(edge.meta[..8].try_into().unwrap_or_default());
-                            let len = u32::from_le_bytes(edge.meta[8..12].try_into().unwrap_or_default());
+                            let offset =
+                                u64::from_le_bytes(edge.meta[..8].try_into().unwrap_or_default());
+                            let len =
+                                u32::from_le_bytes(edge.meta[8..12].try_into().unwrap_or_default());
                             if len > 0 {
                                 let bytes = self.db.blobs.read(offset, len);
                                 std::str::from_utf8(bytes).ok().map(|s| s.to_string())
-                            } else { None }
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
@@ -259,43 +388,62 @@ impl<'db> Set<'db> {
     }
 
     pub fn count(self) -> Result<Outcome<usize>, Box<dyn std::error::Error>> {
-        let (bitmap, trace) = self.execute_pipeline()?;
-        Ok(Outcome { data: bitmap.len() as usize, trace })
+        let (bitmap, trace, _) = self.execute_pipeline()?;
+        Ok(Outcome {
+            data: bitmap.len() as usize,
+            trace,
+        })
     }
 
     pub fn first(self) -> Result<Outcome<Option<Hit>>, Box<dyn std::error::Error>> {
-        let (bitmap, trace) = self.execute_pipeline()?;
+        let (bitmap, trace, score_map) = self.execute_pipeline()?;
         let hit = bitmap.iter().next().map(|idx| {
-            self.db.resolve_single_hit(idx, true)
+            let mut hit = self.db.resolve_single_hit(idx, true);
+            if let Some(score) = score_map.get(&idx).copied() {
+                hit.score = Some(score);
+                hit.payload = inject_score(hit.payload.clone(), score);
+            }
+            hit
         });
         Ok(Outcome { data: hit, trace })
     }
 
     pub fn exists(self) -> Result<Outcome<bool>, Box<dyn std::error::Error>> {
-        let (bitmap, trace) = self.execute_pipeline()?;
-        Ok(Outcome { data: !bitmap.is_empty(), trace })
+        let (bitmap, trace, _) = self.execute_pipeline()?;
+        Ok(Outcome {
+            data: !bitmap.is_empty(),
+            trace,
+        })
     }
 
     pub fn avg(self, field: &str) -> Result<Outcome<f64>, Box<dyn std::error::Error>> {
-        let (bitmap, trace) = self.execute_pipeline()?;
+        let (bitmap, trace, _) = self.execute_pipeline()?;
         let avg = self.db.aggregate_field(&bitmap, field, AggOp::Avg)?;
         Ok(Outcome { data: avg, trace })
     }
 
     pub fn sum(self, field: &str) -> Result<Outcome<f64>, Box<dyn std::error::Error>> {
-        let (bitmap, trace) = self.execute_pipeline()?;
+        let (bitmap, trace, _) = self.execute_pipeline()?;
         let sum = self.db.aggregate_field(&bitmap, field, AggOp::Sum)?;
         Ok(Outcome { data: sum, trace })
     }
 
     pub fn explain(&self) -> Plan {
-        Plan { steps: self.steps.to_vec() }
+        Plan {
+            steps: self.steps.to_vec(),
+        }
     }
 
-    fn execute_pipeline(&self) -> Result<(RoaringBitmap, Trace), Box<dyn std::error::Error>> {
-        let mut trace = Trace { steps: Vec::new(), total_us: 0 };
+    fn execute_pipeline(
+        &self,
+    ) -> Result<(RoaringBitmap, Trace, HashMap<u32, f32>), Box<dyn std::error::Error>> {
+        let mut trace = Trace {
+            steps: Vec::new(),
+            total_us: 0,
+        };
         let total_start = Instant::now();
         let mut candidates: Option<RoaringBitmap> = None;
+        let mut score_map: HashMap<u32, f32> = HashMap::new();
         let mut pending_hops: Option<u32> = None;
 
         for step in &self.steps {
@@ -337,7 +485,11 @@ impl<'db> Set<'db> {
                 }
                 Step::All => {
                     let mut bm = RoaringBitmap::new();
-                    let count = self.db.nodes.write_head.load(std::sync::atomic::Ordering::Acquire);
+                    let count = self
+                        .db
+                        .nodes
+                        .write_head
+                        .load(std::sync::atomic::Ordering::Acquire);
                     for i in 0..count {
                         let slot = self.db.nodes.read_at(i);
                         if slot.flags != 0 {
@@ -348,22 +500,32 @@ impl<'db> Set<'db> {
                 }
                 Step::Forward(type_hash) => {
                     let hops = pending_hops.take().unwrap_or(1);
-                    candidates = Some(self.bfs_forward(candidates.as_ref(), *type_hash, hops as usize));
+                    candidates =
+                        Some(self.bfs_forward(candidates.as_ref(), *type_hash, hops as usize));
                     index_used = "adj_fwd";
                 }
                 Step::Backward(type_hash) => {
                     let hops = pending_hops.take().unwrap_or(1);
-                    candidates = Some(self.bfs_backward(candidates.as_ref(), *type_hash, hops as usize));
+                    candidates =
+                        Some(self.bfs_backward(candidates.as_ref(), *type_hash, hops as usize));
                     index_used = "adj_rev";
                 }
                 Step::ForwardParallel(type_hash) => {
                     let hops = pending_hops.take().unwrap_or(1);
-                    candidates = Some(self.bfs_forward_parallel(candidates.as_ref(), *type_hash, hops as usize));
+                    candidates = Some(self.bfs_forward_parallel(
+                        candidates.as_ref(),
+                        *type_hash,
+                        hops as usize,
+                    ));
                     index_used = "adj_fwd_parallel";
                 }
                 Step::BackwardParallel(type_hash) => {
                     let hops = pending_hops.take().unwrap_or(1);
-                    candidates = Some(self.bfs_backward_parallel(candidates.as_ref(), *type_hash, hops as usize));
+                    candidates = Some(self.bfs_backward_parallel(
+                        candidates.as_ref(),
+                        *type_hash,
+                        hops as usize,
+                    ));
                     index_used = "adj_rev_parallel";
                 }
                 Step::Hops(n) => {
@@ -419,7 +581,7 @@ impl<'db> Set<'db> {
                                 let slot = self.db.nodes.read_at(idx as u64);
                                 let dx = slot.lat - lat;
                                 let dy = slot.lon - lon;
-                                if dx*dx + dy*dy <= r_sq {
+                                if dx * dx + dy * dy <= r_sq {
                                     filtered.insert(idx);
                                 }
                             }
@@ -427,7 +589,10 @@ impl<'db> Set<'db> {
                             index_used = "filter";
                         }
                         _ => {
-                            let results: RoaringBitmap = self.db.spatial.read()
+                            let results: RoaringBitmap = self
+                                .db
+                                .spatial
+                                .read()
                                 .locate_within_distance([*lat, *lon], r_sq)
                                 .map(|n| n.id)
                                 .collect();
@@ -439,6 +604,83 @@ impl<'db> Set<'db> {
                             index_used = "rtree";
                         }
                     }
+                }
+                Step::SpatialWithinBbox(min_lat, min_lon, max_lat, max_lon)
+                | Step::SpatialIntersectsBbox(min_lat, min_lon, max_lat, max_lon) => {
+                    let env = AABB::from_corners([*min_lat, *min_lon], [*max_lat, *max_lon]);
+                    match candidates {
+                        Some(ref mut curr) if curr.len() < 500 => {
+                            let mut filtered = RoaringBitmap::new();
+                            for idx in curr.iter() {
+                                let slot = self.db.nodes.read_at(idx as u64);
+                                if slot.lat >= *min_lat
+                                    && slot.lat <= *max_lat
+                                    && slot.lon >= *min_lon
+                                    && slot.lon <= *max_lon
+                                {
+                                    filtered.insert(idx);
+                                }
+                            }
+                            *curr = filtered;
+                            index_used = "filter";
+                        }
+                        _ => {
+                            let results: RoaringBitmap = self
+                                .db
+                                .spatial
+                                .read()
+                                .locate_in_envelope_intersecting(&env)
+                                .map(|n| n.id)
+                                .collect();
+                            if let Some(ref mut curr) = candidates {
+                                *curr &= results;
+                            } else {
+                                candidates = Some(results);
+                            }
+                            index_used = "rtree";
+                        }
+                    }
+                }
+                Step::SpatialWithinPolygon(polygon) => {
+                    if polygon.len() < 3 {
+                        candidates = Some(RoaringBitmap::new());
+                        index_used = "spatial_polygon";
+                        continue;
+                    }
+
+                    let (min_lat, max_lat, min_lon, max_lon) = polygon.iter().fold(
+                        (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
+                        |(mn_la, mx_la, mn_lo, mx_lo), p| {
+                            (
+                                mn_la.min(p[0]),
+                                mx_la.max(p[0]),
+                                mn_lo.min(p[1]),
+                                mx_lo.max(p[1]),
+                            )
+                        },
+                    );
+                    let env = AABB::from_corners([min_lat, min_lon], [max_lat, max_lon]);
+                    let mut filtered = RoaringBitmap::new();
+                    match candidates {
+                        Some(ref curr) => {
+                            for idx in curr.iter() {
+                                let slot = self.db.nodes.read_at(idx as u64);
+                                if point_in_polygon(slot.lat, slot.lon, polygon) {
+                                    filtered.insert(idx);
+                                }
+                            }
+                        }
+                        None => {
+                            for n in self.db.spatial.read().locate_in_envelope_intersecting(&env) {
+                                let slot = self.db.nodes.read_at(n.id as u64);
+                                if point_in_polygon(slot.lat, slot.lon, polygon) {
+                                    filtered.insert(n.id);
+                                }
+                            }
+                        }
+                    }
+                    candidates = Some(filtered);
+                    index_used = "spatial_polygon";
                 }
                 Step::Similar(query, k) => {
                     let mut bm = RoaringBitmap::new();
@@ -456,24 +698,35 @@ impl<'db> Set<'db> {
                     index_used = "hnsw";
                 }
                 #[cfg(feature = "fulltext")]
-                Step::Matching(text) => {
+                Step::Matching {
+                    text,
+                    limit,
+                    title_weight,
+                    content_weight,
+                } => {
                     if let Some(ref ft) = *self.db.fulltext.read() {
-                        let slug_hashes = ft.search(text, 1000).unwrap_or_default();
+                        let opts = SearchOptions {
+                            title_weight: *title_weight,
+                            content_weight: *content_weight,
+                        };
+                        let slug_hashes = ft.search(text, *limit, Some(&opts)).unwrap_or_default();
                         let mut bm = RoaringBitmap::new();
                         {
                             let slug_r = self.db.slug_index.read();
-                            for hash in slug_hashes {
-                                if let Some(idx) = slug_r.get(hash.id) {
+                            for SearchHit { id, score } in slug_hashes {
+                                if let Some(idx) = slug_r.get(id) {
                                     bm.insert(idx);
+                                    score_map.insert(idx, score);
                                 }
                             }
                         }
                         if let Some(ref mut curr) = candidates {
-                            *curr &= bm;
+                            *curr &= bm.clone();
+                            score_map.retain(|idx, _| curr.contains(*idx));
                         } else {
                             candidates = Some(bm);
                         }
-                        index_used = "tantivy";
+                        index_used = "fulltext";
                     }
                 }
                 Step::WhereEq(field, value) => {
@@ -491,7 +744,9 @@ impl<'db> Set<'db> {
                         let mut filtered = RoaringBitmap::new();
                         for idx in bm.iter() {
                             let slot = self.db.nodes.read_at(idx as u64);
-                            if slot.flags == 0 { continue; }
+                            if slot.flags == 0 {
+                                continue;
+                            }
                             let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                                 if json.get(field) == Some(value) {
@@ -505,10 +760,13 @@ impl<'db> Set<'db> {
                 }
                 Step::WhereBetween(field, lo, hi) => {
                     if let Some(range_idx) = self.db.field_range_indexes.get(field) {
-                        let hits: RoaringBitmap = range_idx.lookup_range(
-                            &serde_json::Value::from(*lo),
-                            &serde_json::Value::from(*hi),
-                        ).into_iter().collect();
+                        let hits: RoaringBitmap = range_idx
+                            .lookup_range(
+                                &serde_json::Value::from(*lo),
+                                &serde_json::Value::from(*hi),
+                            )
+                            .into_iter()
+                            .collect();
                         if let Some(ref mut curr) = candidates {
                             *curr &= hits;
                         } else {
@@ -519,7 +777,9 @@ impl<'db> Set<'db> {
                         let mut filtered = RoaringBitmap::new();
                         for idx in bm.iter() {
                             let slot = self.db.nodes.read_at(idx as u64);
-                            if slot.flags == 0 { continue; }
+                            if slot.flags == 0 {
+                                continue;
+                            }
                             let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                                 if let Some(num) = json.get(field).and_then(|v| v.as_f64()) {
@@ -535,10 +795,13 @@ impl<'db> Set<'db> {
                 }
                 Step::WhereGt(field, threshold) => {
                     if let Some(range_idx) = self.db.field_range_indexes.get(field) {
-                        let hits: RoaringBitmap = range_idx.lookup_range(
-                            &serde_json::Value::from(*threshold + f64::EPSILON),
-                            &serde_json::Value::from(f64::MAX),
-                        ).into_iter().collect();
+                        let hits: RoaringBitmap = range_idx
+                            .lookup_range(
+                                &serde_json::Value::from(*threshold + f64::EPSILON),
+                                &serde_json::Value::from(f64::MAX),
+                            )
+                            .into_iter()
+                            .collect();
                         if let Some(ref mut curr) = candidates {
                             *curr &= hits;
                         } else {
@@ -549,7 +812,9 @@ impl<'db> Set<'db> {
                         let mut filtered = RoaringBitmap::new();
                         for idx in bm.iter() {
                             let slot = self.db.nodes.read_at(idx as u64);
-                            if slot.flags == 0 { continue; }
+                            if slot.flags == 0 {
+                                continue;
+                            }
                             let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                                 if let Some(num) = json.get(field).and_then(|v| v.as_f64()) {
@@ -569,7 +834,9 @@ impl<'db> Set<'db> {
                         let mut filtered = RoaringBitmap::new();
                         for idx in bm.iter() {
                             let slot = self.db.nodes.read_at(idx as u64);
-                            if slot.flags == 0 { continue; }
+                            if slot.flags == 0 {
+                                continue;
+                            }
                             let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                                 if let Some(v) = json.get(field) {
@@ -585,7 +852,7 @@ impl<'db> Set<'db> {
                 }
                 Step::Intersect(other_steps) => {
                     let other_set = Set::from_steps(self.db, other_steps.clone());
-                    let (other_bm, _) = other_set.execute_pipeline()?;
+                    let (other_bm, _, _) = other_set.execute_pipeline()?;
                     if let Some(ref mut curr) = candidates {
                         *curr &= other_bm;
                     } else {
@@ -595,7 +862,7 @@ impl<'db> Set<'db> {
                 }
                 Step::Union(other_steps) => {
                     let other_set = Set::from_steps(self.db, other_steps.clone());
-                    let (other_bm, _) = other_set.execute_pipeline()?;
+                    let (other_bm, _, _) = other_set.execute_pipeline()?;
                     if let Some(ref mut curr) = candidates {
                         *curr |= other_bm;
                     } else {
@@ -605,7 +872,7 @@ impl<'db> Set<'db> {
                 }
                 Step::Subtract(other_steps) => {
                     let other_set = Set::from_steps(self.db, other_steps.clone());
-                    let (other_bm, _) = other_set.execute_pipeline()?;
+                    let (other_bm, _, _) = other_set.execute_pipeline()?;
                     if let Some(ref mut curr) = candidates {
                         let mut result = RoaringBitmap::new();
                         for idx in curr.iter() {
@@ -619,10 +886,13 @@ impl<'db> Set<'db> {
                 }
                 Step::WhereLt(field, threshold) => {
                     if let Some(range_idx) = self.db.field_range_indexes.get(field) {
-                        let hits: RoaringBitmap = range_idx.lookup_range(
-                            &serde_json::Value::from(f64::MIN),
-                            &serde_json::Value::from(*threshold - f64::EPSILON),
-                        ).into_iter().collect();
+                        let hits: RoaringBitmap = range_idx
+                            .lookup_range(
+                                &serde_json::Value::from(f64::MIN),
+                                &serde_json::Value::from(*threshold - f64::EPSILON),
+                            )
+                            .into_iter()
+                            .collect();
                         if let Some(ref mut curr) = candidates {
                             *curr &= hits;
                         } else {
@@ -633,11 +903,15 @@ impl<'db> Set<'db> {
                         let mut filtered = RoaringBitmap::new();
                         for idx in bm.iter() {
                             let slot = self.db.nodes.read_at(idx as u64);
-                            if slot.flags == 0 { continue; }
+                            if slot.flags == 0 {
+                                continue;
+                            }
                             let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                                 if let Some(num) = json.get(field).and_then(|v| v.as_f64()) {
-                                    if num < *threshold { filtered.insert(idx); }
+                                    if num < *threshold {
+                                        filtered.insert(idx);
+                                    }
                                 }
                             }
                         }
@@ -647,10 +921,13 @@ impl<'db> Set<'db> {
                 }
                 Step::WhereLte(field, threshold) => {
                     if let Some(range_idx) = self.db.field_range_indexes.get(field) {
-                        let hits: RoaringBitmap = range_idx.lookup_range(
-                            &serde_json::Value::from(f64::MIN),
-                            &serde_json::Value::from(*threshold),
-                        ).into_iter().collect();
+                        let hits: RoaringBitmap = range_idx
+                            .lookup_range(
+                                &serde_json::Value::from(f64::MIN),
+                                &serde_json::Value::from(*threshold),
+                            )
+                            .into_iter()
+                            .collect();
                         if let Some(ref mut curr) = candidates {
                             *curr &= hits;
                         } else {
@@ -661,11 +938,15 @@ impl<'db> Set<'db> {
                         let mut filtered = RoaringBitmap::new();
                         for idx in bm.iter() {
                             let slot = self.db.nodes.read_at(idx as u64);
-                            if slot.flags == 0 { continue; }
+                            if slot.flags == 0 {
+                                continue;
+                            }
                             let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                                 if let Some(num) = json.get(field).and_then(|v| v.as_f64()) {
-                                    if num <= *threshold { filtered.insert(idx); }
+                                    if num <= *threshold {
+                                        filtered.insert(idx);
+                                    }
                                 }
                             }
                         }
@@ -675,10 +956,13 @@ impl<'db> Set<'db> {
                 }
                 Step::WhereGte(field, threshold) => {
                     if let Some(range_idx) = self.db.field_range_indexes.get(field) {
-                        let hits: RoaringBitmap = range_idx.lookup_range(
-                            &serde_json::Value::from(*threshold),
-                            &serde_json::Value::from(f64::MAX),
-                        ).into_iter().collect();
+                        let hits: RoaringBitmap = range_idx
+                            .lookup_range(
+                                &serde_json::Value::from(*threshold),
+                                &serde_json::Value::from(f64::MAX),
+                            )
+                            .into_iter()
+                            .collect();
                         if let Some(ref mut curr) = candidates {
                             *curr &= hits;
                         } else {
@@ -689,11 +973,15 @@ impl<'db> Set<'db> {
                         let mut filtered = RoaringBitmap::new();
                         for idx in bm.iter() {
                             let slot = self.db.nodes.read_at(idx as u64);
-                            if slot.flags == 0 { continue; }
+                            if slot.flags == 0 {
+                                continue;
+                            }
                             let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                                 if let Some(num) = json.get(field).and_then(|v| v.as_f64()) {
-                                    if num >= *threshold { filtered.insert(idx); }
+                                    if num >= *threshold {
+                                        filtered.insert(idx);
+                                    }
                                 }
                             }
                         }
@@ -726,23 +1014,45 @@ impl<'db> Set<'db> {
             });
         }
 
+        let mut canonical = RoaringBitmap::new();
+        let slug_r = self.db.slug_index.read();
+        for idx in candidates.unwrap_or_default().iter() {
+            let slot = self.db.nodes.read_at(idx as u64);
+            if slot.flags == 0 {
+                continue;
+            }
+            if slug_r.get(slot.slug_hash) == Some(idx) {
+                canonical.insert(idx);
+            }
+        }
+
         trace.total_us = total_start.elapsed().as_micros() as u64;
-        Ok((candidates.unwrap_or_default(), trace))
+        Ok((canonical, trace, score_map))
     }
 
-    fn bfs_forward(&self, candidates: Option<&RoaringBitmap>, type_hash: u64, max_hops: usize) -> RoaringBitmap {
+    fn bfs_forward(
+        &self,
+        candidates: Option<&RoaringBitmap>,
+        type_hash: u64,
+        max_hops: usize,
+    ) -> RoaringBitmap {
         let mut visited = RoaringBitmap::new();
         let mut frontier: RoaringBitmap = candidates.cloned().unwrap_or_default();
-        
+
         for _ in 0..max_hops {
-            if frontier.is_empty() { break; }
+            if frontier.is_empty() {
+                break;
+            }
             let mut next_frontier = RoaringBitmap::new();
             for idx in frontier.iter() {
                 visited.insert(idx);
                 if let Some(edge_indices) = self.db.adj_fwd.get(&idx) {
                     for &e_idx in edge_indices.iter() {
                         let edge = self.db.edges.read_at(e_idx as u64);
-                        if edge.edge_type_hash == type_hash && edge.flags != 0 && !visited.contains(edge.to_node) {
+                        if edge.edge_type_hash == type_hash
+                            && edge.flags != 0
+                            && !visited.contains(edge.to_node)
+                        {
                             next_frontier.insert(edge.to_node);
                         }
                     }
@@ -754,19 +1064,29 @@ impl<'db> Set<'db> {
         visited
     }
 
-    fn bfs_backward(&self, candidates: Option<&RoaringBitmap>, type_hash: u64, max_hops: usize) -> RoaringBitmap {
+    fn bfs_backward(
+        &self,
+        candidates: Option<&RoaringBitmap>,
+        type_hash: u64,
+        max_hops: usize,
+    ) -> RoaringBitmap {
         let mut visited = RoaringBitmap::new();
         let mut frontier: RoaringBitmap = candidates.cloned().unwrap_or_default();
-        
+
         for _ in 0..max_hops {
-            if frontier.is_empty() { break; }
+            if frontier.is_empty() {
+                break;
+            }
             let mut next_frontier = RoaringBitmap::new();
             for idx in frontier.iter() {
                 visited.insert(idx);
                 if let Some(edge_indices) = self.db.adj_rev.get(&idx) {
                     for &e_idx in edge_indices.iter() {
                         let edge = self.db.edges.read_at(e_idx as u64);
-                        if edge.edge_type_hash == type_hash && edge.flags != 0 && !visited.contains(edge.from_node) {
+                        if edge.edge_type_hash == type_hash
+                            && edge.flags != 0
+                            && !visited.contains(edge.from_node)
+                        {
                             next_frontier.insert(edge.from_node);
                         }
                     }
@@ -780,23 +1100,30 @@ impl<'db> Set<'db> {
 
     /// Parallel forward BFS using Rayon - faster for deep traversals (hops > 3)
     #[cfg(feature = "parallel")]
-    fn bfs_forward_parallel(&self, candidates: Option<&RoaringBitmap>, type_hash: u64, max_hops: usize) -> RoaringBitmap {
+    fn bfs_forward_parallel(
+        &self,
+        candidates: Option<&RoaringBitmap>,
+        type_hash: u64,
+        max_hops: usize,
+    ) -> RoaringBitmap {
         use rayon::prelude::*;
         use std::sync::Mutex;
-        
+
         let mut visited = RoaringBitmap::new();
         let mut frontier: RoaringBitmap = candidates.cloned().unwrap_or_default();
-        
+
         for _ in 0..max_hops {
-            if frontier.is_empty() { break; }
-            
+            if frontier.is_empty() {
+                break;
+            }
+
             // Collect frontier into vec for parallel processing
             let frontier_vec: Vec<u32> = frontier.iter().collect();
-            
+
             // Parallel expansion of frontier
             let next_frontier: Mutex<RoaringBitmap> = Mutex::new(RoaringBitmap::new());
             let visited_local: Mutex<RoaringBitmap> = Mutex::new(RoaringBitmap::new());
-            
+
             frontier_vec.into_par_iter().for_each(|idx| {
                 visited_local.lock().unwrap().insert(idx);
                 if let Some(edge_indices) = self.db.adj_fwd.get(&idx) {
@@ -809,40 +1136,52 @@ impl<'db> Set<'db> {
                     }
                 }
             });
-            
+
             visited |= visited_local.into_inner().unwrap();
             frontier = next_frontier.into_inner().unwrap();
-            frontier -= &visited;  // Remove already-visited nodes
+            frontier -= &visited; // Remove already-visited nodes
         }
         visited |= frontier;
         visited
     }
 
     #[cfg(not(feature = "parallel"))]
-    fn bfs_forward_parallel(&self, candidates: Option<&RoaringBitmap>, type_hash: u64, max_hops: usize) -> RoaringBitmap {
+    fn bfs_forward_parallel(
+        &self,
+        candidates: Option<&RoaringBitmap>,
+        type_hash: u64,
+        max_hops: usize,
+    ) -> RoaringBitmap {
         // Fallback to sequential when parallel feature is disabled
         self.bfs_forward(candidates, type_hash, max_hops)
     }
 
     /// Parallel backward BFS using Rayon - faster for deep traversals (hops > 3)
     #[cfg(feature = "parallel")]
-    fn bfs_backward_parallel(&self, candidates: Option<&RoaringBitmap>, type_hash: u64, max_hops: usize) -> RoaringBitmap {
+    fn bfs_backward_parallel(
+        &self,
+        candidates: Option<&RoaringBitmap>,
+        type_hash: u64,
+        max_hops: usize,
+    ) -> RoaringBitmap {
         use rayon::prelude::*;
         use std::sync::Mutex;
-        
+
         let mut visited = RoaringBitmap::new();
         let mut frontier: RoaringBitmap = candidates.cloned().unwrap_or_default();
-        
+
         for _ in 0..max_hops {
-            if frontier.is_empty() { break; }
-            
+            if frontier.is_empty() {
+                break;
+            }
+
             // Collect frontier into vec for parallel processing
             let frontier_vec: Vec<u32> = frontier.iter().collect();
-            
+
             // Parallel expansion of frontier
             let next_frontier: Mutex<RoaringBitmap> = Mutex::new(RoaringBitmap::new());
             let visited_local: Mutex<RoaringBitmap> = Mutex::new(RoaringBitmap::new());
-            
+
             frontier_vec.into_par_iter().for_each(|idx| {
                 visited_local.lock().unwrap().insert(idx);
                 if let Some(edge_indices) = self.db.adj_rev.get(&idx) {
@@ -855,17 +1194,22 @@ impl<'db> Set<'db> {
                     }
                 }
             });
-            
+
             visited |= visited_local.into_inner().unwrap();
             frontier = next_frontier.into_inner().unwrap();
-            frontier -= &visited;  // Remove already-visited nodes
+            frontier -= &visited; // Remove already-visited nodes
         }
         visited |= frontier;
         visited
     }
 
     #[cfg(not(feature = "parallel"))]
-    fn bfs_backward_parallel(&self, candidates: Option<&RoaringBitmap>, type_hash: u64, max_hops: usize) -> RoaringBitmap {
+    fn bfs_backward_parallel(
+        &self,
+        candidates: Option<&RoaringBitmap>,
+        type_hash: u64,
+        max_hops: usize,
+    ) -> RoaringBitmap {
         // Fallback to sequential when parallel feature is disabled
         self.bfs_backward(candidates, type_hash, max_hops)
     }

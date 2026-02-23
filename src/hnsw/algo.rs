@@ -5,7 +5,7 @@
 use crate::hnsw::distance::Distance;
 use crate::hnsw::graph::HNSWGraph;
 use crate::hnsw::storage::ArenaVectorStore;
-use crossbeam_epoch::{pin};
+use crossbeam_epoch::pin;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 

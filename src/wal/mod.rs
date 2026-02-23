@@ -14,18 +14,18 @@
 //! let wal = WalConfig::new(WalMode::Sync).path("./data").build();
 //! ```
 
-mod traits;
-mod noop;
 mod disk;
+mod noop;
+mod traits;
 
-pub use traits::{WriteAheadLog, WalEntry, WalOp, Lsn};
-pub use noop::NoOpWAL;
 pub use disk::DiskWAL;
+pub use noop::NoOpWAL;
+pub use traits::{Lsn, WalEntry, WalOp, WriteAheadLog};
 
 use std::path::Path;
 
 /// WAL mode - selectable at runtime
-/// 
+///
 /// Similar to SQLite's journal modes:
 /// - `Disabled` = SQLite OFF (fastest, no durability)
 /// - `Async` = SQLite MEMORY (fast, partial durability)
@@ -34,10 +34,10 @@ use std::path::Path;
 pub enum WalMode {
     /// No WAL - fastest, no durability (like SQLite OFF)
     Disabled,
-    
+
     /// In-memory buffer with periodic flush (like SQLite MEMORY)
     Async,
-    
+
     /// Synchronous WAL with fsync (like SQLite WAL) - DEFAULT
     #[default]
     Sync,
@@ -87,24 +87,24 @@ impl WalConfig {
             ..Default::default()
         }
     }
-    
+
     /// Set WAL mode
     pub fn mode(mut self, mode: WalMode) -> Self {
         self.mode = mode;
         self
     }
-    
+
     /// Set WAL path
     pub fn path(mut self, path: impl AsRef<Path>) -> Self {
         self.path = Some(path.as_ref().to_path_buf());
         self
     }
-    
+
     /// Create WAL instance based on config
     pub fn build(&self) -> Box<dyn WriteAheadLog> {
         self.build_with_path(self.path.as_deref())
     }
-    
+
     /// Create WAL instance with explicit path
     pub fn build_with_path(&self, path: Option<&Path>) -> Box<dyn WriteAheadLog> {
         match self.mode {

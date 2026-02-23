@@ -2,7 +2,6 @@
 ///
 /// These tests verify performance characteristics at moderate scale.
 /// (Full 50M test would be too slow for CI; 100K demonstrates the same patterns.)
-
 use sekejap::SekejapDB;
 use serde_json::json;
 use std::time::Instant;
@@ -16,10 +15,7 @@ fn rss_mb() -> u64 {
         .output()
         .map(|o| o.stdout)
         .unwrap_or_default();
-    let kb: u64 = String::from_utf8_lossy(&stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let kb: u64 = String::from_utf8_lossy(&stdout).trim().parse().unwrap_or(0);
     kb / 1024
 }
 
@@ -49,7 +45,8 @@ fn ingest_nodes(db: &SekejapDB, n: usize) -> std::time::Duration {
         })
         .collect();
 
-    let refs: Vec<(&str, &str)> = items.iter()
+    let refs: Vec<(&str, &str)> = items
+        .iter()
         .map(|(s, j)| (s.as_str(), j.as_str()))
         .collect();
 
@@ -69,7 +66,10 @@ fn test_ingest_100k_nodes() {
 
     println!(
         "Ingest {} nodes: {:?}  |  RAM before={} MB  after={} MB  delta=+{} MB",
-        SCALE, elapsed, rss_before, rss_after,
+        SCALE,
+        elapsed,
+        rss_before,
+        rss_after,
         rss_after.saturating_sub(rss_before)
     );
 
@@ -92,7 +92,10 @@ fn test_collection_bitmap_is_fast() {
     let outcome = db.nodes().collection("citizens").count().unwrap();
     let elapsed = t.elapsed();
 
-    println!("collection('citizens') count={} in {:?}", outcome.data, elapsed);
+    println!(
+        "collection('citizens') count={} in {:?}",
+        outcome.data, elapsed
+    );
     assert_eq!(outcome.data, expected_citizens, "wrong citizen count");
 
     // Should be sub-millisecond (bitmap op, not scan)
@@ -103,10 +106,21 @@ fn test_collection_bitmap_is_fast() {
     );
 
     // Verify trace says collection_bitmap
-    let used_bitmap = outcome.trace.steps.iter()
+    let used_bitmap = outcome
+        .trace
+        .steps
+        .iter()
         .any(|s| s.index_used == "collection_bitmap");
-    assert!(used_bitmap, "expected collection_bitmap index in trace, got: {:?}",
-        outcome.trace.steps.iter().map(|s| &s.index_used).collect::<Vec<_>>());
+    assert!(
+        used_bitmap,
+        "expected collection_bitmap index in trace, got: {:?}",
+        outcome
+            .trace
+            .steps
+            .iter()
+            .map(|s| &s.index_used)
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Slug lookup (MmapHashIndex) ───────────────────────────────────────────────
@@ -117,8 +131,8 @@ fn test_slug_lookup_100k() {
     ingest_nodes(&db, SCALE);
 
     // Spot checks at known-valid indices (even → citizens, odd → services)
-    let last_even = ((SCALE - 2) / 2) * 2;  // largest even index < SCALE
-    let last_odd  = ((SCALE - 1) / 2) * 2 + 1; // largest odd index < SCALE
+    let last_even = ((SCALE - 2) / 2) * 2; // largest even index < SCALE
+    let last_odd = ((SCALE - 1) / 2) * 2 + 1; // largest odd index < SCALE
     let slugs = [
         format!("citizens/{}", 0),
         format!("services/{}", 1),
@@ -127,7 +141,12 @@ fn test_slug_lookup_100k() {
     ];
     for slug in &slugs {
         let result = db.nodes().get(slug);
-        assert!(result.is_some(), "slug {} not found after {}K ingest", slug, SCALE / 1000);
+        assert!(
+            result.is_some(),
+            "slug {} not found after {}K ingest",
+            slug,
+            SCALE / 1000
+        );
     }
 }
 
@@ -139,7 +158,10 @@ fn test_hash_index_at_scale() {
     let (db, _dir) = make_db(n + 1024);
 
     // Define schema BEFORE ingest to activate index
-    db.schema().define("items", r#"{
+    db.schema()
+        .define(
+            "items",
+            r#"{
         "hot_fields": {
             "hash_index": ["status"],
             "range_index": [],
@@ -147,7 +169,9 @@ fn test_hash_index_at_scale() {
             "spatial": [],
             "fulltext": []
         }
-    }"#).unwrap();
+    }"#,
+        )
+        .unwrap();
 
     let items: Vec<(String, String)> = (0..n)
         .map(|i| {
@@ -157,16 +181,27 @@ fn test_hash_index_at_scale() {
             (slug, json)
         })
         .collect();
-    let refs: Vec<(&str, &str)> = items.iter().map(|(s, j)| (s.as_str(), j.as_str())).collect();
+    let refs: Vec<(&str, &str)> = items
+        .iter()
+        .map(|(s, j)| (s.as_str(), j.as_str()))
+        .collect();
     db.nodes().ingest(&refs).unwrap();
 
     let t = Instant::now();
-    let outcome = db.nodes().all()
+    let outcome = db
+        .nodes()
+        .all()
         .where_eq("status", json!("active"))
-        .count().unwrap();
+        .count()
+        .unwrap();
     let elapsed = t.elapsed();
 
-    println!("where_eq('status','active') at {}K: count={} in {:?}", n / 1000, outcome.data, elapsed);
+    println!(
+        "where_eq('status','active') at {}K: count={} in {:?}",
+        n / 1000,
+        outcome.data,
+        elapsed
+    );
     assert_eq!(outcome.data, n / 4, "expected {} active items", n / 4);
 }
 
@@ -175,7 +210,10 @@ fn test_range_index_at_scale() {
     let n = 10_000usize;
     let (db, _dir) = make_db(n + 1024);
 
-    db.schema().define("products", r#"{
+    db.schema()
+        .define(
+            "products",
+            r#"{
         "hot_fields": {
             "hash_index": [],
             "range_index": ["price"],
@@ -183,7 +221,9 @@ fn test_range_index_at_scale() {
             "spatial": [],
             "fulltext": []
         }
-    }"#).unwrap();
+    }"#,
+        )
+        .unwrap();
 
     let items: Vec<(String, String)> = (0..n)
         .map(|i| {
@@ -193,16 +233,27 @@ fn test_range_index_at_scale() {
             (slug, json)
         })
         .collect();
-    let refs: Vec<(&str, &str)> = items.iter().map(|(s, j)| (s.as_str(), j.as_str())).collect();
+    let refs: Vec<(&str, &str)> = items
+        .iter()
+        .map(|(s, j)| (s.as_str(), j.as_str()))
+        .collect();
     db.nodes().ingest(&refs).unwrap();
 
     let t = Instant::now();
-    let outcome = db.nodes().all()
+    let outcome = db
+        .nodes()
+        .all()
         .where_between("price", 1000.0, 5000.0)
-        .count().unwrap();
+        .count()
+        .unwrap();
     let elapsed = t.elapsed();
 
-    println!("where_between('price',1000,5000) at {}K: count={} in {:?}", n / 1000, outcome.data, elapsed);
+    println!(
+        "where_between('price',1000,5000) at {}K: count={} in {:?}",
+        n / 1000,
+        outcome.data,
+        elapsed
+    );
     // prices 1000..=5000 → 4001 items
     assert_eq!(outcome.data, 4001, "expected 4001 products in [1000,5000]");
 }
@@ -223,7 +274,10 @@ fn test_persist_and_reopen_at_scale() {
                 (slug, json)
             })
             .collect();
-        let refs: Vec<(&str, &str)> = items.iter().map(|(s, j)| (s.as_str(), j.as_str())).collect();
+        let refs: Vec<(&str, &str)> = items
+            .iter()
+            .map(|(s, j)| (s.as_str(), j.as_str()))
+            .collect();
         db.nodes().ingest(&refs).unwrap();
         db.flush().unwrap();
     }

@@ -9,8 +9,8 @@
 //! cargo test tc_2_5 -- --nocapture
 
 use sekejap::SekejapDB;
-use tempfile::TempDir;
 use serde_json::json;
+use tempfile::TempDir;
 
 fn setup_db() -> (SekejapDB, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -30,7 +30,8 @@ mod tc_2_1_simple_node_promotion {
             "_id": slug,
             "summary": "Flood report",
             "severity": "high"
-        }).to_string();
+        })
+        .to_string();
 
         let idx = db.nodes().put_json(&payload).unwrap();
         db.flush().unwrap();
@@ -56,7 +57,8 @@ mod tc_2_1_simple_node_promotion {
             "data": "test data",
             "nested": {"key": "value"},
             "array": [1, 2, 3]
-        }).to_string();
+        })
+        .to_string();
 
         db.nodes().put_json(&payload).unwrap();
         db.flush().unwrap();
@@ -82,7 +84,11 @@ mod tc_2_1_simple_node_promotion {
 
         for i in 0..5 {
             let slug = format!("events/multi-{}", i);
-            assert!(db.nodes().get(&slug).is_some(), "Node {} should be promoted", i);
+            assert!(
+                db.nodes().get(&slug).is_some(),
+                "Node {} should be promoted",
+                i
+            );
         }
         println!("[TC-2.1] Multiple node promotion: PASSED");
     }
@@ -100,14 +106,16 @@ mod tc_2_2_duplicate_detection {
             "summary": "Riot near station",
             "who": ["Group A"],
             "where": "Station X"
-        }).to_string();
+        })
+        .to_string();
 
         let node_b = json!({
             "_id": "events/riot-002",
             "summary": "Riot at Station X",
             "who": ["Group A"],
             "where": "Station X"
-        }).to_string();
+        })
+        .to_string();
 
         db.nodes().put_json(&node_a).unwrap();
         db.nodes().put_json(&node_b).unwrap();
@@ -138,7 +146,10 @@ mod tc_2_2_duplicate_detection {
         }
         db.flush().unwrap();
 
-        println!("[TC-2.2] {} nodes above similarity threshold", above_threshold.len());
+        println!(
+            "[TC-2.2] {} nodes above similarity threshold",
+            above_threshold.len()
+        );
     }
 }
 
@@ -150,7 +161,8 @@ mod tc_2_3_node_fusion {
         let (db, _dir) = setup_db();
 
         let node_a = json!({"_id": "events/accident-1", "who": ["Driver A"]}).to_string();
-        let node_b = json!({"_id": "events/accident-2", "who": ["Driver A", "Passenger B"]}).to_string();
+        let node_b =
+            json!({"_id": "events/accident-2", "who": ["Driver A", "Passenger B"]}).to_string();
 
         db.nodes().put_json(&node_a).unwrap();
         db.nodes().put_json(&node_b).unwrap();
@@ -160,7 +172,8 @@ mod tc_2_3_node_fusion {
         let merged = json!({
             "_id": "events/accident-fused",
             "who": ["Driver A", "Passenger B"]
-        }).to_string();
+        })
+        .to_string();
 
         db.nodes().put_json(&merged).unwrap();
         db.flush().unwrap();
@@ -210,9 +223,17 @@ mod tc_2_4_hierarchy_edge_creation {
         db.nodes().put_json(&effect).unwrap();
         db.flush().unwrap();
 
-        db.edges().link("events/rainstorm-2024", "events/flood-2024", "caused_by", 0.85).unwrap();
+        db.edges()
+            .link(
+                "events/rainstorm-2024",
+                "events/flood-2024",
+                "caused_by",
+                0.85,
+            )
+            .unwrap();
 
-        let outcome = db.nodes()
+        let outcome = db
+            .nodes()
             .one("events/rainstorm-2024")
             .forward("caused_by")
             .collect()
@@ -235,17 +256,30 @@ mod tc_2_4_hierarchy_edge_creation {
         db.nodes().put_json(&district).unwrap();
         db.flush().unwrap();
 
-        db.edges().link("events/incident-001", "geo/subdistrict-001", "located_in", 1.0).unwrap();
-        db.edges().link("geo/subdistrict-001", "geo/district-001", "located_in", 1.0).unwrap();
+        db.edges()
+            .link(
+                "events/incident-001",
+                "geo/subdistrict-001",
+                "located_in",
+                1.0,
+            )
+            .unwrap();
+        db.edges()
+            .link("geo/subdistrict-001", "geo/district-001", "located_in", 1.0)
+            .unwrap();
 
-        let outcome = db.nodes()
+        let outcome = db
+            .nodes()
             .one("events/incident-001")
             .forward("located_in")
             .hops(2)
             .collect()
             .unwrap();
 
-        println!("[TC-2.4] Hierarchy traversal found {} nodes", outcome.data.len());
+        println!(
+            "[TC-2.4] Hierarchy traversal found {} nodes",
+            outcome.data.len()
+        );
     }
 }
 
@@ -294,7 +328,10 @@ mod tc_2_5_mvcc_snapshot_isolation {
         }
 
         assert_eq!(indices.len(), 10);
-        println!("[TC-2.5] Consistent read across {} nodes: PASSED", indices.len());
+        println!(
+            "[TC-2.5] Consistent read across {} nodes: PASSED",
+            indices.len()
+        );
     }
 
     #[test]

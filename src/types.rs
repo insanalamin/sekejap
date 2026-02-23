@@ -6,7 +6,7 @@ use serde_json::Value;
 pub struct NodeSlot {
     pub crc32: u32,
     pub slug_hash: u64,       // Key hash
-    pub collection_hash: u64,  // Collection hash
+    pub collection_hash: u64, // Collection hash
     pub flags: u64,           // 1 = Active, 0 = Deleted
     pub lat: f32,
     pub lon: f32,
@@ -15,7 +15,7 @@ pub struct NodeSlot {
     pub vec_slot: u32,
     pub edge_head: u32,
     pub edge_count: u32,
-    pub _pad: [u64; 7],       // Pad to 128 bytes total
+    pub _pad: [u64; 7], // Pad to 128 bytes total
 }
 
 #[repr(C)]
@@ -73,7 +73,11 @@ pub struct VectorSlot {
 }
 
 impl Default for VectorSlot {
-    fn default() -> Self { Self { data: [0.0f32; 128] } }
+    fn default() -> Self {
+        Self {
+            data: [0.0f32; 128],
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -84,7 +88,9 @@ pub struct SpatialNode {
 
 impl RTreeObject for SpatialNode {
     type Envelope = rstar::AABB<[f32; 2]>;
-    fn envelope(&self) -> Self::Envelope { rstar::AABB::from_point(self.coords) }
+    fn envelope(&self) -> Self::Envelope {
+        rstar::AABB::from_point(self.coords)
+    }
 }
 
 impl rstar::PointDistance for SpatialNode {
@@ -117,45 +123,53 @@ pub struct CollectionSchema {
 #[derive(Clone, Debug)]
 pub enum Step {
     // Starters (produce initial candidate set)
-    One(u64),                         // slug_hash
-    Many(Vec<u64>),                   // multiple slug_hashes
-    Collection(u64),                   // collection_hash
+    One(u64),        // slug_hash
+    Many(Vec<u64>),  // multiple slug_hashes
+    Collection(u64), // collection_hash
     All,
 
     // Graph transforms
-    Forward(u64),                     // edge_type_hash (single-threaded)
-    Backward(u64),                    // edge_type_hash (single-threaded)
-    ForwardParallel(u64),             // edge_type_hash (multi-threaded with Rayon)
-    BackwardParallel(u64),            // edge_type_hash (multi-threaded with Rayon)
-    Hops(u32),                        // max depth
-    Leaves,                           // filter to nodes with no outgoing edges
-    Roots,                            // filter to nodes with no incoming edges
+    Forward(u64),          // edge_type_hash (single-threaded)
+    Backward(u64),         // edge_type_hash (single-threaded)
+    ForwardParallel(u64),  // edge_type_hash (multi-threaded with Rayon)
+    BackwardParallel(u64), // edge_type_hash (multi-threaded with Rayon)
+    Hops(u32),             // max depth
+    Leaves,                // filter to nodes with no outgoing edges
+    Roots,                 // filter to nodes with no incoming edges
 
     // Search transforms
-    Near(f32, f32, f32),              // lat, lon, radius_km (radius is squared internally)
-    Similar(Vec<f32>, usize),          // query_vec, k
+    Near(f32, f32, f32), // lat, lon, radius_km (radius is squared internally)
+    SpatialWithinBbox(f32, f32, f32, f32), // min_lat, min_lon, max_lat, max_lon
+    SpatialIntersectsBbox(f32, f32, f32, f32), // point dataset: same semantics as within bbox
+    SpatialWithinPolygon(Vec<[f32; 2]>), // polygon ring points [lat, lon]
+    Similar(Vec<f32>, usize), // query_vec, k
 
     #[cfg(feature = "fulltext")]
-    Matching(String),                 // fulltext query
+    Matching {
+        text: String,
+        limit: usize,
+        title_weight: f32,
+        content_weight: f32,
+    }, // fulltext query with optional field weighting
 
     // Payload filters
-    WhereEq(String, Value),            // field, value
-    WhereBetween(String, f64, f64),   // field, lo, hi
-    WhereGt(String, f64),             // field, threshold
-    WhereLt(String, f64),             // field, threshold
-    WhereGte(String, f64),            // field, threshold (>=)
-    WhereLte(String, f64),            // field, threshold (<=)
-    WhereIn(String, Vec<Value>),      // field, values
+    WhereEq(String, Value),         // field, value
+    WhereBetween(String, f64, f64), // field, lo, hi
+    WhereGt(String, f64),           // field, threshold
+    WhereLt(String, f64),           // field, threshold
+    WhereGte(String, f64),          // field, threshold (>=)
+    WhereLte(String, f64),          // field, threshold (<=)
+    WhereIn(String, Vec<Value>),    // field, values
 
     // Set algebra
-    Intersect(Vec<Step>),            // another pipeline to intersect with
-    Union(Vec<Step>),                 // another pipeline to union with
-    Subtract(Vec<Step>),              // another pipeline to subtract
+    Intersect(Vec<Step>), // another pipeline to intersect with
+    Union(Vec<Step>),     // another pipeline to union with
+    Subtract(Vec<Step>),  // another pipeline to subtract
 
     // Ordering / pagination / projection
-    Sort(String, bool),               // field, ascending
-    Skip(usize),                      // skip N results
-    Select(Vec<String>),              // return only these fields from payload
+    Sort(String, bool),  // field, ascending
+    Skip(usize),         // skip N results
+    Select(Vec<String>), // return only these fields from payload
 
     // Limit
     Take(usize),
@@ -194,6 +208,7 @@ pub struct Hit {
     pub payload: Option<String>,
     pub lat: f32,
     pub lon: f32,
+    pub score: Option<f32>,
 }
 
 /// Plan type returned by explain()
@@ -214,30 +229,91 @@ impl Step {
         match self {
             Step::One(hash) => serde_json::json!({ "op": "one", "slug_hash": hash }),
             Step::Many(hashes) => serde_json::json!({ "op": "many", "slug_hashes": hashes }),
-            Step::Collection(hash) => serde_json::json!({ "op": "collection", "collection_hash": hash }),
+            Step::Collection(hash) => {
+                serde_json::json!({ "op": "collection", "collection_hash": hash })
+            }
             Step::All => serde_json::json!({ "op": "all" }),
             Step::Forward(hash) => serde_json::json!({ "op": "forward", "type_hash": hash }),
             Step::Backward(hash) => serde_json::json!({ "op": "backward", "type_hash": hash }),
-            Step::ForwardParallel(hash) => serde_json::json!({ "op": "forward_parallel", "type_hash": hash }),
-            Step::BackwardParallel(hash) => serde_json::json!({ "op": "backward_parallel", "type_hash": hash }),
+            Step::ForwardParallel(hash) => {
+                serde_json::json!({ "op": "forward_parallel", "type_hash": hash })
+            }
+            Step::BackwardParallel(hash) => {
+                serde_json::json!({ "op": "backward_parallel", "type_hash": hash })
+            }
             Step::Hops(n) => serde_json::json!({ "op": "hops", "n": n }),
             Step::Leaves => serde_json::json!({ "op": "leaves" }),
             Step::Roots => serde_json::json!({ "op": "roots" }),
-            Step::Near(lat, lon, radius) => serde_json::json!({ "op": "near", "lat": lat, "lon": lon, "radius": radius }),
-            Step::Similar(query, k) => serde_json::json!({ "op": "similar", "query": query, "k": k }),
+            Step::Near(lat, lon, radius) => {
+                serde_json::json!({ "op": "near", "lat": lat, "lon": lon, "radius": radius })
+            }
+            Step::SpatialWithinBbox(min_lat, min_lon, max_lat, max_lon) => serde_json::json!({
+                "op": "spatial_within_bbox",
+                "min_lat": min_lat,
+                "min_lon": min_lon,
+                "max_lat": max_lat,
+                "max_lon": max_lon
+            }),
+            Step::SpatialIntersectsBbox(min_lat, min_lon, max_lat, max_lon) => serde_json::json!({
+                "op": "spatial_intersects_bbox",
+                "min_lat": min_lat,
+                "min_lon": min_lon,
+                "max_lat": max_lat,
+                "max_lon": max_lon
+            }),
+            Step::SpatialWithinPolygon(polygon) => serde_json::json!({
+                "op": "spatial_within_polygon",
+                "polygon": polygon
+            }),
+            Step::Similar(query, k) => {
+                serde_json::json!({ "op": "similar", "query": query, "k": k })
+            }
             #[cfg(feature = "fulltext")]
-            Step::Matching(text) => serde_json::json!({ "op": "matching", "text": text }),
-            Step::WhereEq(field, value) => serde_json::json!({ "op": "where_eq", "field": field, "value": value }),
-            Step::WhereBetween(field, lo, hi) => serde_json::json!({ "op": "where_between", "field": field, "lo": lo, "hi": hi }),
-            Step::WhereGt(field, threshold) => serde_json::json!({ "op": "where_gt", "field": field, "threshold": threshold }),
-            Step::WhereLt(field, threshold) => serde_json::json!({ "op": "where_lt", "field": field, "threshold": threshold }),
-            Step::WhereGte(field, threshold) => serde_json::json!({ "op": "where_gte", "field": field, "threshold": threshold }),
-            Step::WhereLte(field, threshold) => serde_json::json!({ "op": "where_lte", "field": field, "threshold": threshold }),
-            Step::WhereIn(field, values) => serde_json::json!({ "op": "where_in", "field": field, "values": values }),
-            Step::Intersect(steps) => serde_json::json!({ "op": "intersect", "steps": steps.iter().map(|s| s.to_json()).collect::<Vec<_>>() }),
-            Step::Union(steps) => serde_json::json!({ "op": "union", "steps": steps.iter().map(|s| s.to_json()).collect::<Vec<_>>() }),
-            Step::Subtract(steps) => serde_json::json!({ "op": "subtract", "steps": steps.iter().map(|s| s.to_json()).collect::<Vec<_>>() }),
-            Step::Sort(field, asc) => serde_json::json!({ "op": "sort", "field": field, "asc": asc }),
+            Step::Matching {
+                text,
+                limit,
+                title_weight,
+                content_weight,
+            } => serde_json::json!({
+                "op": "matching",
+                "text": text,
+                "limit": limit,
+                "title_weight": title_weight,
+                "content_weight": content_weight
+            }),
+            Step::WhereEq(field, value) => {
+                serde_json::json!({ "op": "where_eq", "field": field, "value": value })
+            }
+            Step::WhereBetween(field, lo, hi) => {
+                serde_json::json!({ "op": "where_between", "field": field, "lo": lo, "hi": hi })
+            }
+            Step::WhereGt(field, threshold) => {
+                serde_json::json!({ "op": "where_gt", "field": field, "threshold": threshold })
+            }
+            Step::WhereLt(field, threshold) => {
+                serde_json::json!({ "op": "where_lt", "field": field, "threshold": threshold })
+            }
+            Step::WhereGte(field, threshold) => {
+                serde_json::json!({ "op": "where_gte", "field": field, "threshold": threshold })
+            }
+            Step::WhereLte(field, threshold) => {
+                serde_json::json!({ "op": "where_lte", "field": field, "threshold": threshold })
+            }
+            Step::WhereIn(field, values) => {
+                serde_json::json!({ "op": "where_in", "field": field, "values": values })
+            }
+            Step::Intersect(steps) => {
+                serde_json::json!({ "op": "intersect", "steps": steps.iter().map(|s| s.to_json()).collect::<Vec<_>>() })
+            }
+            Step::Union(steps) => {
+                serde_json::json!({ "op": "union", "steps": steps.iter().map(|s| s.to_json()).collect::<Vec<_>>() })
+            }
+            Step::Subtract(steps) => {
+                serde_json::json!({ "op": "subtract", "steps": steps.iter().map(|s| s.to_json()).collect::<Vec<_>>() })
+            }
+            Step::Sort(field, asc) => {
+                serde_json::json!({ "op": "sort", "field": field, "asc": asc })
+            }
             Step::Skip(n) => serde_json::json!({ "op": "skip", "n": n }),
             Step::Select(fields) => serde_json::json!({ "op": "select", "fields": fields }),
             Step::Take(n) => serde_json::json!({ "op": "take", "n": n }),

@@ -33,7 +33,10 @@ impl<'db> NodeStore<'db> {
     }
 
     /// Raw batch ingest: arena + spatial only (NO HNSW). Call build_hnsw() separately.
-    pub fn ingest_raw(&self, items: &[(&str, &str)]) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
+    pub fn ingest_raw(
+        &self,
+        items: &[(&str, &str)],
+    ) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
         self.0.ingest_nodes_raw(items)
     }
 
@@ -62,7 +65,8 @@ impl<'db> NodeStore<'db> {
 
     /// Start a query from multiple nodes
     pub fn many(&self, slugs: &[&str]) -> Set<'db> {
-        let hashes: Vec<u64> = slugs.iter()
+        let hashes: Vec<u64> = slugs
+            .iter()
             .map(|s| SekejapDB::parse_entity_id(s).1)
             .collect();
         Set::new(self.0, Step::Many(hashes))
@@ -91,13 +95,23 @@ impl<'db> EdgeStore<'db> {
     }
 
     /// Create an edge between two nodes
-    pub fn link(&self, source: &str, target: &str, edge_type: &str, weight: f32) -> Result<(), Box<dyn std::error::Error>> {
-        self.0.add_edge_internal(source, target, weight, edge_type)?;
+    pub fn link(
+        &self,
+        source: &str,
+        target: &str,
+        edge_type: &str,
+        weight: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.0
+            .add_edge_internal(source, target, weight, edge_type)?;
         Ok(())
     }
 
     /// Batch create edges (legacy: per-item commit)
-    pub fn link_many(&self, edges: &[(&str, &str, &str, f32)]) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn link_many(
+        &self,
+        edges: &[(&str, &str, &str, f32)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for &(src, dst, etype, weight) in edges {
             self.0.add_edge_internal(src, dst, weight, etype)?;
         }
@@ -105,7 +119,10 @@ impl<'db> EdgeStore<'db> {
     }
 
     /// Fast batch ingest edges: deferred writes → single commit
-    pub fn ingest(&self, edges: &[(&str, &str, &str, f32)]) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn ingest(
+        &self,
+        edges: &[(&str, &str, &str, f32)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.0.ingest_edges_batch(edges)
     }
 
@@ -120,12 +137,18 @@ impl<'db> EdgeStore<'db> {
         weight: f32,
         meta_json: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.0.add_edge_meta_internal(source, target, weight, edge_type, meta_json)?;
+        self.0
+            .add_edge_meta_internal(source, target, weight, edge_type, meta_json)?;
         Ok(())
     }
 
     /// Remove an edge (tombstone)
-    pub fn unlink(&self, source: &str, target: &str, edge_type: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn unlink(
+        &self,
+        source: &str,
+        target: &str,
+        edge_type: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.0.delete_edge_internal(source, target, edge_type)?;
         Ok(())
     }

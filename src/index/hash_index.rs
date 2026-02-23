@@ -6,9 +6,9 @@
 use super::PropertyIndex;
 use dashmap::DashMap;
 use serde_json::Value;
-use std::sync::Arc;
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// Fast hash index for equality lookups
 pub struct HashIndex {
@@ -27,7 +27,7 @@ impl HashIndex {
             reverse: DashMap::new(),
         }
     }
-    
+
     /// Hash a JSON value to u64
     fn hash_value(value: &Value) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -46,16 +46,16 @@ impl PropertyIndex for HashIndex {
     fn insert(&self, node_idx: u32, value: &Value) {
         // Remove old entry if exists
         self.remove(node_idx);
-        
+
         let hash = Self::hash_value(value);
-        
+
         // Forward: value -> nodes
         self.index.entry(hash).or_default().push(node_idx);
-        
+
         // Reverse: node -> value (for fast removal)
         self.reverse.insert(node_idx, hash);
     }
-    
+
     fn remove(&self, node_idx: u32) {
         if let Some((_, old_hash)) = self.reverse.remove(&node_idx) {
             if let Some(mut nodes) = self.index.get_mut(&old_hash) {
@@ -71,22 +71,25 @@ impl PropertyIndex for HashIndex {
             }
         }
     }
-    
+
     fn lookup_eq(&self, value: &Value) -> Vec<u32> {
         let hash = Self::hash_value(value);
         // Use reference-based iteration - much faster than clone
-        self.index.get(&hash).map(|v| v.to_vec()).unwrap_or_default()
+        self.index
+            .get(&hash)
+            .map(|v| v.to_vec())
+            .unwrap_or_default()
     }
-    
+
     fn lookup_range(&self, _min: &Value, _max: &Value) -> Vec<u32> {
         // Hash index doesn't support range queries
         Vec::new()
     }
-    
+
     fn name(&self) -> &str {
         &self.name
     }
-    
+
     fn count(&self) -> usize {
         self.reverse.len()
     }
@@ -95,54 +98,57 @@ impl PropertyIndex for HashIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_hash_index_basic() {
         let idx = HashIndex::new("status");
-        
+
         idx.insert(1, &Value::String("active".to_string()));
         idx.insert(2, &Value::String("active".to_string()));
         idx.insert(3, &Value::String("inactive".to_string()));
-        
+
         let active = idx.lookup_eq(&Value::String("active".to_string()));
         assert_eq!(active.len(), 2);
         assert!(active.contains(&1));
         assert!(active.contains(&2));
-        
+
         let inactive = idx.lookup_eq(&Value::String("inactive".to_string()));
         assert_eq!(inactive.len(), 1);
         assert!(inactive.contains(&3));
     }
-    
+
     #[test]
     fn test_hash_index_remove() {
         let idx = HashIndex::new("status");
-        
+
         idx.insert(1, &Value::String("active".to_string()));
         assert_eq!(idx.lookup_eq(&Value::String("active".to_string())).len(), 1);
-        
+
         idx.remove(1);
         assert_eq!(idx.lookup_eq(&Value::String("active".to_string())).len(), 0);
     }
-    
+
     #[test]
     fn test_hash_index_update() {
         let idx = HashIndex::new("status");
-        
+
         idx.insert(1, &Value::String("active".to_string()));
         idx.insert(1, &Value::String("inactive".to_string()));
-        
+
         assert_eq!(idx.lookup_eq(&Value::String("active".to_string())).len(), 0);
-        assert_eq!(idx.lookup_eq(&Value::String("inactive".to_string())).len(), 1);
+        assert_eq!(
+            idx.lookup_eq(&Value::String("inactive".to_string())).len(),
+            1
+        );
     }
-    
+
     #[test]
     fn test_hash_index_concurrent() {
         use std::sync::Arc;
         use std::thread;
-        
+
         let idx = Arc::new(HashIndex::new("status"));
-        
+
         let handles: Vec<_> = (0..10)
             .map(|t| {
                 let idx = Arc::clone(&idx);
@@ -155,11 +161,11 @@ mod tests {
                 })
             })
             .collect();
-        
+
         for h in handles {
             h.join().unwrap();
         }
-        
+
         // Should have 10,000 entries
         assert_eq!(idx.count(), 10000);
     }

@@ -14,17 +14,17 @@
 //! let config = TxnConfig::new(TxnMode::Disabled);
 //! ```
 
+mod manager;
+mod snapshot;
 mod traits;
 mod transaction;
-mod snapshot;
 mod version;
-mod manager;
 
-pub use traits::{TransactionManager, IsolationLevel};
-pub use transaction::{Transaction, TxnId, TxnState};
+pub use manager::{create_txn_manager, FastMvccManager, MvccManager, NoOpManager};
 pub use snapshot::Snapshot;
-pub use version::{VersionTracker, FastVersionTracker, QuickSnapshot};
-pub use manager::{FastMvccManager, MvccManager, NoOpManager, create_txn_manager};
+pub use traits::{IsolationLevel, TransactionManager};
+pub use transaction::{Transaction, TxnId, TxnState};
+pub use version::{FastVersionTracker, QuickSnapshot, VersionTracker};
 
 /// Transaction mode - runtime selectable like WAL
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,7 +32,7 @@ pub enum TxnMode {
     /// MVCC disabled - fastest, no isolation
     /// Use for: single-threaded, batch processing
     Disabled,
-    
+
     /// MVCC enabled - snapshot isolation
     /// Use for: multi-threaded, production (default)
     #[default]
@@ -82,19 +82,19 @@ impl TxnConfig {
             ..Default::default()
         }
     }
-    
+
     /// Set MVCC mode
     pub fn mode(mut self, mode: TxnMode) -> Self {
         self.mode = mode;
         self
     }
-    
+
     /// Set isolation level
     pub fn isolation(mut self, level: IsolationLevel) -> Self {
         self.isolation = level;
         self
     }
-    
+
     /// Check if MVCC is enabled
     pub fn is_enabled(&self) -> bool {
         matches!(self.mode, TxnMode::Enabled)

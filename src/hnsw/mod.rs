@@ -83,7 +83,12 @@ impl<D: Distance> HyperHNSW<D> {
     /// Connect a pre-initialized node's neighbors at a single level.
     /// For parallel batch builds: node was already inserted via `add_node_at`,
     /// entry_point was already set. Each call is independent and parallel-safe.
-    pub fn connect_neighbors(&self, actual_idx: u32, level: usize, ef: usize) -> Result<(), String> {
+    pub fn connect_neighbors(
+        &self,
+        actual_idx: u32,
+        level: usize,
+        ef: usize,
+    ) -> Result<(), String> {
         let guard = pin();
         let entry_point = self.graph.entry_point.load(Ordering::Acquire, &guard);
         if entry_point.is_null() {
@@ -118,11 +123,8 @@ impl<D: Distance> HyperHNSW<D> {
         );
 
         let m_max = self.graph.m_max(level);
-        let neighbors = algo::select_neighbors_heuristic::<D>(
-            &self.storage,
-            &mut candidates,
-            m_max,
-        );
+        let neighbors =
+            algo::select_neighbors_heuristic::<D>(&self.storage, &mut candidates, m_max);
 
         let guard = pin();
         self.graph
@@ -144,11 +146,8 @@ impl<D: Distance> HyperHNSW<D> {
                         dist: D::eval(self.storage.get(id), self.storage.get(nb_id)),
                     })
                     .collect();
-                let pruned = algo::select_neighbors_heuristic::<D>(
-                    &self.storage,
-                    &mut cands,
-                    m_max,
-                );
+                let pruned =
+                    algo::select_neighbors_heuristic::<D>(&self.storage, &mut cands, m_max);
                 self.graph.update_neighbors(nb_id, level, pruned, &guard);
             } else {
                 self.graph

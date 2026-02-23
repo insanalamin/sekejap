@@ -15,27 +15,27 @@ mod range_index;
 pub use hash_index::HashIndex;
 pub use range_index::RangeIndex;
 
-use std::sync::Arc;
 use dashmap::DashMap;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Property index trait
 pub trait PropertyIndex: Send + Sync {
     /// Insert a value for a node
     fn insert(&self, node_idx: u32, value: &Value);
-    
+
     /// Remove a node from index
     fn remove(&self, node_idx: u32);
-    
+
     /// Lookup exact match
     fn lookup_eq(&self, value: &Value) -> Vec<u32>;
-    
+
     /// Lookup range (for numeric fields)
     fn lookup_range(&self, min: &Value, max: &Value) -> Vec<u32>;
-    
+
     /// Get index name
     fn name(&self) -> &str;
-    
+
     /// Get indexed count
     fn count(&self) -> usize;
 }

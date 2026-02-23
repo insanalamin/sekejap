@@ -1,10 +1,10 @@
 //! Snapshot Implementation
 
-use std::sync::Arc;
 use super::TxnId;
+use std::sync::Arc;
 
 /// A snapshot of the database at a point in time
-/// 
+///
 /// Used for:
 /// - Read-only transactions
 /// - Visibility checks during reads
@@ -31,9 +31,9 @@ impl Snapshot {
                 .unwrap_or(0),
         }
     }
-    
+
     /// Check if a transaction's writes are visible in this snapshot
-    /// 
+    ///
     /// A write is visible if:
     /// 1. The writing transaction committed before this snapshot was taken
     /// 2. The writing transaction is not in the active_txns set
@@ -42,15 +42,15 @@ impl Snapshot {
         if commit_version > self.version {
             return false;
         }
-        
+
         // If writer was active when snapshot was taken, not visible
         if self.active_txns.contains(&writer_txn) {
             return false;
         }
-        
+
         true
     }
-    
+
     /// Create an empty snapshot (for MVCC disabled mode)
     pub fn empty() -> Self {
         Self {

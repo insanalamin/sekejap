@@ -8,8 +8,8 @@
 //! cargo test tc_5_4 -- --nocapture
 
 use sekejap::SekejapDB;
-use tempfile::TempDir;
 use serde_json::json;
+use tempfile::TempDir;
 
 fn setup_db() -> (SekejapDB, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -28,7 +28,8 @@ mod tc_5_1_blobstore_write {
             "_id": "blob/test-large",
             "data": "x".repeat(1000),
             "metadata": {"size": 1000}
-        }).to_string();
+        })
+        .to_string();
 
         db.nodes().put_json(&payload).unwrap();
         db.flush().unwrap();
@@ -47,7 +48,8 @@ mod tc_5_1_blobstore_write {
                 "_id": format!("blob/item-{}", i),
                 "data": format!("content-{}", i),
                 "index": i
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
@@ -71,7 +73,8 @@ mod tc_5_2_blobstore_read {
             "_id": "blob/read-test",
             "content": "Hello, World!",
             "binary": "SGVsbG8gV29ybGQh"  // Base64 encoded
-        }).to_string();
+        })
+        .to_string();
 
         db.nodes().put_json(&payload).unwrap();
         db.flush().unwrap();
@@ -103,7 +106,8 @@ mod tc_5_3_nodeheader_payload_reference {
             "_id": "ref/test",
             "description": "Test node with references",
             "references": ["events/a", "events/b"]
-        }).to_string();
+        })
+        .to_string();
 
         db.nodes().put_json(&payload).unwrap();
         db.flush().unwrap();
@@ -119,14 +123,19 @@ mod tc_5_3_nodeheader_payload_reference {
         let (db, _dir) = setup_db();
 
         // Create referenced nodes
-        db.nodes().put_json(&json!({"_id": "ref/source1"}).to_string()).unwrap();
-        db.nodes().put_json(&json!({"_id": "ref/source2"}).to_string()).unwrap();
-        
+        db.nodes()
+            .put_json(&json!({"_id": "ref/source1"}).to_string())
+            .unwrap();
+        db.nodes()
+            .put_json(&json!({"_id": "ref/source2"}).to_string())
+            .unwrap();
+
         // Create node referencing them
         let payload = json!({
             "_id": "ref/aggregator",
             "sources": ["ref/source1", "ref/source2"]
-        }).to_string();
+        })
+        .to_string();
         db.nodes().put_json(&payload).unwrap();
         db.flush().unwrap();
 
@@ -154,7 +163,8 @@ mod tc_5_4_bptree_size_vs_payload {
                 "_id": slug,
                 "content": "x".repeat(*size),
                 "expected_size": size
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
@@ -173,7 +183,8 @@ mod tc_5_4_bptree_size_vs_payload {
             let payload = json!({
                 "_id": format!("indexed/node-{:03}", i),
                 "order": i
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();

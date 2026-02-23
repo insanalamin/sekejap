@@ -5,9 +5,9 @@ use std::sync::atomic::Ordering;
 /// Arena-backed vector store using raw pointers (not Arc clone)
 /// This avoids the undefined behavior of cloning mmap handles.
 pub struct ArenaVectorStore {
-    ptr: *const u8,                    // raw pointer to mmap base
-    slot_size: usize,                   // size of VectorSlot
-    len_ptr: *const std::sync::atomic::AtomicU64,  // pointer to write_head
+    ptr: *const u8,                               // raw pointer to mmap base
+    slot_size: usize,                             // size of VectorSlot
+    len_ptr: *const std::sync::atomic::AtomicU64, // pointer to write_head
     dim: usize,
 }
 

@@ -8,8 +8,8 @@
 //! cargo test m1_basic_node_ops -- --nocapture
 
 use sekejap::SekejapDB;
-use tempfile::TempDir;
 use serde_json::json;
+use tempfile::TempDir;
 
 fn setup_db() -> (SekejapDB, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -33,7 +33,8 @@ mod tc_1_1_create_node_with_entities {
             "when": "2024-04-12T09:30:00Z",
             "coordinates": {"lat": -6.2088, "lon": 106.8456},
             "summary": "Morning incident near downtown"
-        }).to_string();
+        })
+        .to_string();
 
         // Step 1: Insert the node
         let idx = db.nodes().put_json(&payload).unwrap();
@@ -51,20 +52,31 @@ mod tc_1_1_create_node_with_entities {
         assert_eq!(retrieved_json["summary"], "Morning incident near downtown");
 
         // Step 3: Run spatial query centered at the node location with 1km radius
-        let outcome = db.nodes()
+        let outcome = db
+            .nodes()
             .one(slug)
-            .near(-6.2088, 106.8456, 1.0)  // 1km radius
+            .near(-6.2088, 106.8456, 1.0) // 1km radius
             .collect()
             .unwrap();
 
         println!("Spatial query trace: {:?}", outcome.trace);
-        assert!(!outcome.data.is_empty(), "Spatial query should include the node");
+        assert!(
+            !outcome.data.is_empty(),
+            "Spatial query should include the node"
+        );
 
         // Verify slug_index contains mapping
         let (_, slug_hash) = SekejapDB::parse_entity_id(slug);
         let stored_idx = db.slug_index.read().get(slug_hash);
-        assert!(stored_idx.is_some(), "slug_index should contain mapping for slug hash");
-        assert_eq!(stored_idx.unwrap(), idx, "slug_index should map to correct node index");
+        assert!(
+            stored_idx.is_some(),
+            "slug_index should contain mapping for slug hash"
+        );
+        assert_eq!(
+            stored_idx.unwrap(),
+            idx,
+            "slug_index should map to correct node index"
+        );
     }
 
     #[test]
@@ -101,7 +113,8 @@ mod tc_1_2_upsert_ingestion_buffer {
             "_id": slug,
             "summary": "Initial report",
             "version": 1
-        }).to_string();
+        })
+        .to_string();
 
         // Insert initial
         let idx1 = db.nodes().put_json(&initial_payload).unwrap();
@@ -113,7 +126,8 @@ mod tc_1_2_upsert_ingestion_buffer {
             "_id": slug,
             "summary": "Update with new details",
             "version": 2
-        }).to_string();
+        })
+        .to_string();
 
         // Upsert (insert with same slug)
         let idx2 = db.nodes().put_json(&updated_payload).unwrap();
@@ -169,7 +183,8 @@ mod tc_1_3_spatial_index_registration {
             "_id": slug,
             "name": "Monas",
             "coordinates": {"lat": -6.1754, "lon": 106.8272}
-        }).to_string();
+        })
+        .to_string();
 
         // Step 1: Insert node with coordinates
         let idx = db.nodes().put_json(&payload).unwrap();
@@ -183,23 +198,31 @@ mod tc_1_3_spatial_index_registration {
         assert!(!all_nodes.is_empty(), "Spatial index should not be empty");
 
         // Step 2: Spatial query with 0.5km radius should include node
-        let outcome = db.nodes()
+        let outcome = db
+            .nodes()
             .one(slug)
             .near(-6.1754, 106.8272, 0.5)
             .collect()
             .unwrap();
 
-        assert!(!outcome.data.is_empty(), "0.5km radius should include Monas");
+        assert!(
+            !outcome.data.is_empty(),
+            "0.5km radius should include Monas"
+        );
         println!("0.5km radius query: found {} nodes", outcome.data.len());
 
         // Step 3: Excluded if radius is too small (0.01km = 10 meters)
-        let outcome_small = db.nodes()
+        let outcome_small = db
+            .nodes()
             .one(slug)
             .near(-6.1754, 106.8272, 0.01)
             .collect()
             .unwrap();
 
-        println!("0.01km radius query: found {} nodes", outcome_small.data.len());
+        println!(
+            "0.01km radius query: found {} nodes",
+            outcome_small.data.len()
+        );
     }
 
     #[test]
@@ -208,10 +231,10 @@ mod tc_1_3_spatial_index_registration {
 
         // Insert multiple nodes at different locations
         let nodes = vec![
-            ("loc/a", -6.1754, 106.8272),  // Monas
-            ("loc/b", -6.1760, 106.8280),  // Very close
-            ("loc/c", -6.2000, 106.8500),  // Further away
-            ("loc/d", -6.3000, 106.9000),  // Far
+            ("loc/a", -6.1754, 106.8272), // Monas
+            ("loc/b", -6.1760, 106.8280), // Very close
+            ("loc/c", -6.2000, 106.8500), // Further away
+            ("loc/d", -6.3000, 106.9000), // Far
         ];
 
         for (slug, lat, lon) in &nodes {
@@ -219,24 +242,32 @@ mod tc_1_3_spatial_index_registration {
                 "_id": slug,
                 "name": format!("Node {}", slug),
                 "coordinates": {"lat": lat, "lon": lon}
-            }).to_string();
+            })
+            .to_string();
             db.nodes().put_json(&payload).unwrap();
         }
         db.flush().unwrap();
 
         // Query near Monas with 1km radius
-        let outcome = db.nodes()
+        let outcome = db
+            .nodes()
             .all()
             .near(-6.1754, 106.8272, 1.0)
             .collect()
             .unwrap();
 
-        println!("Spatial query near Monas (1km): found {} nodes", outcome.data.len());
+        println!(
+            "Spatial query near Monas (1km): found {} nodes",
+            outcome.data.len()
+        );
         for hit in &outcome.data {
             println!("  - lat: {}, lon: {}", hit.lat, hit.lon);
         }
 
         // Should find at least nodes A and B (close to query point)
-        assert!(outcome.data.len() >= 2, "Should find at least 2 nearby nodes");
+        assert!(
+            outcome.data.len() >= 2,
+            "Should find at least 2 nearby nodes"
+        );
     }
 }

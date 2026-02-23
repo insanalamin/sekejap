@@ -26,7 +26,11 @@ impl<T: Copy + Default> DurableArena<T> {
     pub fn new(path: &Path, capacity: usize) -> std::io::Result<Self> {
         let slot_size = std::mem::size_of::<T>();
         let file_size = (64 + capacity * slot_size).max(64);
-        let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
 
         // Only grow — never truncate an existing arena (preserves data on reopen)
         if file.metadata()?.len() < file_size as u64 {
@@ -57,7 +61,11 @@ impl<T: Copy + Default> DurableArena<T> {
     /// Number of slots currently mapped (may be larger than original capacity on reopen).
     pub fn capacity(&self) -> usize {
         let mapped = self.mmap.len();
-        if mapped <= 64 { 0 } else { (mapped - 64) / self.slot_size }
+        if mapped <= 64 {
+            0
+        } else {
+            (mapped - 64) / self.slot_size
+        }
     }
 
     /// Grow the arena to hold at least `new_capacity` slots.
@@ -77,7 +85,11 @@ impl<T: Copy + Default> DurableArena<T> {
         let offset = 64 + (idx as usize * self.slot_size);
         unsafe {
             let dest = self.mmap.as_ptr().add(offset);
-            std::ptr::copy_nonoverlapping(item as *const T as *const u8, dest as *mut u8, self.slot_size);
+            std::ptr::copy_nonoverlapping(
+                item as *const T as *const u8,
+                dest as *mut u8,
+                self.slot_size,
+            );
         }
     }
 
@@ -93,7 +105,9 @@ impl<T: Copy + Default> DurableArena<T> {
     pub fn commit(&self, new_count: u64) {
         let header_ptr = self.mmap.as_ptr() as *const ArenaHeader;
         unsafe {
-            (*header_ptr).committed_count.store(new_count, Ordering::Release);
+            (*header_ptr)
+                .committed_count
+                .store(new_count, Ordering::Release);
         }
     }
 
@@ -121,13 +135,17 @@ pub struct BlobArena {
 impl BlobArena {
     pub fn new(path: &Path, size_mb: usize) -> std::io::Result<Self> {
         let size = size_mb * 1024 * 1024;
-        let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
         // Only grow — never truncate existing blob data on reopen
         if file.metadata()?.len() < size as u64 {
             file.set_len(size as u64)?;
         }
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        
+
         unsafe {
             let magic = *(mmap.as_ptr() as *const u64);
             if magic != 0x424C_4F42 {
@@ -138,10 +156,10 @@ impl BlobArena {
 
         let committed_offset = unsafe { *(mmap.as_ptr().add(8) as *const u64) };
 
-        Ok(Self { 
-            mmap, 
+        Ok(Self {
+            mmap,
             _file: file,
-            write_offset: AtomicU64::new(committed_offset) 
+            write_offset: AtomicU64::new(committed_offset),
         })
     }
 

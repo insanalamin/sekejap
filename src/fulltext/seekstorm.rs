@@ -3,11 +3,11 @@
 //! Tiny, ultra-fast full-text search engine.
 //! ~1MB binary, ~100µs latency.
 
-use super::{FullTextAdapter, SearchHit};
+use super::{FullTextAdapter, SearchHit, SearchOptions};
 use std::path::Path;
 
 /// Placeholder for SeekStorm adapter
-/// 
+///
 /// SeekStorm v2.3.0 is available but requires more complex setup.
 /// This is a stub that returns empty results until fully implemented.
 pub struct SeekStormAdapter {
@@ -24,13 +24,23 @@ impl SeekStormAdapter {
 }
 
 impl FullTextAdapter for SeekStormAdapter {
-    fn add_document(&self, _title: &str, _content: &str, _id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn add_document(
+        &self,
+        _title: &str,
+        _content: &str,
+        _id: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // TODO: Implement with seekstorm crate
         // seekstorm::Index::add_document(...)
         Ok(())
     }
 
-    fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>, Box<dyn std::error::Error>> {
+    fn search(
+        &self,
+        _query: &str,
+        _limit: usize,
+        _options: Option<&SearchOptions>,
+    ) -> Result<Vec<SearchHit>, Box<dyn std::error::Error>> {
         // TODO: Implement with seekstorm crate
         // seekstorm::Index::search(...)
         Ok(vec![])
