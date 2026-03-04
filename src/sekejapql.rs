@@ -88,6 +88,18 @@ pub enum StepDef {
     },
     #[serde(rename = "spatial_within_polygon")]
     SpatialWithinPolygon { polygon: Option<Vec<[f32; 2]>> },
+    #[serde(rename = "st_within")]
+    StWithin { polygon: Option<Vec<[f32; 2]>> },
+    #[serde(rename = "st_contains")]
+    StContains { polygon: Option<Vec<[f32; 2]>> },
+    #[serde(rename = "st_intersects")]
+    StIntersects { polygon: Option<Vec<[f32; 2]>> },
+    #[serde(rename = "st_dwithin")]
+    StDWithin {
+        lat: Option<f32>,
+        lon: Option<f32>,
+        distance_km: Option<f32>,
+    },
     #[serde(rename = "similar")]
     Similar {
         #[serde(rename = "query")]
@@ -248,6 +260,20 @@ impl StepDef {
                 polygon
                     .clone()
                     .ok_or("spatial_within_polygon: missing polygon")?,
+            )),
+            StepDef::StWithin { polygon } => Ok(Step::StWithin(
+                polygon.clone().ok_or("st_within: missing polygon")?,
+            )),
+            StepDef::StContains { polygon } => Ok(Step::StContains(
+                polygon.clone().ok_or("st_contains: missing polygon")?,
+            )),
+            StepDef::StIntersects { polygon } => Ok(Step::StIntersects(
+                polygon.clone().ok_or("st_intersects: missing polygon")?,
+            )),
+            StepDef::StDWithin { lat, lon, distance_km } => Ok(Step::StDWithin(
+                lat.unwrap_or(0.0),
+                lon.unwrap_or(0.0),
+                distance_km.unwrap_or(1.0),
             )),
             StepDef::Similar { query, k } => Ok(Step::Similar(
                 query.clone().unwrap_or_default(),
@@ -698,6 +724,26 @@ impl QueryCompiler {
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect(),
             )),
+            "st_within" => {
+                let polygon = parse_polygon_arg(obj, "st_within")?;
+                Ok(Step::StWithin(polygon))
+            }
+            "st_contains" => {
+                let polygon = parse_polygon_arg(obj, "st_contains")?;
+                Ok(Step::StContains(polygon))
+            }
+            "st_intersects" => {
+                let polygon = parse_polygon_arg(obj, "st_intersects")?;
+                Ok(Step::StIntersects(polygon))
+            }
+            "st_dwithin" => Ok(Step::StDWithin(
+                obj.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                obj.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                obj.get("distance_km")
+                    .or(obj.get("distance"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32,
+            )),
             _ => Err(format!("Unknown op: {}", op).into()),
         }
     }
@@ -705,6 +751,406 @@ impl QueryCompiler {
 
 fn sekejapql_hash(s: &str) -> u64 {
     seahash::hash(s.as_bytes())
+}
+
+fn parse_polygon_arg(obj: &Value, op: &str) -> Result<Vec<[f32; 2]>, Box<dyn Error>> {
+    obj.get("polygon")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{}: missing polygon", op))?
+        .iter()
+        .map(|pt| {
+            let arr = pt
+                .as_array()
+                .ok_or_else(|| format!("{}: polygon point must be array [lat, lon]", op))?;
+            let lat = arr
+                .first()
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| format!("{}: missing point lat", op))? as f32;
+            let lon = arr
+                .get(1)
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| format!("{}: missing point lon", op))? as f32;
+            Ok::<[f32; 2], Box<dyn Error>>([lat, lon])
+        })
+        .collect()
+}
+
+// ============================================================================
+// SekejapQL text format parser
+// ============================================================================
+// One op per line, or pipe-separated.  Quoted strings, bare numbers, booleans.
+// Example:
+//   collection "crimes"
+//   where_eq "type" "robbery"
+//   near 3.1291 101.6710 1.0
+//   sort "severity" desc
+//   take 20
+
+impl QueryCompiler {
+    /// Parse a SekejapQL text query (one-op-per-line or pipe-separated).
+    pub fn parse_text_pipeline(&self, text: &str) -> Result<Vec<Step>, Box<dyn Error>> {
+        // Normalise: replace pipes with newlines, strip comment lines
+        let normalised: String = text
+            .lines()
+            .map(|line| {
+                // Remove inline comments (# ...)
+                let line = if let Some(pos) = line.find('#') {
+                    &line[..pos]
+                } else {
+                    line
+                };
+                line.trim().to_string()
+            })
+            .filter(|line| !line.is_empty())
+            .flat_map(|line| {
+                // Split by pipe, treating each segment as a separate line
+                line.split('|')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut steps = Vec::new();
+        let mut pending_polygon: Option<(String, Vec<[f32; 2]>)> = None;
+
+        for line in normalised.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Handle polygon continuation lines: (lat,lon)
+            if line.starts_with('(') {
+                if let Some((_, ref mut ring)) = pending_polygon {
+                    for pair in parse_coord_pairs(line) {
+                        ring.push(pair);
+                    }
+                    continue;
+                }
+            }
+
+            // Flush any pending polygon on a non-coord line
+            if let Some((op, ring)) = pending_polygon.take() {
+                steps.push(build_polygon_step(&op, ring)?);
+            }
+
+            let tokens = tokenise(line);
+            if tokens.is_empty() {
+                continue;
+            }
+
+            let op = tokens[0].to_lowercase();
+            let args = &tokens[1..];
+
+            let step = match op.as_str() {
+                "one" => Step::One(sekejapql_hash(require_str(args, 0, "one")?)),
+                "many" => {
+                    let hashes: Vec<u64> = args
+                        .iter()
+                        .map(|s| sekejapql_hash(s.trim_matches('"')))
+                        .collect();
+                    if hashes.is_empty() {
+                        return Err("many: at least one slug required".into());
+                    }
+                    Step::Many(hashes)
+                }
+                "all" => Step::All,
+                "collection" => Step::Collection(sekejapql_hash(require_str(args, 0, "collection")?)),
+                "forward" => Step::Forward(sekejapql_hash(require_str(args, 0, "forward")?)),
+                "backward" => Step::Backward(sekejapql_hash(require_str(args, 0, "backward")?)),
+                "forward_parallel" => {
+                    Step::ForwardParallel(sekejapql_hash(require_str(args, 0, "forward_parallel")?))
+                }
+                "backward_parallel" => Step::BackwardParallel(sekejapql_hash(require_str(
+                    args,
+                    0,
+                    "backward_parallel",
+                )?)),
+                "hops" => Step::Hops(require_u32(args, 0, "hops")?),
+                "leaves" => Step::Leaves,
+                "roots" => Step::Roots,
+                "near" => Step::Near(
+                    require_f32(args, 0, "near lat")?,
+                    require_f32(args, 1, "near lon")?,
+                    require_f32(args, 2, "near radius_km")?,
+                ),
+                "spatial_within_bbox" => Step::SpatialWithinBbox(
+                    require_f32(args, 0, "spatial_within_bbox min_lat")?,
+                    require_f32(args, 1, "spatial_within_bbox min_lon")?,
+                    require_f32(args, 2, "spatial_within_bbox max_lat")?,
+                    require_f32(args, 3, "spatial_within_bbox max_lon")?,
+                ),
+                "spatial_intersects_bbox" => Step::SpatialIntersectsBbox(
+                    require_f32(args, 0, "spatial_intersects_bbox min_lat")?,
+                    require_f32(args, 1, "spatial_intersects_bbox min_lon")?,
+                    require_f32(args, 2, "spatial_intersects_bbox max_lat")?,
+                    require_f32(args, 3, "spatial_intersects_bbox max_lon")?,
+                ),
+                "spatial_within_polygon" => {
+                    // May have inline coords on the same line OR span multiple lines
+                    let ring = parse_coord_pairs(
+                        &args.join(" "),
+                    );
+                    if ring.is_empty() {
+                        // Multi-line polygon — accumulate
+                        pending_polygon = Some((op, Vec::new()));
+                        continue;
+                    }
+                    Step::SpatialWithinPolygon(ring)
+                }
+                "st_within" => {
+                    let ring = parse_coord_pairs(&args.join(" "));
+                    if ring.is_empty() {
+                        pending_polygon = Some((op, Vec::new()));
+                        continue;
+                    }
+                    Step::StWithin(ring)
+                }
+                "st_contains" => {
+                    let ring = parse_coord_pairs(&args.join(" "));
+                    if ring.is_empty() {
+                        pending_polygon = Some((op, Vec::new()));
+                        continue;
+                    }
+                    Step::StContains(ring)
+                }
+                "st_intersects" => {
+                    let ring = parse_coord_pairs(&args.join(" "));
+                    if ring.is_empty() {
+                        pending_polygon = Some((op, Vec::new()));
+                        continue;
+                    }
+                    Step::StIntersects(ring)
+                }
+                "st_dwithin" => Step::StDWithin(
+                    require_f32(args, 0, "st_dwithin lat")?,
+                    require_f32(args, 1, "st_dwithin lon")?,
+                    require_f32(args, 2, "st_dwithin distance_km")?,
+                ),
+                "similar" => {
+                    let slug = require_str(args, 0, "similar slug")?;
+                    let k = args
+                        .get(1)
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(10);
+                    // Store slug hash as special marker — resolved at execute time
+                    Step::Similar(vec![sekejapql_hash(slug) as f32], k)
+                }
+                "matching" => {
+                    let text = require_str(args, 0, "matching")?;
+                    let mut limit = 1000usize;
+                    let mut title_weight = 1.0f32;
+                    let mut content_weight = 1.0f32;
+                    for arg in args.iter().skip(1) {
+                        if let Some(rest) = arg.strip_prefix("limit:") {
+                            limit = rest.parse().unwrap_or(1000);
+                        } else if let Some(rest) = arg.strip_prefix("title_weight:") {
+                            title_weight = rest.parse().unwrap_or(1.0);
+                        } else if let Some(rest) = arg.strip_prefix("content_weight:") {
+                            content_weight = rest.parse().unwrap_or(1.0);
+                        }
+                    }
+                    #[cfg(feature = "fulltext")]
+                    {
+                        Step::Matching {
+                            text: text.to_string(),
+                            limit,
+                            title_weight,
+                            content_weight,
+                        }
+                    }
+                    #[cfg(not(feature = "fulltext"))]
+                    {
+                        let _ = (text, limit, title_weight, content_weight);
+                        return Err("matching requires fulltext feature".into());
+                    }
+                }
+                "where_eq" => {
+                    let field = require_str(args, 0, "where_eq field")?.to_string();
+                    let val = parse_value_arg(args, 1, "where_eq value")?;
+                    Step::WhereEq(field, val)
+                }
+                "where_gt" => Step::WhereGt(
+                    require_str(args, 0, "where_gt field")?.to_string(),
+                    require_f64(args, 1, "where_gt value")?,
+                ),
+                "where_lt" => Step::WhereLt(
+                    require_str(args, 0, "where_lt field")?.to_string(),
+                    require_f64(args, 1, "where_lt value")?,
+                ),
+                "where_gte" => Step::WhereGte(
+                    require_str(args, 0, "where_gte field")?.to_string(),
+                    require_f64(args, 1, "where_gte value")?,
+                ),
+                "where_lte" => Step::WhereLte(
+                    require_str(args, 0, "where_lte field")?.to_string(),
+                    require_f64(args, 1, "where_lte value")?,
+                ),
+                "where_between" => Step::WhereBetween(
+                    require_str(args, 0, "where_between field")?.to_string(),
+                    require_f64(args, 1, "where_between lo")?,
+                    require_f64(args, 2, "where_between hi")?,
+                ),
+                "where_in" => {
+                    let field = require_str(args, 0, "where_in field")?.to_string();
+                    let values: Vec<Value> = args
+                        .iter()
+                        .skip(1)
+                        .map(|s| parse_value_token(s))
+                        .collect();
+                    Step::WhereIn(field, values)
+                }
+                "sort" => {
+                    let field = require_str(args, 0, "sort field")?.to_string();
+                    let asc = args
+                        .get(1)
+                        .map(|s| s.to_lowercase() != "desc")
+                        .unwrap_or(true);
+                    Step::Sort(field, asc)
+                }
+                "skip" => Step::Skip(require_u32(args, 0, "skip")? as usize),
+                "take" | "limit" => Step::Take(require_u32(args, 0, "take")? as usize),
+                "select" => {
+                    let fields: Vec<String> =
+                        args.iter().map(|s| s.trim_matches('"').to_string()).collect();
+                    if fields.is_empty() {
+                        return Err("select: at least one field required".into());
+                    }
+                    Step::Select(fields)
+                }
+                unknown => return Err(format!("Unknown SekejapQL op: '{}'", unknown).into()),
+            };
+            steps.push(step);
+        }
+
+        // Flush trailing polygon
+        if let Some((op, ring)) = pending_polygon.take() {
+            steps.push(build_polygon_step(&op, ring)?);
+        }
+
+        if steps.is_empty() {
+            return Err("Empty pipeline".into());
+        }
+        Ok(steps)
+    }
+}
+
+// ── Tokeniser ─────────────────────────────────────────────────────────────────
+// Splits a line into tokens, respecting double-quoted strings.
+fn tokenise(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in line.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                // Don't include the quote char — callers get clean strings
+            }
+            ' ' | '\t' if !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+// ── Coordinate pair parser ────────────────────────────────────────────────────
+// Parses `(lat,lon)` pairs from a string like `(3.128,101.665) (3.135,101.678)`
+fn parse_coord_pairs(s: &str) -> Vec<[f32; 2]> {
+    let mut pairs = Vec::new();
+    let mut rest = s.trim();
+    while let Some(start) = rest.find('(') {
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find(')') {
+            let inner = &rest[..end];
+            let parts: Vec<&str> = inner.split(',').collect();
+            if parts.len() >= 2 {
+                if let (Ok(lat), Ok(lon)) =
+                    (parts[0].trim().parse::<f32>(), parts[1].trim().parse::<f32>())
+                {
+                    pairs.push([lat, lon]);
+                }
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    pairs
+}
+
+fn build_polygon_step(op: &str, ring: Vec<[f32; 2]>) -> Result<Step, Box<dyn Error>> {
+    match op {
+        "spatial_within_polygon" => Ok(Step::SpatialWithinPolygon(ring)),
+        "st_within" => Ok(Step::StWithin(ring)),
+        "st_contains" => Ok(Step::StContains(ring)),
+        "st_intersects" => Ok(Step::StIntersects(ring)),
+        _ => Err(format!("Unknown polygon op: {}", op).into()),
+    }
+}
+
+// ── Argument helpers ──────────────────────────────────────────────────────────
+
+fn require_str<'a>(args: &'a [String], idx: usize, ctx: &str) -> Result<&'a str, Box<dyn Error>> {
+    args.get(idx)
+        .map(|s| s.trim_matches('"'))
+        .ok_or_else(|| format!("{}: missing argument", ctx).into())
+}
+
+fn require_f32(args: &[String], idx: usize, ctx: &str) -> Result<f32, Box<dyn Error>> {
+    args.get(idx)
+        .and_then(|s| s.parse::<f32>().ok())
+        .ok_or_else(|| format!("{}: expected number", ctx).into())
+}
+
+fn require_f64(args: &[String], idx: usize, ctx: &str) -> Result<f64, Box<dyn Error>> {
+    args.get(idx)
+        .and_then(|s| s.parse::<f64>().ok())
+        .ok_or_else(|| format!("{}: expected number", ctx).into())
+}
+
+fn require_u32(args: &[String], idx: usize, ctx: &str) -> Result<u32, Box<dyn Error>> {
+    args.get(idx)
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| format!("{}: expected integer", ctx).into())
+}
+
+fn parse_value_arg(args: &[String], idx: usize, ctx: &str) -> Result<Value, Box<dyn Error>> {
+    let s = args
+        .get(idx)
+        .ok_or_else(|| format!("{}: missing argument", ctx))?;
+    Ok(parse_value_token(s))
+}
+
+fn parse_value_token(s: &str) -> Value {
+    if s == "true" {
+        return Value::Bool(true);
+    }
+    if s == "false" {
+        return Value::Bool(false);
+    }
+    if s == "null" {
+        return Value::Null;
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Value::Number(n.into());
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return Value::Number(n);
+        }
+    }
+    Value::String(s.trim_matches('"').to_string())
 }
 
 #[deprecated(note = "Use QueryCompiler")]

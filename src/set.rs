@@ -158,7 +158,7 @@ impl<'db> Set<'db> {
         self.steps.push(Step::Near(lat, lon, radius_km));
         self
     }
-    pub fn spatial_within_bbox(
+    pub fn within_bbox(
         mut self,
         min_lat: f32,
         min_lon: f32,
@@ -169,20 +169,24 @@ impl<'db> Set<'db> {
             .push(Step::SpatialWithinBbox(min_lat, min_lon, max_lat, max_lon));
         self
     }
-    pub fn spatial_intersects_bbox(
-        mut self,
-        min_lat: f32,
-        min_lon: f32,
-        max_lat: f32,
-        max_lon: f32,
-    ) -> Self {
-        self.steps.push(Step::SpatialIntersectsBbox(
-            min_lat, min_lon, max_lat, max_lon,
-        ));
+    /// Filter nodes whose geometry is completely within the query polygon.
+    pub fn st_within(mut self, polygon: Vec<[f32; 2]>) -> Self {
+        self.steps.push(Step::StWithin(polygon));
         self
     }
-    pub fn spatial_within_polygon(mut self, polygon: Vec<[f32; 2]>) -> Self {
-        self.steps.push(Step::SpatialWithinPolygon(polygon));
+    /// Filter nodes whose geometry contains the query polygon.
+    pub fn st_contains(mut self, polygon: Vec<[f32; 2]>) -> Self {
+        self.steps.push(Step::StContains(polygon));
+        self
+    }
+    /// Filter nodes whose geometry intersects the query polygon.
+    pub fn st_intersects(mut self, polygon: Vec<[f32; 2]>) -> Self {
+        self.steps.push(Step::StIntersects(polygon));
+        self
+    }
+    /// Filter nodes whose centroid is within distance_km of a point (PostGIS st_dwithin).
+    pub fn st_dwithin(mut self, lat: f32, lon: f32, distance_km: f32) -> Self {
+        self.steps.push(Step::StDWithin(lat, lon, distance_km));
         self
     }
     pub fn similar(mut self, query: &[f32], k: usize) -> Self {
@@ -288,7 +292,13 @@ impl<'db> Set<'db> {
         let select_fields = self.select_fields.clone();
 
         let (bitmap, trace, score_map) = self.execute_pipeline()?;
-        let mut hits = self.db.resolve_hits(&bitmap, true);
+
+        // Defer payload loading: only load eagerly if sort_by requires a JSON field.
+        // Score-based sort and skip/limit only need indices + lat/lon, not payload.
+        let needs_payload_for_sort = sort_by.as_ref().map_or(false, |(field, _)| {
+            field != "_score" && field != "lat" && field != "lon"
+        });
+        let mut hits = self.db.resolve_hits(&bitmap, needs_payload_for_sort);
 
         if sort_by.is_none() && !score_map.is_empty() {
             hits.sort_unstable_by(|a, b| {
@@ -310,6 +320,17 @@ impl<'db> Set<'db> {
 
         if skip_n > 0 {
             hits.drain(..skip_n.min(hits.len()));
+        }
+
+        // Load payloads now for remaining hits (after sort + skip)
+        if !needs_payload_for_sort {
+            for hit in &mut hits {
+                let slot = self.db.nodes.read_at(hit.idx as u64);
+                if slot.flags != 0 {
+                    let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
+                    hit.payload = Some(String::from_utf8_lossy(bytes).into_owned());
+                }
+            }
         }
 
         if let Some(ref fields) = select_fields {
@@ -388,6 +409,21 @@ impl<'db> Set<'db> {
     }
 
     pub fn count(self) -> Result<Outcome<usize>, Box<dyn std::error::Error>> {
+        // Fast path: single Collection step → skip bitmap clone, use len_for() directly.
+        if let [Step::Collection(hash)] = self.steps.as_slice() {
+            let count = self.db.collection_bitmaps.len_for(*hash);
+            let trace = Trace {
+                steps: vec![StepReport {
+                    atom: "collection".to_string(),
+                    input_size: 0,
+                    output_size: count,
+                    index_used: "collection_bitmap".to_string(),
+                    time_us: 0,
+                }],
+                total_us: 0,
+            };
+            return Ok(Outcome { data: count, trace });
+        }
         let (bitmap, trace, _) = self.execute_pipeline()?;
         Ok(Outcome {
             data: bitmap.len() as usize,
@@ -682,6 +718,94 @@ impl<'db> Set<'db> {
                     candidates = Some(filtered);
                     index_used = "spatial_polygon";
                 }
+
+                // ── DE-9IM geometry predicates ──────────────────────────────
+                Step::StWithin(polygon) | Step::StContains(polygon) | Step::StIntersects(polygon) => {
+                    let predicate: fn(&serde_json::Value, &[[f32; 2]]) -> bool = match step {
+                        Step::StWithin(_) => crate::geometry::geom_within_polygon,
+                        Step::StContains(_) => crate::geometry::geom_contains_polygon,
+                        _ => crate::geometry::geom_intersects_polygon,
+                    };
+                    if polygon.len() < 3 {
+                        candidates = Some(RoaringBitmap::new());
+                        index_used = "geometry";
+                        continue;
+                    }
+                    // R-Tree pre-filter on envelope
+                    let (min_lat, max_lat, min_lon, max_lon) = polygon.iter().fold(
+                        (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
+                        |(mn_la, mx_la, mn_lo, mx_lo), p| (
+                            mn_la.min(p[0]), mx_la.max(p[0]),
+                            mn_lo.min(p[1]), mx_lo.max(p[1]),
+                        ),
+                    );
+                    let env = AABB::from_corners([min_lat, min_lon], [max_lat, max_lon]);
+                    let mut filtered = RoaringBitmap::new();
+                    let test_node = |idx: u32, db: &SekejapDB, polygon: &[[f32; 2]]| -> bool {
+                        let slot = db.nodes.read_at(idx as u64);
+                        if slot.flags == 0 { return false; }
+                        let bytes = db.blobs.read(slot.blob_offset, slot.blob_len);
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                            predicate(&json, polygon)
+                        } else {
+                            false
+                        }
+                    };
+                    match candidates {
+                        Some(ref curr) => {
+                            for idx in curr.iter() {
+                                if test_node(idx, self.db, polygon) {
+                                    filtered.insert(idx);
+                                }
+                            }
+                        }
+                        None => {
+                            for n in self.db.spatial.read().locate_in_envelope_intersecting(&env) {
+                                if test_node(n.id, self.db, polygon) {
+                                    filtered.insert(n.id);
+                                }
+                            }
+                        }
+                    }
+                    candidates = Some(filtered);
+                    index_used = "geometry";
+                }
+
+                Step::StDWithin(lat, lon, distance_km) => {
+                    // Uses centroid distance (slot.lat/lon) — same as Near but named for PostGIS familiarity
+                    let r_sq = distance_km * distance_km;
+                    match candidates {
+                        Some(ref mut curr) if curr.len() < 500 => {
+                            let mut filtered = RoaringBitmap::new();
+                            for idx in curr.iter() {
+                                let slot = self.db.nodes.read_at(idx as u64);
+                                let dx = slot.lat - lat;
+                                let dy = slot.lon - lon;
+                                if dx * dx + dy * dy <= r_sq {
+                                    filtered.insert(idx);
+                                }
+                            }
+                            *curr = filtered;
+                            index_used = "filter";
+                        }
+                        _ => {
+                            let results: RoaringBitmap = self
+                                .db
+                                .spatial
+                                .read()
+                                .locate_within_distance([*lat, *lon], r_sq)
+                                .map(|n| n.id)
+                                .collect();
+                            if let Some(ref mut curr) = candidates {
+                                *curr &= results;
+                            } else {
+                                candidates = Some(results);
+                            }
+                            index_used = "rtree";
+                        }
+                    }
+                }
+
                 Step::Similar(query, k) => {
                     let mut bm = RoaringBitmap::new();
                     if let Some(ref hnsw) = *self.db.hnsw.read() {
@@ -1231,7 +1355,9 @@ impl<'db> Set<'db> {
     }
 
     /// Build a Set from a parsed step list, extracting Sort/Skip/Select into Set state.
-    pub(crate) fn from_steps(db: &'db SekejapDB, steps: Vec<Step>) -> Self {
+    /// Also optimizes the pipeline: removes redundant `All` before spatial steps,
+    /// since spatial steps already handle `candidates = None` via direct R-Tree lookup.
+    pub fn from_steps(db: &'db SekejapDB, steps: Vec<Step>) -> Self {
         let mut set = Self {
             db,
             steps: SmallVec::new(),
@@ -1239,11 +1365,25 @@ impl<'db> Set<'db> {
             skip_n: 0,
             select_fields: None,
         };
-        for step in steps {
+        let mut iter = steps.into_iter().peekable();
+        while let Some(step) = iter.next() {
             match step {
                 Step::Sort(field, asc) => set.sort_by = Some((field, asc)),
                 Step::Skip(n) => set.skip_n = n,
                 Step::Select(fields) => set.select_fields = Some(fields),
+                Step::All => {
+                    // Drop All when the next step is spatial — spatial steps use the
+                    // R-Tree directly when candidates is None, avoiding an O(N) scan.
+                    let next_is_spatial = iter.peek().map_or(false, |next| matches!(next,
+                        Step::Near(..) | Step::SpatialWithinBbox(..) |
+                        Step::SpatialIntersectsBbox(..) | Step::SpatialWithinPolygon(..) |
+                        Step::StWithin(..) | Step::StContains(..) |
+                        Step::StIntersects(..) | Step::StDWithin(..)
+                    ));
+                    if !next_is_spatial {
+                        set.steps.push(Step::All);
+                    }
+                }
                 other => set.steps.push(other),
             }
         }

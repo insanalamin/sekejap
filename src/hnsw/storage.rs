@@ -33,6 +33,29 @@ impl ArenaVectorStore {
     pub fn len(&self) -> usize {
         unsafe { (*self.len_ptr).load(Ordering::Acquire) as usize }
     }
+
+    /// Emit a prefetch hint for the vector at `idx`.
+    /// Hides mmap random-access latency when the next slot is known ahead of time.
+    #[inline(always)]
+    pub fn prefetch(&self, idx: u32) {
+        let offset = 64 + (idx as usize * self.slot_size);
+        unsafe {
+            let ptr = self.ptr.add(offset);
+            #[cfg(target_arch = "x86_64")]
+            {
+                #[cfg(target_feature = "sse")]
+                std::arch::x86_64::_mm_prefetch(
+                    ptr as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack));
+            }
+            let _ = ptr; // suppress unused warning on other archs
+        }
+    }
 }
 
 // Safety: ArenaVectorStore is safe to send between threads because:

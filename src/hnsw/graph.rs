@@ -119,7 +119,13 @@ impl HNSWGraph {
 
         guard: &Guard,
     ) {
-        let node = self.nodes.get(&node_idx).unwrap();
+        let Some(node) = self.nodes.get(&node_idx) else {
+            return;
+        };
+
+        if layer >= node.layers.len() {
+            return;
+        }
 
         let new_list = Owned::new(NeighborList {
             data: new_neighbors,

@@ -31,6 +31,18 @@ impl<D: Distance> HyperHNSW<D> {
     /// `ef_construction`: search beam width — use 32 for quality, 8 for bulk speed.
     /// Takes `&self` — all internals are already concurrent-safe (DashMap + Atomic).
     pub fn insert_index(&self, actual_idx: u32, ef_construction: usize) -> Result<(), String> {
+        let mut ctx = SearchContext::new(actual_idx as usize + 1);
+        self.insert_index_with_ctx(actual_idx, ef_construction, &mut ctx)
+    }
+
+    /// Insert with caller-provided SearchContext (enables per-thread reuse).
+    /// Use this in batch builds to eliminate per-insert allocation.
+    pub fn insert_index_with_ctx(
+        &self,
+        actual_idx: u32,
+        ef_construction: usize,
+        ctx: &mut SearchContext,
+    ) -> Result<(), String> {
         let vector = self.storage.get(actual_idx);
         let max_level = self.graph.pick_level();
         self.graph.add_node_at(actual_idx, max_level);
@@ -47,7 +59,8 @@ impl<D: Distance> HyperHNSW<D> {
         }
 
         let (mut curr_ep, curr_level) = unsafe { *entry_point.as_ref().unwrap() };
-        let mut ctx = SearchContext::new(actual_idx as usize + 1);
+
+        ctx.ensure_capacity(actual_idx as usize + 1);
 
         // Navigate down to max_level via greedy descent (ef=1)
         for level in (max_level + 1..=curr_level).rev() {
@@ -58,7 +71,7 @@ impl<D: Distance> HyperHNSW<D> {
                 level,
                 &self.graph,
                 &self.storage,
-                &mut ctx,
+                ctx,
             );
             if let Some(best) = candidates.first() {
                 curr_ep = best.id;
@@ -67,14 +80,35 @@ impl<D: Distance> HyperHNSW<D> {
 
         // Connect neighbors at each level from max_level down to 0
         for level in (0..=std::cmp::min(max_level, curr_level)).rev() {
-            curr_ep = self.connect_at_level(actual_idx, vector, curr_ep, level, ef_construction);
+            curr_ep =
+                self.connect_at_level_with_ctx(actual_idx, vector, curr_ep, level, ef_construction, ctx);
         }
 
+        // CAS loop to update entry point — safe under concurrent parallel insertion
         if max_level > curr_level {
-            self.graph.entry_point.store(
-                crossbeam_epoch::Owned::new((actual_idx, max_level)),
-                Ordering::Release,
-            );
+            loop {
+                let guard2 = pin();
+                let current = self.graph.entry_point.load(Ordering::Acquire, &guard2);
+                let current_level = if current.is_null() {
+                    0
+                } else {
+                    unsafe { (*current.as_ref().unwrap()).1 }
+                };
+                if max_level <= current_level {
+                    break; // Someone else already set a higher level
+                }
+                let new_ep = crossbeam_epoch::Owned::new((actual_idx, max_level));
+                match self.graph.entry_point.compare_exchange(
+                    current,
+                    new_ep,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    &guard2,
+                ) {
+                    Ok(_) => break,
+                    Err(_) => continue, // Retry
+                }
+            }
         }
 
         Ok(())
@@ -89,6 +123,7 @@ impl<D: Distance> HyperHNSW<D> {
         level: usize,
         ef: usize,
     ) -> Result<(), String> {
+        let mut ctx = SearchContext::new(actual_idx as usize + 1);
         let guard = pin();
         let entry_point = self.graph.entry_point.load(Ordering::Acquire, &guard);
         if entry_point.is_null() {
@@ -96,22 +131,22 @@ impl<D: Distance> HyperHNSW<D> {
         }
         let (curr_ep, _) = unsafe { *entry_point.as_ref().unwrap() };
         let vector = self.storage.get(actual_idx);
-        self.connect_at_level(actual_idx, vector, curr_ep, level, ef);
+        self.connect_at_level_with_ctx(actual_idx, vector, curr_ep, level, ef, &mut ctx);
         Ok(())
     }
 
     /// Core neighbor-search-and-wire for one level.
     /// Searches from `curr_ep`, selects m_max best candidates, updates both directions.
     /// Returns the best candidate found (useful for cascading down levels).
-    fn connect_at_level(
+    fn connect_at_level_with_ctx(
         &self,
         actual_idx: u32,
         vector: &[f32],
         curr_ep: u32,
         level: usize,
         ef: usize,
+        ctx: &mut SearchContext,
     ) -> u32 {
-        let mut ctx = SearchContext::new(actual_idx as usize + 1);
         let mut candidates = algo::search_layer::<D>(
             vector,
             curr_ep,
@@ -119,7 +154,7 @@ impl<D: Distance> HyperHNSW<D> {
             level,
             &self.graph,
             &self.storage,
-            &mut ctx,
+            ctx,
         );
 
         let m_max = self.graph.m_max(level);

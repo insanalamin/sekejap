@@ -128,13 +128,22 @@ fn print_help() {
     println!("  describe [name]      Show describe output (global or collection)");
     println!("  \\flush               Flush data to disk");
     println!("  clear                Clear the screen");
-    println!("\n{}", "Querying:".bold().underline());
-    println!("  query {{...}};        Execute JSON query pipeline");
-    println!("  mutate {{...}};       Execute JSON mutation");
-    println!("  describe [name];      Inspect global/collection index state");
-    println!(
-        "  Example: query {{\"pipeline\": [{{\"op\": \"all\"}}, {{\"op\": \"take\", \"n\": 5}}]}};"
-    );
+    println!("\n{}", "Querying (SekejapQL):".bold().underline());
+    println!("  collection \"crimes\"                  SekejapQL query (auto-detected)");
+    println!("  collection \"crimes\" | take 5         Pipe-style SekejapQL");
+    println!("  count collection \"crimes\"            Count results");
+    println!("  explain collection \"crimes\"          Show compiled pipeline steps");
+    println!("\n{}", "Querying (JSON):".bold().underline());
+    println!("  query {{...}};                        Execute JSON query pipeline");
+    println!("  count {{...}};                        Count results from JSON pipeline");
+    println!("  explain {{...}};                      Show compiled steps from JSON");
+    println!("\n{}", "Mutations:".bold().underline());
+    println!("  mutate {{...}};                       Execute JSON mutation");
+    println!("\n{}", "Examples:".bold().underline());
+    println!("  collection \"crimes\" | where_eq \"type\" \"robbery\" | take 10");
+    println!("  one \"persons/ali\" | forward \"committed\" | take 5");
+    println!("  all | similar \"persons/ali\" 10");
+    println!("  query {{\"pipeline\": [{{\"op\": \"all\"}}, {{\"op\": \"take\", \"n\": 5}}]}};");
 }
 
 fn list_collections(db: &SekejapDB) {
@@ -167,20 +176,13 @@ fn list_collections(db: &SekejapDB) {
     println!("{}", table);
 }
 
-fn describe_collection(db: &SekejapDB, name: &str) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&db.describe_collection(name))
-            .unwrap_or_else(|_| "{}".to_string())
-    );
-}
-
 fn handle_query(line: &str, db: &SekejapDB) {
     let line = line.trim().trim_end_matches(';').trim();
     if line.is_empty() {
         return;
     }
 
+    // describe (global or collection)
     if line == "describe" {
         println!(
             "{}",
@@ -196,6 +198,8 @@ fn handle_query(line: &str, db: &SekejapDB) {
         );
         return;
     }
+
+    // mutate
     if let Some(json) = line.strip_prefix("mutate ") {
         let start = Instant::now();
         match db.mutate(json.trim()) {
@@ -216,13 +220,48 @@ fn handle_query(line: &str, db: &SekejapDB) {
         return;
     }
 
-    let query_json = line.strip_prefix("query ").unwrap_or(line).trim();
+    // explain — show compiled pipeline steps without executing
+    if let Some(rest) = line.strip_prefix("explain ") {
+        let input = rest.strip_prefix("query ").unwrap_or(rest).trim();
+        match db.explain(input) {
+            Ok(steps) => {
+                println!("{} {} steps compiled", "Plan:".green(), steps.len());
+                for (i, step) in steps.iter().enumerate() {
+                    println!("  {}: {:?}", i + 1, step);
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Explain Error:".red(), e),
+        }
+        return;
+    }
+
+    // count — return count only
+    if let Some(rest) = line.strip_prefix("count ") {
+        let input = rest.strip_prefix("query ").unwrap_or(rest).trim();
+        let start = Instant::now();
+        match db.count(input) {
+            Ok(outcome) => {
+                let duration = start.elapsed();
+                println!(
+                    "{} {} results in {:.4}s",
+                    "Count:".green(),
+                    outcome.data,
+                    duration.as_secs_f64()
+                );
+                print_trace(&outcome.trace);
+            }
+            Err(e) => eprintln!("{} {}", "Count Error:".red(), e),
+        }
+        return;
+    }
+
+    // query — SekejapQL text or JSON pipeline (auto-detected)
+    let input = line.strip_prefix("query ").unwrap_or(line).trim();
     let start = Instant::now();
-    match db.query(query_json) {
+    match db.query(input) {
         Ok(outcome) => {
             let duration = start.elapsed();
             let hits = outcome.data;
-            let trace = outcome.trace;
 
             println!(
                 "{} {} hits in {:.4}s",
@@ -257,19 +296,22 @@ fn handle_query(line: &str, db: &SekejapDB) {
                 }
             }
 
-            // Print Trace stats
-            if !trace.steps.is_empty() {
-                println!("\n{}", "Execution Trace:".dimmed());
-                for step in trace.steps {
-                    println!(
-                        "  -> {} (in: {}, out: {}, index: {}, time: {}us)",
-                        step.atom, step.input_size, step.output_size, step.index_used, step.time_us
-                    );
-                }
-            }
+            print_trace(&outcome.trace);
         }
         Err(e) => {
             eprintln!("{} {}", "Query Error:".red(), e);
+        }
+    }
+}
+
+fn print_trace(trace: &sekejap::Trace) {
+    if !trace.steps.is_empty() {
+        println!("\n{}", "Execution Trace:".dimmed());
+        for step in &trace.steps {
+            println!(
+                "  -> {} (in: {}, out: {}, index: {}, time: {}us)",
+                step.atom, step.input_size, step.output_size, step.index_used, step.time_us
+            );
         }
     }
 }

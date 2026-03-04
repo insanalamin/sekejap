@@ -4,6 +4,7 @@
 pub mod arena;
 pub mod collection_bitmap;
 pub mod db;
+pub mod geometry;
 pub mod hnsw;
 pub mod index;
 pub mod mmap_hash;

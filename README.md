@@ -2,162 +2,165 @@
 
 A **graph-first**, embedded multi-model database engine for Rust and Python.
 
-## 1: Overview 
-
-Sekejap-DB is a **graph-native database** designed for high-performance, relationship-heavy workloads like **Root Cause Analysis (RCA)**, **RAG**, and **Agentic AI**.
-
-It unifies **Graph**, **Vector**, **Spatial**, and **Full-Text** search into a single, cohesive engine where the **Graph** acts as the primary structure and other models serve as attributes or filters.
-
-### 1.1 Features 
-
-- **HNSW Engine**: Custom, SIMD-accelerated HNSW implementation for high-concurrency vector search.
-- **Graph-First**: Relationships are first-class citizens. Queries traverse edges to prune the search space.
-- **Hybrid Querying**: Native **Index Intersection** allows combining Graph, Vector, Spatial, and Text conditions via a pipeline API.
-- **Embedded**: Runs directly in your application process (Rust/Python). Zero network overhead.
-- **Zero-Copy Storage**: Memory-mapped arenas for ultra-fast data access.
+Graph is the primary structure. **Vector**, **Spatial**, and **Full-Text** are first-class attributes on nodes, queryable in the same pipeline. Runs in-process — zero network overhead.
 
 ---
 
-## 2: Main Usage (Rust & Python)
+## Features
 
-### 2.1 Basic CRUD Operations
+- **Graph-First**: Edges are first-class. Queries traverse the graph to prune the search space before applying other indexes.
+- **HNSW Engine**: Parallel construction (Rayon), NEON/AVX2 SIMD CosineDistance, `ef_construction=32`. 44x faster batch build vs v0.2.
+- **Spatial (PostGIS-par)**: R-Tree index on full GeoJSON geometry envelopes. Point, Polygon, LineString, Multi* — with DE-9IM predicates (`st_within`, `st_contains`, `st_intersects`, `st_dwithin`).
+- **Full-Text**: Pluggable adapters — Tantivy (default) or SeekStorm.
+- **Embedded**: Memory-mapped arenas, zero-copy storage.
+- **SekejapQL**: Lightweight text query language — one op per line, compiles to the same pipeline as JSON.
+- **CLI**: Interactive REPL (`skcli`) — SekejapQL and JSON queries, mutations, introspection.
 
-#### Write Data
+---
 
-**Rust:**
+## Quick Start
+
+### Python
+```python
+import sekejap, json
+
+db = sekejap.SekejapDB("./data", capacity=1_000_000)
+db.init_hnsw(16)
+db.init_fulltext()
+
+# Write
+db.put("persons/ali", json.dumps({
+    "name": "Ali Hassan", "status": "wanted",
+    "vectors": {"dense": [0.12, 0.87, ...]},
+    "geo": {"loc": {"lat": 3.1105, "lon": 101.6682}}
+}))
+db.link("persons/ali", "crimes/robbery-001", "committed", 1.0)
+
+# Query — SekejapQL
+result = db.query_skql("""
+    one "crimes/robbery-001"
+    backward "committed"
+    where_eq "status" "wanted"
+    forward "lives_at"
+    near 3.1291 101.6710 5.0
+    select "name" "alias" "geo"
+""")
+
+db.flush()
+db.close()
+```
+
+### Rust
 ```rust
 use sekejap::SekejapDB;
 
-// Initialize with path and capacity
 let db = SekejapDB::new(std::path::Path::new("./data"), 1_000_000)?;
+db.init_hnsw(16);
+db.init_fulltext(std::path::Path::new("./data"));
 
-// Simple write
-db.nodes().put("event/001", r#"{"title": "Theft", "severity": "high"}"#)?;
+db.nodes().put("persons/ali", r#"{"name":"Ali Hassan","status":"wanted"}"#)?;
+db.edges().link("persons/ali", "crimes/robbery-001", "committed", 1.0)?;
 
-// JSON with Vector & Geo
-db.nodes().put("news/flood-2026", r#"{
-    "title": "Flood in Jakarta",
-    "vectors": { "dense": [0.1, 0.2, 0.3] },
-    "geo": { "loc": { "lat": -6.2, "lon": 106.8 } }
-}"#)?;
-```
+// SekejapQL (auto-detected — anything not starting with '{')
+let result = db.query("collection \"crimes\"\nwhere_eq \"type\" \"robbery\"\ntake 20")?;
 
-**Python:**
-```python
-import sekejap
+// JSON pipeline (auto-detected — starts with '{')
+let result = db.query(r#"{"pipeline":[{"op":"collection","name":"crimes"},{"op":"take","n":5}]}"#)?;
 
-# Initialize with path and capacity
-db = sekejap.SekejapDB("./data", capacity=1000000)
-
-# Simple write
-db.put("event/001", '{"title": "Theft", "severity": "high"}')
-
-# JSON with Vector & Geo
-db.put("news/flood-2026", """
-{
-    "title": "Flood in Jakarta",
-    "vectors": { "dense": [0.1, 0.2, 0.3] },
-    "geo": { "loc": { "lat": -6.2, "lon": 106.8 } }
-}
-""")
-```
-
-#### Read Data
-
-**Rust:**
-```rust
-if let Some(event) = db.nodes().get("news/flood-2026") {
-    println!("Found: {}", event);
-}
-```
-
-**Python:**
-```python
-event = db.get("news/flood-2026")
-if event:
-    print(f"Found: {event}")
-```
-
-#### Delete Data
-
-**Rust:**
-```rust
-db.nodes().remove("event/001")?;
-```
-
-**Python:**
-```python
-db.remove("event/001")
-```
-
----
-
-### 2.2 Edges & Traversal
-
-#### Link Nodes
-
-**Rust:**
-```rust
-db.edges().link("poverty", "crime/001", "causal", 0.8)?;
-```
-
-**Python:**
-```python
-db.link("poverty", "crime/001", "causal", 0.8)
-```
-
-#### Hybrid Query Pipeline
-
-Find events starting from "cuisine/italian", traversing backward via "related", and filtering by rating.
-
-**Rust:**
-```rust
-let results = db.nodes().one("cuisine/italian")
-    .backward("related")
-    .where_gt("rating", 4.5)
+// Fluent builder (Rust only)
+let result = db.nodes().collection("crimes")
+    .where_eq("type", serde_json::json!("robbery"))
+    .near(3.13, 101.67, 1.0)
+    .take(20)
     .collect()?;
 ```
 
-**Python:**
-```python
-results = db.backward("cuisine/italian", "related")
-for hit in results:
-    print(hit.payload)
+---
+
+## SekejapQL — One Op Per Line
+
+```
+# Find all gang members → their crimes → near a location
+one "persons/ali"
+forward "member_of"
+backward "member_of"
+forward "committed"
+near 3.1291 101.6710 2.0
+sort "severity" desc
+take 10
+select "type" "severity" "occurred_at"
+
+# News → crime → suspect network inside a polygon
+collection "articles"
+matching "armed robbery Bangsar 2024"
+forward "reported_by"
+backward "committed"
+forward "member_of"
+backward "member_of"
+spatial_within_polygon (3.128,101.665) (3.135,101.665) (3.135,101.678) (3.128,101.678) (3.128,101.665)
+where_eq "status" "wanted"
+select "name" "alias" "geo" "priors"
+
+# PostGIS-par geometry predicates
+collection "zones"
+st_intersects (3.128,101.665) (3.128,101.678) (3.135,101.678) (3.135,101.665) (3.128,101.665)
 ```
 
-#### Pipeline query (SekejapQL JSON)
+Pipe style also works: `collection "crimes" | where_eq "type" "robbery" | near 3.1 101.6 1.0 | take 20`
 
-Same logic via a JSON pipeline: `one` → `forward`/`backward` → `where_*` → `take` → result.
+---
 
-**Rust:**
-```rust
-let q = r#"{"pipeline": [{"op": "one", "slug": "cuisine/italian"}, {"op": "backward", "type": "related"}, {"op": "where_gt", "field": "rating", "value": 4.5}, {"op": "take", "n": 10}]}"#;
-let outcome = db.query_json(q)?;
-```
+## CLI (`skcli`)
 
-**Python:**
-```python
-q = '{"pipeline": [{"op": "one", "slug": "cuisine/italian"}, {"op": "backward", "type": "related"}, {"op": "take", "n": 10}]}'
-result = db.query_json(q)  # returns JSON string of outcome
+```bash
+cargo run -p skcli -- --path ./data
+
+sekejap> collection "crimes" | where_eq "type" "robbery" | take 10
+sekejap> one "persons/ali" | forward "committed"
+sekejap> count collection "crimes"
+sekejap> explain collection "crimes" | take 5
+sekejap> mutate {"mutation":"put_json","data":{"_id":"crimes/001","type":"robbery"}}
+sekejap> \d crimes
+sekejap> \l
 ```
 
 ---
 
-## 3: Building and Testing
+## Benchmark (10k Records, Apple Silicon)
+
+| Operation | SQLite (Rust) | Sekejap (Rust) | Speedup |
+|---|---|---|---|
+| Simple retrieval (1k lookups) | 3.4ms | 1.9ms | **1.8x** |
+| Vector retrieval (k-NN) | 9.3ms | 0.3ms | **31x** |
+| Graph traversal (100x 3-hop) | 8.5ms | 1.1ms | **7.7x** |
+| V+S retrieval | 5.3ms | 1.7ms | **3.1x** |
+| V+F retrieval | 3.7ms | <0.1ms | **instant** |
+
+See [`docs/benchmark-results.md`](docs/benchmark-results.md) for full Rust vs Python results and methodology.
+
+---
+
+## Full Documentation
+
+See the [`docs/`](docs/) folder:
+- [`docs/api-reference.md`](docs/api-reference.md) — Complete API reference (setup, schema, mutations, all SekejapQL ops, JSON pipeline, data conventions, performance)
+- [`docs/interface-table.md`](docs/interface-table.md) — Interface inventory and status
+- [`docs/roadmap.md`](docs/roadmap.md) — Development roadmap and execution notes
+- [`docs/benchmark-results.md`](docs/benchmark-results.md) — Benchmark results (Rust vs Python vs SQLite)
+
+---
+
+## Build
 
 ```bash
-# Run tests
-cargo test --all-features
+cargo test
+cargo build --release
 
-# Run an example (e.g. RCA or benchmark)
-cargo run --example real_world_rca --all-features
-cargo run --example sqlite_competition_benchmark --all-features
+# CLI
+cargo run -p skcli -- --path ./data
 
-# Benchmarks
-cargo bench
-
-# Check for errors
-cargo check --all-features
+# Python wheel
+maturin develop --release
 ```
 
 ## License

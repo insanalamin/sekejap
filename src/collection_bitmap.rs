@@ -71,6 +71,24 @@ impl CollectionBitmapIndex {
         }
     }
 
+    /// Return the cardinality of a collection without cloning the bitmap.
+    /// O(1) in memory — no allocation.
+    pub fn len_for(&self, collection_hash: u64) -> usize {
+        // Check in-memory cache first
+        if let Some(bm) = self.bitmaps.get(&collection_hash) {
+            return bm.read().len() as usize;
+        }
+        // Try loading from disk
+        match self.load_from_disk(collection_hash) {
+            Ok(bm) => {
+                let len = bm.read().len() as usize;
+                self.bitmaps.insert(collection_hash, bm);
+                len
+            }
+            Err(_) => 0,
+        }
+    }
+
     /// Get (or lazy-load) the RoaringBitmap for a collection.
     /// Returns a cloned bitmap snapshot for iteration.
     pub fn get_snapshot(&self, collection_hash: u64) -> RoaringBitmap {

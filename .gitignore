@@ -95,5 +95,7 @@ target/.rustc_info.json
 target
 
 /unused
-
 /scenarios
+bench_sekejap_db/
+sekejap-benchmark/bench_sekejap_db/
+sekejap-benchmark/bench_sqlite.db

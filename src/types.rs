@@ -83,20 +83,54 @@ impl Default for VectorSlot {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SpatialNode {
     pub id: u32,
-    pub coords: [f32; 2],
+    /// Centroid [lat, lon] — used for `near` / `st_dwithin` distance ops.
+    pub centroid: [f32; 2],
+    /// Bounding envelope corners. Equal to `centroid` for plain point nodes.
+    pub min_corner: [f32; 2],
+    pub max_corner: [f32; 2],
+}
+
+impl SpatialNode {
+    /// Construct a point node (bbox == centroid).
+    pub fn from_point(id: u32, lat: f32, lon: f32) -> Self {
+        Self {
+            id,
+            centroid: [lat, lon],
+            min_corner: [lat, lon],
+            max_corner: [lat, lon],
+        }
+    }
+
+    /// Construct a geometry node with a separate bbox.
+    pub fn from_bbox(
+        id: u32,
+        centroid_lat: f32,
+        centroid_lon: f32,
+        min_lat: f32,
+        min_lon: f32,
+        max_lat: f32,
+        max_lon: f32,
+    ) -> Self {
+        Self {
+            id,
+            centroid: [centroid_lat, centroid_lon],
+            min_corner: [min_lat, min_lon],
+            max_corner: [max_lat, max_lon],
+        }
+    }
 }
 
 impl RTreeObject for SpatialNode {
     type Envelope = rstar::AABB<[f32; 2]>;
     fn envelope(&self) -> Self::Envelope {
-        rstar::AABB::from_point(self.coords)
+        rstar::AABB::from_corners(self.min_corner, self.max_corner)
     }
 }
 
 impl rstar::PointDistance for SpatialNode {
     fn distance_2(&self, point: &[f32; 2]) -> f32 {
-        let dx = self.coords[0] - point[0];
-        let dy = self.coords[1] - point[1];
+        let dx = self.centroid[0] - point[0];
+        let dy = self.centroid[1] - point[1];
         dx * dx + dy * dy
     }
 }
@@ -142,6 +176,14 @@ pub enum Step {
     SpatialWithinBbox(f32, f32, f32, f32), // min_lat, min_lon, max_lat, max_lon
     SpatialIntersectsBbox(f32, f32, f32, f32), // point dataset: same semantics as within bbox
     SpatialWithinPolygon(Vec<[f32; 2]>), // polygon ring points [lat, lon]
+
+    // DE-9IM geometry predicates (PostGIS-par)
+    // All polygon args use [lat, lon] pairs; predicates operate on the node's "geometry" field.
+    StWithin(Vec<[f32; 2]>),     // node geometry is completely within query polygon
+    StContains(Vec<[f32; 2]>),   // node geometry contains the query polygon
+    StIntersects(Vec<[f32; 2]>), // node geometry intersects the query polygon
+    StDWithin(f32, f32, f32),    // node centroid within distance_km of (lat, lon)
+
     Similar(Vec<f32>, usize), // query_vec, k
 
     #[cfg(feature = "fulltext")]
@@ -264,6 +306,24 @@ impl Step {
             Step::SpatialWithinPolygon(polygon) => serde_json::json!({
                 "op": "spatial_within_polygon",
                 "polygon": polygon
+            }),
+            Step::StWithin(polygon) => serde_json::json!({
+                "op": "st_within",
+                "polygon": polygon
+            }),
+            Step::StContains(polygon) => serde_json::json!({
+                "op": "st_contains",
+                "polygon": polygon
+            }),
+            Step::StIntersects(polygon) => serde_json::json!({
+                "op": "st_intersects",
+                "polygon": polygon
+            }),
+            Step::StDWithin(lat, lon, distance_km) => serde_json::json!({
+                "op": "st_dwithin",
+                "lat": lat,
+                "lon": lon,
+                "distance_km": distance_km
             }),
             Step::Similar(query, k) => {
                 serde_json::json!({ "op": "similar", "query": query, "k": k })

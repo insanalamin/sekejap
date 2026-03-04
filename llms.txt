@@ -1,0 +1,547 @@
+# Sekejap DB
+
+> A graph-first, embedded multi-model database engine for Rust and Python.
+> Graph is the primary structure. Vector, Spatial, and Full-Text are first-class attributes on nodes, queryable in the same pipeline. Runs in-process — zero network overhead.
+
+## Installation
+
+### Rust
+```toml
+[dependencies]
+sekejap = "0.3"
+# For full-text search:
+sekejap = { version = "0.3", features = ["fulltext"] }
+```
+
+### Python
+```bash
+pip install sekejap
+```
+
+---
+
+## Quick Start
+
+### Rust
+```rust
+use sekejap::SekejapDB;
+
+let db = SekejapDB::new(std::path::Path::new("./data"), 1_000_000)?;
+db.init_hnsw(16);                          // enable vector search
+db.init_fulltext(std::path::Path::new("./data")); // enable fulltext
+
+// Define collection with indexed fields
+db.schema().define("persons", r#"{"hot_fields":{"hash":["status"],"range":["severity"]}}"#)?;
+
+// Write node
+db.nodes().put("persons/ali", r#"{"name":"Ali","status":"wanted","vectors":{"dense":[0.1,0.2,...]},"geo":{"loc":{"lat":3.11,"lon":101.67}},"title":"Ali","body":"Known criminal"}"#)?;
+
+// Write edge
+db.edges().link("persons/ali", "crimes/robbery-001", "committed", 1.0)?;
+
+// Query
+let result = db.nodes().collection("crimes")
+    .where_eq("type", serde_json::json!("robbery"))
+    .near(3.13, 101.67, 1.0)
+    .take(20)
+    .collect()?;
+
+db.flush()?;
+```
+
+### Python
+```python
+import sekejap, json
+
+db = sekejap.SekejapDB("./data", capacity=1_000_000)
+db.init_hnsw(16)
+db.init_fulltext()
+
+db.nodes().put("persons/ali", json.dumps({
+    "name": "Ali", "status": "wanted",
+    "vectors": {"dense": [0.1, 0.2, ...]},
+    "geo": {"loc": {"lat": 3.11, "lon": 101.67}},
+    "title": "Ali", "body": "Known criminal"
+}))
+db.edges().link("persons/ali", "crimes/robbery-001", "committed", 1.0)
+
+result = db.query_skql("""
+    collection "crimes"
+    where_eq "type" "robbery"
+    near 3.1291 101.6710 1.0
+    take 20
+""")
+db.flush()
+db.close()
+```
+
+---
+
+## Initialization Order (MUST follow)
+
+```
+1. db = SekejapDB::new(path, capacity)     # Create/open database
+2. db.schema().define(name, json)           # Optional: define collection indexes
+3. db.init_hnsw(m)                          # Optional: enable vector search (BEFORE inserting vectors)
+4. db.init_fulltext(path)                   # Optional: enable fulltext (BEFORE inserting text)
+5. db.nodes().put(...) or ingest(...)       # Write data
+6. db.edges().link(...)                     # Write edges (nodes MUST exist first)
+7. db.flush()                               # Persist to disk
+```
+
+**Critical:** `init_hnsw()` must be called BEFORE writing nodes with vectors. `init_fulltext()` must be called BEFORE writing nodes with title/body fields.
+
+---
+
+## Node Data Format
+
+```json
+{
+    "_id": "collection/key",
+    "name": "Any field",
+    "vectors": {"dense": [0.1, 0.2, ..., 0.99]},
+    "geo": {"loc": {"lat": 3.11, "lon": 101.67}},
+    "geometry": {"type": "Polygon", "coordinates": [[[101.6, 3.1], ...]]},
+    "title": "Fulltext title field",
+    "body": "Fulltext body field",
+    "content": "Alternative to body"
+}
+```
+
+| Field | Purpose | Notes |
+|---|---|---|
+| `_id` | Slug identifier | Format: `collection/key` |
+| `vectors.dense` | 128-dim f32 vector | For HNSW similarity search |
+| `geo.loc.lat/lon` | Point coordinates | Legacy point format |
+| `geometry` | GeoJSON geometry | Any type: Point, Polygon, LineString, etc. |
+| `title` | Fulltext title | Indexed by fulltext adapter |
+| `body` or `content` | Fulltext body | Indexed by fulltext adapter |
+
+---
+
+## Write Operations
+
+### Rust — NodeStore
+
+```rust
+// Single write
+db.nodes().put("persons/ali", r#"{"name":"Ali"}"#)?;          // -> u32 (index)
+db.nodes().put_json(r#"{"_id":"persons/ali","name":"Ali"}"#)?; // auto-detect slug from _id
+
+// Read / Delete
+let json: Option<String> = db.nodes().get("persons/ali");
+db.nodes().remove("persons/ali")?;
+
+// Batch (FAST — 10-100x faster than put())
+db.nodes().ingest(&[("persons/ali", r#"{...}"#), ("persons/bob", r#"{...}"#)])?;
+// Or split: ingest_raw (no HNSW) then build_hnsw separately
+db.nodes().ingest_raw(&items)?;
+db.nodes().build_hnsw()?;
+```
+
+### Rust — EdgeStore
+
+```rust
+db.edges().link("persons/ali", "crimes/001", "committed", 1.0)?;
+db.edges().link_meta("persons/ali", "crimes/001", "committed", 1.0, r#"{"role":"mastermind"}"#)?;
+db.edges().unlink("persons/ali", "crimes/001", "committed")?;
+// Batch
+db.edges().ingest(&[("persons/ali", "crimes/001", "committed", 1.0)])?;
+```
+
+### Rust — SchemaStore
+
+```rust
+db.schema().define("crimes", r#"{"hot_fields":{"hash":["type","status"],"range":["severity"]}}"#)?;
+db.schema().count("crimes"); // -> usize (O(1))
+```
+
+### Python
+
+```python
+db.nodes().put("persons/ali", json.dumps({"name": "Ali"}))
+db.nodes().get("persons/ali")     # -> str or None
+db.nodes().remove("persons/ali")
+db.nodes().ingest([("persons/ali", json.dumps({...})), ...])
+
+db.edges().link("persons/ali", "crimes/001", "committed", 1.0)
+db.edges().link_meta("persons/ali", "crimes/001", "committed", 1.0, '{"role":"mastermind"}')
+db.edges().unlink("persons/ali", "crimes/001", "committed")
+db.edges().ingest([("persons/ali", "crimes/001", "committed", 1.0), ...])
+
+db.schema().define("crimes", '{"hot_fields":{"hash":["type"],"range":["severity"]}}')
+db.schema().count("crimes")
+```
+
+---
+
+## Query — Fluent Builder (Rust)
+
+All queries start from a `Set` and chain operations. Terminal methods execute the pipeline.
+
+### Starters
+
+```rust
+db.nodes().one("persons/ali")           // Single node by slug
+db.nodes().many(&["persons/ali", "persons/bob"])  // Multiple slugs
+db.nodes().collection("crimes")         // All nodes in collection
+db.nodes().all()                        // All nodes
+```
+
+### Graph Traversal
+
+```rust
+.forward("committed")           // Follow outgoing edges of type
+.backward("committed")          // Follow incoming edges of type
+.hops(3)                        // Multi-hop BFS (up to 3 levels)
+.forward_parallel("committed")  // Parallel traversal (Rayon)
+.backward_parallel("committed")
+.roots()                        // Nodes with no incoming edges
+.leaves()                       // Nodes with no outgoing edges
+```
+
+### Vector Search
+
+```rust
+.similar(&query_vec, 10)        // Top-10 nearest neighbors via HNSW
+// Requires: db.init_hnsw(m) called before data insertion
+```
+
+### Spatial Search
+
+```rust
+.near(3.13, 101.67, 1.0)                           // Within 1km radius
+.within_bbox(3.1, 101.6, 3.2, 101.7)               // Bounding box
+.st_within(vec![[3.1,101.6],[3.2,101.6],[3.2,101.7],[3.1,101.7],[3.1,101.6]])   // Geometry within polygon
+.st_contains(polygon)                                // Geometry contains polygon
+.st_intersects(polygon)                              // Geometry intersects polygon
+.st_dwithin(3.13, 101.67, 1.0)                      // Centroid within distance
+```
+
+### Fulltext Search
+
+```rust
+.matching("robbery Bangsar")                         // Search title + body
+.matching_weighted("robbery", 100, 2.0, 1.0)        // With limit, title_weight, content_weight
+// Requires: db.init_fulltext(path) and feature = "fulltext"
+```
+
+### Filters
+
+```rust
+.where_eq("status", serde_json::json!("wanted"))    // Exact match
+.where_gt("severity", 7.0)                          // Greater than
+.where_lt("severity", 5.0)                          // Less than
+.where_gte("severity", 7.0)                         // Greater or equal
+.where_lte("severity", 5.0)                         // Less or equal
+.where_between("severity", 5.0, 9.0)                // Range inclusive
+.where_in("type", vec![json!("robbery"), json!("assault")])  // IN list
+```
+
+### Set Algebra
+
+```rust
+.intersect(other_set)   // AND
+.union(other_set)       // OR
+.subtract(other_set)    // MINUS
+```
+
+### Ordering & Pagination
+
+```rust
+.sort("severity", false)   // Sort by field (false = descending)
+.skip(20)                  // Skip first 20
+.take(10)                  // Limit to 10 results
+.select(&["name", "geo"])  // Project specific fields only
+```
+
+### Terminal Methods
+
+```rust
+.collect()?    // -> Outcome<Vec<Hit>>    Execute and return all hits with payloads
+.count()?      // -> Outcome<usize>       Execute and return count only
+.first()?      // -> Outcome<Option<Hit>> First hit or None
+.exists()?     // -> Outcome<bool>        Any results?
+.avg("field")? // -> Outcome<f64>         Average of numeric field
+.sum("field")? // -> Outcome<f64>         Sum of numeric field
+.explain()     // -> Plan                 Compile without executing
+```
+
+### Full Rust Query Examples
+
+```rust
+// Find wanted suspects near a crime scene
+let result = db.nodes().collection("persons")
+    .where_eq("status", json!("wanted"))
+    .near(3.13, 101.67, 2.0)
+    .sort("severity", false)
+    .take(10)
+    .select(&["name", "alias", "geo"])
+    .collect()?;
+
+// Graph traversal: crime -> suspects -> gang -> all members
+let result = db.nodes().one("crimes/robbery-001")
+    .backward("committed")
+    .forward("member_of")
+    .backward("member_of")
+    .collect()?;
+
+// Vector similarity search
+let result = db.nodes().all()
+    .similar(&query_vec, 10)
+    .collect()?;
+
+// Multi-hop graph traversal
+let result = db.nodes().one("persons/ali")
+    .forward("follows")
+    .hops(3)
+    .collect()?;
+```
+
+---
+
+## Query — SekejapQL (Text Format)
+
+One op per line, or pipe-separated. Compiles to same pipeline as fluent builder.
+
+```
+# Starters
+one "persons/ali"
+many "persons/ali" "persons/bob"
+collection "crimes"
+all
+
+# Graph
+forward "committed"
+backward "committed"
+hops 3
+
+# Vector
+similar "persons/ali" 10
+
+# Spatial
+near 3.1291 101.6710 1.0
+spatial_within_bbox 3.1 101.6 3.2 101.7
+st_within (3.1,101.6) (3.2,101.6) (3.2,101.7) (3.1,101.7) (3.1,101.6)
+
+# Fulltext
+matching "robbery Bangsar"
+
+# Filters
+where_eq "status" "wanted"
+where_gt "severity" 7
+where_between "severity" 5 9
+where_in "type" "robbery" "assault"
+
+# Result shaping
+sort "severity" desc
+skip 20
+take 10
+select "name" "alias" "geo"
+```
+
+**Pipe style:** `collection "crimes" | where_eq "type" "robbery" | near 3.1 101.6 1.0 | take 20`
+
+### Execute SekejapQL
+
+**Rust:**
+```rust
+let result = db.query("collection \"crimes\"\nwhere_eq \"type\" \"robbery\"\ntake 20")?;
+let count = db.count("collection \"crimes\"")?;
+let plan = db.explain("collection \"crimes\"\ntake 20")?;
+```
+
+**Python:**
+```python
+result = db.query_skql('collection "crimes"\nwhere_eq "type" "robbery"\ntake 20')
+count = db.query_skql_count('collection "crimes"')
+```
+
+---
+
+## Query — JSON Pipeline Format
+
+```json
+{"pipeline": [
+    {"op": "collection", "name": "crimes"},
+    {"op": "where_eq", "field": "type", "value": "robbery"},
+    {"op": "near", "lat": 3.1291, "lon": 101.6710, "radius": 1.0},
+    {"op": "sort", "field": "severity", "asc": false},
+    {"op": "take", "n": 20}
+]}
+```
+
+**Execute:**
+```rust
+let result = db.query(r#"{"pipeline":[...]}"#)?;
+```
+
+---
+
+## Mutation — JSON Format
+
+```rust
+db.mutate(r#"{"mutation":"put_json","data":{"_id":"crimes/001","type":"robbery"}}"#)?;
+db.mutate(r#"{"mutation":"link","source":"persons/ali","target":"crimes/001","type":"committed","weight":1.0}"#)?;
+db.mutate(r#"{"mutation":"remove","slug":"crimes/001"}"#)?;
+db.mutate(r#"{"mutation":"unlink","source":"persons/ali","target":"crimes/001","type":"committed"}"#)?;
+```
+
+---
+
+## Return Types
+
+### Hit
+```rust
+pub struct Hit {
+    pub idx: u32,                    // Arena index
+    pub slug_hash: u64,              // Hash of slug
+    pub collection_hash: u64,        // Hash of collection
+    pub payload: Option<String>,     // JSON payload
+    pub lat: f32,                    // Latitude
+    pub lon: f32,                    // Longitude
+    pub score: Option<f32>,          // Similarity/FTS score
+}
+```
+
+### Outcome<T>
+```rust
+pub struct Outcome<T> {
+    pub data: T,                     // Result data
+    pub trace: Trace,                // Execution trace with per-step timing
+}
+```
+
+### Trace
+```rust
+pub struct Trace {
+    pub steps: Vec<StepReport>,      // Per-step reports
+    pub total_us: u64,               // Total microseconds
+}
+pub struct StepReport {
+    pub atom: String,                // Step name
+    pub input_size: usize,           // Input candidates
+    pub output_size: usize,          // Output candidates
+    pub index_used: String,          // Which index was used
+    pub time_us: u64,                // Microseconds
+}
+```
+
+---
+
+## Introspection
+
+```rust
+let info = db.describe();              // Global: node count, vector/spatial/fulltext status
+let col = db.describe_collection("crimes"); // Collection: count, index readiness
+```
+
+---
+
+## Persistence
+
+```rust
+db.flush()?;              // Sync all data to disk
+db.backup(path)?;         // Export all nodes + edges as JSON
+db.restore(path)?;        // Import from backup file
+```
+
+---
+
+## Schema Definition Format
+
+```json
+{
+    "hot_fields": {
+        "hash": ["status", "type"],
+        "range": ["severity", "timestamp"],
+        "vector": ["vec_field"],
+        "spatial": ["geo_field"],
+        "fulltext": ["title", "content"]
+    }
+}
+```
+
+- `hash`: O(1) equality index for `where_eq`
+- `range`: O(log N) range index for `where_between`, `where_gt`, etc.
+- `vector`, `spatial`, `fulltext`: documentation only (auto-detected from data)
+
+---
+
+## Features (Cargo.toml)
+
+```toml
+[features]
+fulltext = ["dep:tantivy"]                    # Tantivy fulltext (recommended)
+fulltext-tantivy = ["dep:tantivy"]            # Same as fulltext
+fulltext-seekstorm = ["dep:seekstorm"]        # SeekStorm (faster, needs RUSTFLAGS="-C target-cpu=native")
+parallel = []                                  # Parallel graph traversal
+```
+
+---
+
+## Performance Characteristics
+
+| Operation | Complexity | Notes |
+|---|---|---|
+| `put()` single | O(1) amortized | Commits immediately, builds all indexes inline |
+| `ingest()` batch | O(N log N) | Deferred indexing, parallel HNSW, single commit. 10-100x faster than put() |
+| `get()` | O(1) | Hash lookup on slug_index |
+| `forward/backward` | O(degree × hops) | BFS traversal |
+| `similar()` | O(log N) | HNSW approximate nearest neighbor |
+| `near/within_bbox` | O(log N) | R-Tree spatial index |
+| `matching()` | O(index) | Tantivy/SeekStorm fulltext |
+| `where_eq` (hot field) | O(1) | HashIndex lookup |
+| `where_between` (hot field) | O(log N) | RangeIndex |
+| `where_eq` (cold field) | O(N) | JSON scan |
+| `collection().count()` | O(1) | Atomic counter |
+| `flush()` | O(data) | mmap sync |
+
+---
+
+## Complete Query Examples
+
+### Graph: Who committed this crime, where do they live?
+```
+one "crimes/robbery-001"
+backward "committed"
+forward "lives_at"
+select "name" "address" "geo"
+```
+
+### Vector: Find similar criminal profiles
+```rust
+let result = db.nodes().all().similar(&suspect_vector, 20)
+    .where_eq("status", json!("wanted"))
+    .collect()?;
+```
+
+### Spatial: Crimes within polygon
+```
+collection "crimes"
+st_within (3.128,101.665) (3.135,101.665) (3.135,101.678) (3.128,101.678) (3.128,101.665)
+sort "severity" desc
+take 20
+```
+
+### Combined: News -> crime -> suspects -> gang -> near location
+```
+collection "articles"
+matching "armed robbery Bangsar"
+forward "reported_by"
+backward "committed"
+forward "member_of"
+backward "member_of"
+near 3.1291 101.6710 5.0
+where_eq "status" "wanted"
+select "name" "alias" "geo"
+take 50
+```
+
+### Hybrid Vector + Spatial
+```rust
+let spatial_hits = db.nodes().all().within_bbox(-5.0, -5.0, 5.0, 5.0).collect()?;
+let spatial_ids: HashSet<u32> = spatial_hits.data.iter().map(|h| h.idx).collect();
+let vec_hits = db.nodes().all().similar(&query_vec, 100).collect()?;
+let combined: Vec<_> = vec_hits.data.iter().filter(|h| spatial_ids.contains(&h.idx)).take(10).collect();
+```

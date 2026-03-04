@@ -1,0 +1,449 @@
+# Sekejap DB — Complete API Reference for LLM/Agent Integration
+
+> Graph-first, embedded multi-model database engine. Graph + Vector + Spatial + Full-Text in one pipeline.
+
+---
+
+## CRITICAL: Initialization Order
+
+```python
+# Python
+db = sekejap.SekejapDB("./data", capacity=1_000_000)
+db.init_hnsw(16)       # BEFORE inserting nodes with vectors
+db.init_fulltext()     # BEFORE inserting nodes with title/body
+db.schema().define("collection_name", '{"hot_fields":{"hash":["field1"],"range":["field2"]}}')
+# NOW insert data
+db.nodes().put("collection/key", json.dumps({...}))
+db.edges().link("src", "dst", "type", 1.0)
+db.flush()
+db.close()
+```
+
+```rust
+// Rust
+let db = SekejapDB::new(Path::new("./data"), 1_000_000)?;
+db.init_hnsw(16);
+db.init_fulltext(Path::new("./data"));
+db.schema().define("collection_name", r#"{"hot_fields":{"hash":["field1"],"range":["field2"]}}"#)?;
+db.nodes().put("collection/key", r#"{...}"#)?;
+db.edges().link("src", "dst", "type", 1.0)?;
+db.flush()?;
+```
+
+**Rules:**
+- `init_hnsw(m)` MUST be called before writing nodes that contain `vectors.dense`
+- `init_fulltext(path)` MUST be called before writing nodes that contain `title`/`body`/`content`
+- Nodes MUST exist before creating edges to/from them
+- Slugs follow `collection/key` format (e.g., `"persons/ali"`, `"crimes/robbery-001"`)
+
+---
+
+## Node JSON Format
+
+```json
+{
+    "_id": "collection/key",
+    "name": "Any custom field",
+    "status": "wanted",
+    "severity": 9.5,
+
+    "vectors": {
+        "dense": [0.12, 0.87, 0.34, ...]
+    },
+
+    "geo": {
+        "loc": {"lat": 3.1105, "lon": 101.6682}
+    },
+
+    "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[101.665, 3.128], [101.678, 3.128], [101.678, 3.135], [101.665, 3.128]]]
+    },
+
+    "title": "Title for fulltext search",
+    "body": "Body text for fulltext search"
+}
+```
+
+| Field | Type | Required | Purpose |
+|---|---|---|---|
+| `_id` | `"collection/key"` | For `put_json` only | Auto-detect slug |
+| `vectors.dense` | `[f32; 128]` | No | HNSW vector similarity search |
+| `geo.loc.lat`, `geo.loc.lon` | `f32` | No | Legacy point coordinates |
+| `geometry` | GeoJSON object | No | Full geometry (Point, Polygon, LineString, etc.) |
+| `title` | `string` | No | Fulltext title field |
+| `body` or `content` | `string` | No | Fulltext body field |
+| Any other field | Any JSON | No | Stored in payload, queryable via `where_*` |
+
+---
+
+## ALL Write Methods
+
+### NodeStore
+
+| Method | Signature | Returns | Description |
+|---|---|---|---|
+| `put` | `put(slug: &str, json: &str)` | `u32` (index) | Write single node with explicit slug |
+| `put_json` | `put_json(json: &str)` | `u32` | Write node, auto-detect slug from `_id` |
+| `put_many` | `put_many(items: &[(&str, &str)])` | `Vec<u32>` | Sequential batch write (SLOW, use ingest instead) |
+| `ingest` | `ingest(items: &[(&str, &str)])` | `Vec<u32>` | Fast batch: deferred indexes + parallel HNSW. 10-100x faster |
+| `ingest_raw` | `ingest_raw(items: &[(&str, &str)])` | `(Vec<u32>, Vec<u32>)` | Batch without HNSW. Call build_hnsw() after |
+| `build_hnsw` | `build_hnsw()` | `()` | Build HNSW index after ingest_raw() |
+| `get` | `get(slug: &str)` | `Option<String>` | Read raw JSON payload |
+| `remove` | `remove(slug: &str)` | `()` | Soft delete (tombstone) |
+
+### EdgeStore
+
+| Method | Signature | Returns | Description |
+|---|---|---|---|
+| `link` | `link(src, dst, type, weight: f32)` | `()` | Create directed typed weighted edge |
+| `link_meta` | `link_meta(src, dst, type, weight, meta_json)` | `()` | Edge with JSON metadata |
+| `unlink` | `unlink(src, dst, type)` | `()` | Soft delete edge |
+| `ingest` | `ingest(edges: &[(src, dst, type, weight)])` | `()` | Fast batch edges |
+
+### SchemaStore
+
+| Method | Signature | Returns | Description |
+|---|---|---|---|
+| `define` | `define(name, json)` | `()` | Define collection with hot-field indexes |
+| `count` | `count(name)` | `usize` | O(1) collection count |
+
+### System
+
+| Method | Signature | Returns | Description |
+|---|---|---|---|
+| `flush` | `flush()` | `()` | Persist all data to disk |
+| `backup` | `backup(path)` | `()` | Export all data as JSON |
+| `restore` | `restore(path)` | `()` | Import from backup JSON |
+| `describe` | `describe()` | JSON | Global database info |
+| `describe_collection` | `describe_collection(name)` | JSON | Collection-specific info |
+
+---
+
+## ALL Query Methods (Set Builder Chain)
+
+### Starters (every query begins with one)
+
+```rust
+db.nodes().one("slug")                // Single node
+db.nodes().many(&["slug1", "slug2"])  // Multiple nodes
+db.nodes().collection("name")        // All nodes in collection
+db.nodes().all()                      // All nodes in database
+```
+
+### Graph Traversal
+
+```rust
+.forward("edge_type")           // Outgoing edges
+.backward("edge_type")          // Incoming edges
+.hops(n)                        // Multi-hop BFS (n levels deep)
+.forward_parallel("edge_type")  // Parallel outgoing (Rayon)
+.backward_parallel("edge_type") // Parallel incoming
+.roots()                        // No incoming edges
+.leaves()                       // No outgoing edges
+```
+
+### Vector Search
+
+```rust
+.similar(&query_vec, k)         // Top-k HNSW nearest neighbors
+// query_vec: &[f32] (128 dims), k: usize
+// Requires init_hnsw(m) before data insertion
+```
+
+### Spatial Search
+
+```rust
+.near(lat, lon, radius_km)                    // Point + radius
+.within_bbox(min_lat, min_lon, max_lat, max_lon)  // Bounding box
+.st_within(polygon)                            // Geometry within polygon
+.st_contains(polygon)                          // Geometry contains polygon
+.st_intersects(polygon)                        // Geometry intersects polygon
+.st_dwithin(lat, lon, distance_km)             // Point + distance
+// polygon: Vec<[f32; 2]> of [lat, lon] pairs, ring must be closed
+```
+
+### Fulltext Search
+
+```rust
+.matching("search query")                      // Search title + body
+.matching_weighted("query", limit, title_w, content_w)  // Weighted
+// Requires init_fulltext(path) and feature = "fulltext"
+```
+
+### Payload Filters
+
+```rust
+.where_eq("field", json_value)       // field == value
+.where_gt("field", threshold)        // field > threshold
+.where_lt("field", threshold)        // field < threshold
+.where_gte("field", threshold)       // field >= threshold
+.where_lte("field", threshold)       // field <= threshold
+.where_between("field", lo, hi)      // lo <= field <= hi
+.where_in("field", vec![values])     // field IN values
+// Hot fields (defined in schema) use O(1)/O(log N) indexes
+// Cold fields scan JSON (slower)
+```
+
+### Set Algebra
+
+```rust
+.intersect(other_set)    // AND: keep nodes in both sets
+.union(other_set)        // OR: merge both sets
+.subtract(other_set)     // MINUS: remove other from current
+```
+
+### Ordering & Pagination
+
+```rust
+.sort("field", ascending)   // Sort by JSON field (bool: true=asc, false=desc)
+.skip(n)                    // Skip first n results
+.take(n)                    // Limit to n results
+.select(&["f1", "f2"])     // Project only these fields
+```
+
+### Terminal Methods (execute the query)
+
+```rust
+.collect()?       // -> Outcome<Vec<Hit>>       All matching hits with payloads
+.count()?         // -> Outcome<usize>           Count only
+.first()?         // -> Outcome<Option<Hit>>     First hit or None
+.exists()?        // -> Outcome<bool>            Any results?
+.avg("field")?    // -> Outcome<f64>             Average of numeric field
+.sum("field")?    // -> Outcome<f64>             Sum of numeric field
+.edge_collect()?  // -> Outcome<Vec<EdgeHit>>    All outgoing edges from candidates
+.explain()        // -> Plan                     Compile without executing
+```
+
+---
+
+## SekejapQL Text Query Language
+
+One op per line. Same execution as fluent builder.
+
+```
+# Format: op_name arg1 arg2 ...
+# Strings in quotes, numbers bare
+# Pipe style also works: op1 | op2 | op3
+
+one "persons/ali"
+forward "member_of"
+backward "member_of"
+forward "committed"
+near 3.1291 101.6710 2.0
+where_eq "status" "wanted"
+sort "severity" desc
+take 10
+select "name" "alias" "geo"
+```
+
+### All SekejapQL Ops
+
+| Op | Args | Example |
+|---|---|---|
+| `one` | `"slug"` | `one "persons/ali"` |
+| `many` | `"s1" "s2" ...` | `many "persons/ali" "persons/bob"` |
+| `collection` | `"name"` | `collection "crimes"` |
+| `all` | — | `all` |
+| `forward` | `"type"` | `forward "committed"` |
+| `backward` | `"type"` | `backward "committed"` |
+| `hops` | `n` | `hops 3` |
+| `similar` | `"slug" k` | `similar "persons/ali" 10` |
+| `near` | `lat lon radius_km` | `near 3.13 101.67 1.0` |
+| `spatial_within_bbox` | `minlat minlon maxlat maxlon` | `spatial_within_bbox 3.1 101.6 3.2 101.7` |
+| `spatial_within_polygon` | `(lat,lon) ...` | `spatial_within_polygon (3.1,101.6) (3.2,101.7) ...` |
+| `st_within` | `(lat,lon) ...` | `st_within (3.1,101.6) (3.2,101.7) ...` |
+| `st_contains` | `(lat,lon) ...` | `st_contains (3.1,101.6) ...` |
+| `st_intersects` | `(lat,lon) ...` | `st_intersects (3.1,101.6) ...` |
+| `st_dwithin` | `lat lon dist_km` | `st_dwithin 3.13 101.67 1.0` |
+| `matching` | `"query"` | `matching "robbery Bangsar"` |
+| `where_eq` | `"field" value` | `where_eq "status" "wanted"` |
+| `where_gt` | `"field" value` | `where_gt "severity" 7` |
+| `where_lt` | `"field" value` | `where_lt "severity" 5` |
+| `where_gte` | `"field" value` | `where_gte "severity" 7` |
+| `where_lte` | `"field" value` | `where_lte "severity" 5` |
+| `where_between` | `"field" lo hi` | `where_between "severity" 5 9` |
+| `where_in` | `"field" "v1" "v2" ...` | `where_in "type" "robbery" "assault"` |
+| `sort` | `"field" asc\|desc` | `sort "severity" desc` |
+| `skip` | `n` | `skip 20` |
+| `take` | `n` | `take 10` |
+| `select` | `"f1" "f2" ...` | `select "name" "geo" "status"` |
+
+### Execute SekejapQL
+
+```python
+# Python
+result = db.query_skql('collection "crimes"\nwhere_eq "type" "robbery"\ntake 20')
+count = db.query_skql_count('collection "crimes"\nnear 3.13 101.67 1.0')
+plan = db.explain_skql('collection "crimes"\ntake 20')
+```
+
+```rust
+// Rust
+let result = db.query("collection \"crimes\"\nwhere_eq \"type\" \"robbery\"\ntake 20")?;
+let count = db.count("collection \"crimes\"\nnear 3.13 101.67 1.0")?;
+let plan = db.explain("collection \"crimes\"\ntake 20")?;
+```
+
+---
+
+## JSON Pipeline Format
+
+```json
+{"pipeline": [
+    {"op": "collection", "name": "crimes"},
+    {"op": "where_eq", "field": "type", "value": "robbery"},
+    {"op": "near", "lat": 3.13, "lon": 101.67, "radius": 1.0},
+    {"op": "forward", "edge_type": "committed"},
+    {"op": "backward", "edge_type": "committed"},
+    {"op": "hops", "n": 3},
+    {"op": "similar", "slug": "persons/ali", "k": 10},
+    {"op": "matching", "text": "robbery", "limit": 100, "title_weight": 2.0, "content_weight": 1.0},
+    {"op": "st_within", "polygon": [[3.1, 101.6], [3.2, 101.7], ...]},
+    {"op": "sort", "field": "severity", "asc": false},
+    {"op": "take", "n": 20},
+    {"op": "select", "fields": ["name", "geo"]},
+    {"op": "intersect", "pipeline": [...]},
+    {"op": "union", "pipeline": [...]},
+    {"op": "subtract", "pipeline": [...]}
+]}
+```
+
+---
+
+## Mutation JSON Format
+
+```json
+{"mutation": "put_json", "data": {"_id": "crimes/001", "type": "robbery"}}
+{"mutation": "link", "source": "persons/ali", "target": "crimes/001", "type": "committed", "weight": 1.0}
+{"mutation": "link_meta", "source": "persons/ali", "target": "crimes/001", "type": "committed", "weight": 1.0, "meta_json": "{\"role\":\"mastermind\"}"}
+{"mutation": "remove", "slug": "crimes/001"}
+{"mutation": "unlink", "source": "persons/ali", "target": "crimes/001", "type": "committed"}
+```
+
+---
+
+## Return Types
+
+```rust
+struct Hit {
+    idx: u32,                    // Internal index
+    slug_hash: u64,              // Hash of "collection/key"
+    collection_hash: u64,        // Hash of collection name
+    payload: Option<String>,     // JSON payload string
+    lat: f32, lon: f32,          // Coordinates
+    score: Option<f32>,          // Similarity/fulltext score
+}
+
+struct EdgeHit {
+    from_idx: u32, to_idx: u32,
+    from_slug_hash: u64, to_slug_hash: u64,
+    edge_type_hash: u64,
+    weight: f32,
+    timestamp: u64,
+    meta: Option<String>,        // Edge metadata JSON
+}
+
+struct Outcome<T> {
+    data: T,                     // Vec<Hit>, usize, bool, etc.
+    trace: Trace,                // Step-by-step execution timing
+}
+
+struct Trace {
+    steps: Vec<StepReport>,      // Per-step: atom, input_size, output_size, index_used, time_us
+    total_us: u64,
+}
+```
+
+---
+
+## Schema Definition
+
+```json
+{
+    "hot_fields": {
+        "hash": ["status", "type"],
+        "range": ["severity", "timestamp"]
+    }
+}
+```
+
+- `hash` fields: O(1) equality lookups for `where_eq`
+- `range` fields: O(log N) range lookups for `where_between`, `where_gt`, etc.
+- Fields NOT in hot_fields still work with `where_*` but scan JSON (slower)
+
+---
+
+## Cargo Features
+
+```toml
+sekejap = "0.3"                                          # Core only
+sekejap = { version = "0.3", features = ["fulltext"] }   # + Tantivy fulltext
+sekejap = { version = "0.3", features = ["fulltext-seekstorm"] }  # + SeekStorm (needs RUSTFLAGS)
+sekejap = { version = "0.3", features = ["parallel"] }   # + Parallel graph traversal
+```
+
+---
+
+## Performance
+
+| Operation | Complexity | Benchmark (10k records) |
+|---|---|---|
+| `ingest()` batch | O(N log N) | ~0.27s (without HNSW), ~0.53s (with HNSW) |
+| `put()` single | O(1) amortized | ~0.15ms per record |
+| `get()` | O(1) | ~1.8us |
+| `similar()` k-NN | O(log N) | 0.6ms for top-10 |
+| `near()` / `within_bbox()` | O(log N) | 0.5-0.9ms |
+| `matching()` fulltext | O(index) | ~23ms (Tantivy cold), ~2ms (warm) |
+| `forward().hops(3)` | O(degree × hops) | 0.013ms per traversal |
+| `where_eq` (hot field) | O(1) | ~0.01ms |
+| `collection().count()` | O(1) | ~0.001ms |
+| `flush()` | O(data) | ~5ms |
+
+---
+
+## Common Patterns
+
+### Build a knowledge graph
+```python
+# 1. Setup
+db = sekejap.SekejapDB("./data", capacity=100_000)
+db.init_hnsw(16)
+db.init_fulltext()
+db.schema().define("persons", '{"hot_fields":{"hash":["status","role"]}}')
+db.schema().define("crimes", '{"hot_fields":{"hash":["type","status"],"range":["severity"]}}')
+
+# 2. Batch ingest nodes
+nodes = [(f"persons/{i}", json.dumps({...})) for i in range(10000)]
+db.nodes().ingest(nodes)
+
+# 3. Batch ingest edges
+edges = [("persons/ali", "crimes/001", "committed", 1.0), ...]
+db.edges().ingest(edges)
+
+db.flush()
+```
+
+### Multi-model query pipeline
+```
+# Start from text search, traverse graph, filter by location
+collection "articles"
+matching "armed robbery 2024"
+forward "reports"
+backward "committed"
+near 3.13 101.67 5.0
+where_eq "status" "wanted"
+sort "severity" desc
+take 20
+select "name" "alias" "geo" "priors"
+```
+
+### Hybrid vector + spatial search (Rust)
+```rust
+let spatial = db.nodes().all().within_bbox(min_lat, min_lon, max_lat, max_lon).collect()?;
+let spatial_ids: HashSet<u32> = spatial.data.iter().map(|h| h.idx).collect();
+let similar = db.nodes().all().similar(&query_vec, 100).collect()?;
+let combined: Vec<&Hit> = similar.data.iter()
+    .filter(|h| spatial_ids.contains(&h.idx))
+    .take(10).collect();
+```

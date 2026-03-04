@@ -47,27 +47,51 @@ pub struct SearchResult {
     pub dist: f32,
 }
 
+/// Visited-node tracker using a compact bitset instead of HashSet.
+/// For N nodes: N/64 u64 words. At 10k nodes = 1.25 KB (fits in L1 cache).
+/// `reset()` is a fast memset. `is_visited`/`mark_visited` are single bit ops.
 pub struct SearchContext {
-    visited: std::collections::HashSet<u32>,
+    visited: Vec<u64>,
 }
 
 impl SearchContext {
-    pub fn new(_capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
+        let words = (capacity + 63) / 64;
         Self {
-            visited: std::collections::HashSet::new(),
+            visited: vec![0u64; words],
         }
     }
 
+    #[inline(always)]
     pub fn reset(&mut self) {
-        self.visited.clear();
+        for w in self.visited.iter_mut() {
+            *w = 0;
+        }
     }
 
+    #[inline(always)]
     pub fn is_visited(&self, id: u32) -> bool {
-        self.visited.contains(&id)
+        let word = (id as usize) >> 6;
+        let bit = (id as usize) & 63;
+        word < self.visited.len() && (self.visited[word] >> bit) & 1 == 1
     }
 
+    #[inline(always)]
     pub fn mark_visited(&mut self, id: u32) {
-        self.visited.insert(id);
+        let word = (id as usize) >> 6;
+        let bit = (id as usize) & 63;
+        if word >= self.visited.len() {
+            self.visited.resize(word + 1, 0);
+        }
+        self.visited[word] |= 1u64 << bit;
+    }
+
+    /// Grow bitset to cover at least `capacity` node indices.
+    pub fn ensure_capacity(&mut self, capacity: usize) {
+        let needed = (capacity + 63) / 64;
+        if needed > self.visited.len() {
+            self.visited.resize(needed, 0);
+        }
     }
 }
 
@@ -105,9 +129,19 @@ pub fn search_layer<D: Distance>(
         }
 
         if let Some(neighbors) = graph.get_neighbors(current.id, layer, &guard) {
-            for &nb_id in neighbors {
+            // Prefetch first neighbor before the loop
+            if let Some(&first_nb) = neighbors.first() {
+                storage.prefetch(first_nb);
+            }
+
+            for (j, &nb_id) in neighbors.iter().enumerate() {
                 if !ctx.is_visited(nb_id) {
                     ctx.mark_visited(nb_id);
+
+                    // Prefetch next neighbor's vector while computing current distance
+                    if let Some(&next_nb) = neighbors.get(j + 1) {
+                        storage.prefetch(next_nb);
+                    }
 
                     let dist = D::eval(query, storage.get(nb_id));
 
