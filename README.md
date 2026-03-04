@@ -143,6 +143,7 @@ See [`docs/benchmark-results.md`](docs/benchmark-results.md) for full Rust vs Py
 ## Full Documentation
 
 See the [`docs/`](docs/) folder:
+- [`docs/skill.md`](docs/skill.md) — Skill guide for AI agents and developers (setup recipes, all query ops, common patterns, gotchas)
 - [`docs/api-reference.md`](docs/api-reference.md) — Complete API reference (setup, schema, mutations, all SekejapQL ops, JSON pipeline, data conventions, performance)
 - [`docs/interface-table.md`](docs/interface-table.md) — Interface inventory and status
 - [`docs/roadmap.md`](docs/roadmap.md) — Development roadmap and execution notes
