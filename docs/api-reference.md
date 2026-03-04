@@ -14,7 +14,7 @@ Every piece of data is a **node** identified by a `slug` (`collection/key`). Nod
 Nodes are connected by typed, weighted, directed **edges**.
 
 ```
-Node "persons/ali"  ──[committed]──►  Node "crimes/robbery-001"
+Node "persons/lucci"  ──[committed]──►  Node "crimes/robbery-001"
                                               │
                                         [occurred_at]
                                               │
@@ -81,14 +81,14 @@ db.nodes().put("crimes/robbery-001", r#"{"type":"robbery","severity":9,"status":
 ### Node with vector + geo + fulltext fields
 
 ```python
-db.put("persons/ali", json.dumps({
-    "name": "Ali Hassan",
+db.put("persons/lucci", json.dumps({
+    "name": "Rob Lucci",
     "status": "wanted",
     "priors": ["robbery", "assault"],
     "vectors": {"dense": [0.12, 0.87, ...]},  # 128 floats
     "geo": {"loc": {"lat": 3.1105, "lon": 101.6682}},  # legacy point format
-    "title": "Ali Hassan",
-    "content": "Known associate of Lembah Pantai gang, armed robbery specialist"
+    "title": "Rob Lucci",
+    "content": "Known associate of CP9, covert operations specialist"
 }))
 
 # GeoJSON geometry — Point, Polygon, LineString, etc.
@@ -109,14 +109,14 @@ db.put("zones/bangsar-south", json.dumps({
 
 **Python**
 ```python
-items = [("persons/ali", json.dumps({...})), ("crimes/001", json.dumps({...}))]
+items = [("persons/lucci", json.dumps({...})), ("crimes/001", json.dumps({...}))]
 db.ingest_nodes(items)
 db.build_hnsw()   # call after ingest_nodes if using vectors
 ```
 
 **Rust**
 ```rust
-db.nodes().ingest(&[("persons/ali", r#"{...}"#), ("crimes/001", r#"{...}"#)])?;
+db.nodes().ingest(&[("persons/lucci", r#"{...}"#), ("crimes/001", r#"{...}"#)])?;
 // or: ingest_raw() then build_hnsw() separately
 db.nodes().build_hnsw()?;
 ```
@@ -134,18 +134,18 @@ db.remove("crimes/robbery-001")
 
 ```python
 # Basic directed edge
-db.link("persons/ali", "crimes/robbery-001", "committed", 1.0)
+db.link("persons/lucci", "crimes/robbery-001", "committed", 1.0)
 
 # Edge with metadata
-db.link_meta("persons/ali", "crimes/robbery-001", "committed", 1.0,
+db.link_meta("persons/lucci", "crimes/robbery-001", "committed", 1.0,
              '{"role":"mastermind","timestamp":"2024-11-03T14:32:00+08:00"}')
 
 # Remove edge
-db.unlink("persons/ali", "crimes/robbery-001", "committed")
+db.unlink("persons/lucci", "crimes/robbery-001", "committed")
 
 # Batch edges (fast path)
 db.ingest_edges([
-    ("persons/ali",   "crimes/robbery-001", "committed", 1.0),
+    ("persons/lucci",   "crimes/robbery-001", "committed", 1.0),
     ("crimes/robbery-001", "locations/cimb", "occurred_at", 1.0),
 ])
 ```
@@ -197,9 +197,9 @@ let steps  = db.explain_skql("collection \"crimes\"\ntake 20")?;  // compile-onl
 | `all` | — | Every node in the database |
 
 ```
-one "persons/ali"
+one "persons/lucci"
 collection "crimes"
-many "persons/ali" "persons/zul" "persons/hafiz"
+many "persons/lucci" "persons/kaku" "persons/jabra"
 ```
 
 ---
@@ -221,13 +221,13 @@ many "persons/ali" "persons/zul" "persons/hafiz"
 one "crimes/robbery-001"
 backward "committed"
 
-# All members of the same gang as Ali
-one "persons/ali"
+# All members of the same gang as Lucci
+one "persons/lucci"
 forward "member_of"
 backward "member_of"
 
 # Full network up to 3 hops
-one "persons/ali"
+one "persons/lucci"
 forward "associate_of"
 hops 3
 ```
@@ -242,10 +242,10 @@ hops 3
 
 ```
 # Find persons with similar criminal profile (k=10)
-similar "persons/ali" 10
+similar "persons/lucci" 10
 
 # Narrow by status after vector search
-similar "persons/ali" 20
+similar "persons/lucci" 20
 where_eq "status" "wanted"
 ```
 
@@ -476,7 +476,7 @@ select "name" "alias" "geo" "address"
 
 **Full gang network → their crimes → crime locations in Bangsar polygon:**
 ```
-one "persons/ali"
+one "persons/lucci"
 forward "member_of"
 backward "member_of"
 forward "committed"
@@ -494,7 +494,7 @@ forward "reported_by"
 backward "committed"
 forward "member_of"
 backward "member_of"
-similar "persons/ali" 20
+similar "persons/lucci" 20
 where_eq "status" "wanted"
 select "name" "alias" "priors" "geo"
 take 50
@@ -557,16 +557,16 @@ let steps   = db.explain(r#"{"pipeline": [...]}"#)?;
 db.mutate('{"mutation":"put_json","data":{"_id":"crimes/001","type":"robbery"}}')
 
 # Create edge
-db.mutate('{"mutation":"link","source":"persons/ali","target":"crimes/001","type":"committed","weight":1.0}')
+db.mutate('{"mutation":"link","source":"persons/lucci","target":"crimes/001","type":"committed","weight":1.0}')
 
 # Create edge with metadata
-db.mutate('{"mutation":"link_meta","source":"persons/ali","target":"crimes/001","type":"committed","weight":1.0,"meta_json":"{\"role\":\"mastermind\"}"}')
+db.mutate('{"mutation":"link_meta","source":"persons/lucci","target":"crimes/001","type":"committed","weight":1.0,"meta_json":"{\"role\":\"mastermind\"}"}')
 
 # Remove node
 db.mutate('{"mutation":"remove","slug":"crimes/001"}')
 
 # Remove edge
-db.mutate('{"mutation":"unlink","source":"persons/ali","target":"crimes/001","type":"committed"}')
+db.mutate('{"mutation":"unlink","source":"persons/lucci","target":"crimes/001","type":"committed"}')
 ```
 
 ---
@@ -664,15 +664,15 @@ Complete method listing for both Rust and Python. All methods are available on b
 **Rust-only typed query builder** (no Python equivalent — use `query_skql` from Python):
 ```rust
 db.nodes().collection("crimes").near(3.13, 101.67, 1.0).where_eq("status", "open").take(20).collect()?;
-db.nodes().one("persons/ali").forward("committed").collect()?;
+db.nodes().one("persons/lucci").forward("committed").collect()?;
 db.nodes().all().similar(&vec, 10).collect()?;
 ```
 
 **Python-only convenience shortcuts** (wraps the fluent builder):
 ```python
-db.one("persons/ali")                     # → single PyHit or None
+db.one("persons/lucci")                     # → single PyHit or None
 db.collection("crimes")                   # → list[PyHit]
-db.forward("persons/ali", "committed", max_hops=1)
+db.forward("persons/lucci", "committed", max_hops=1)
 db.backward("crimes/001", "committed")
 db.near(3.1291, 101.6710, 1.0)           # across all nodes
 db.similar(query_vec, k=10)

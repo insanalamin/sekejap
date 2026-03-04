@@ -34,7 +34,7 @@ db.flush()?;
 - `init_hnsw(m)` MUST be called before writing nodes that contain `vectors.dense`
 - `init_fulltext(path)` MUST be called before writing nodes that contain `title`/`body`/`content`
 - Nodes MUST exist before creating edges to/from them
-- Slugs follow `collection/key` format (e.g., `"persons/ali"`, `"crimes/robbery-001"`)
+- Slugs follow `collection/key` format (e.g., `"persons/lucci"`, `"crimes/robbery-001"`)
 
 ---
 
@@ -226,7 +226,7 @@ One op per line. Same execution as fluent builder.
 # Strings in quotes, numbers bare
 # Pipe style also works: op1 | op2 | op3
 
-one "persons/ali"
+one "persons/lucci"
 forward "member_of"
 backward "member_of"
 forward "committed"
@@ -241,14 +241,14 @@ select "name" "alias" "geo"
 
 | Op | Args | Example |
 |---|---|---|
-| `one` | `"slug"` | `one "persons/ali"` |
-| `many` | `"s1" "s2" ...` | `many "persons/ali" "persons/bob"` |
+| `one` | `"slug"` | `one "persons/lucci"` |
+| `many` | `"s1" "s2" ...` | `many "persons/lucci" "persons/kaku"` |
 | `collection` | `"name"` | `collection "crimes"` |
 | `all` | — | `all` |
 | `forward` | `"type"` | `forward "committed"` |
 | `backward` | `"type"` | `backward "committed"` |
 | `hops` | `n` | `hops 3` |
-| `similar` | `"slug" k` | `similar "persons/ali" 10` |
+| `similar` | `"slug" k` | `similar "persons/lucci" 10` |
 | `near` | `lat lon radius_km` | `near 3.13 101.67 1.0` |
 | `spatial_within_bbox` | `minlat minlon maxlat maxlon` | `spatial_within_bbox 3.1 101.6 3.2 101.7` |
 | `spatial_within_polygon` | `(lat,lon) ...` | `spatial_within_polygon (3.1,101.6) (3.2,101.7) ...` |
@@ -297,7 +297,7 @@ let plan = db.explain("collection \"crimes\"\ntake 20")?;
     {"op": "forward", "edge_type": "committed"},
     {"op": "backward", "edge_type": "committed"},
     {"op": "hops", "n": 3},
-    {"op": "similar", "slug": "persons/ali", "k": 10},
+    {"op": "similar", "slug": "persons/lucci", "k": 10},
     {"op": "matching", "text": "robbery", "limit": 100, "title_weight": 2.0, "content_weight": 1.0},
     {"op": "st_within", "polygon": [[3.1, 101.6], [3.2, 101.7], ...]},
     {"op": "sort", "field": "severity", "asc": false},
@@ -315,10 +315,10 @@ let plan = db.explain("collection \"crimes\"\ntake 20")?;
 
 ```json
 {"mutation": "put_json", "data": {"_id": "crimes/001", "type": "robbery"}}
-{"mutation": "link", "source": "persons/ali", "target": "crimes/001", "type": "committed", "weight": 1.0}
-{"mutation": "link_meta", "source": "persons/ali", "target": "crimes/001", "type": "committed", "weight": 1.0, "meta_json": "{\"role\":\"mastermind\"}"}
+{"mutation": "link", "source": "persons/lucci", "target": "crimes/001", "type": "committed", "weight": 1.0}
+{"mutation": "link_meta", "source": "persons/lucci", "target": "crimes/001", "type": "committed", "weight": 1.0, "meta_json": "{\"role\":\"mastermind\"}"}
 {"mutation": "remove", "slug": "crimes/001"}
-{"mutation": "unlink", "source": "persons/ali", "target": "crimes/001", "type": "committed"}
+{"mutation": "unlink", "source": "persons/lucci", "target": "crimes/001", "type": "committed"}
 ```
 
 ---
@@ -418,7 +418,7 @@ nodes = [(f"persons/{i}", json.dumps({...})) for i in range(10000)]
 db.nodes().ingest(nodes)
 
 # 3. Batch ingest edges
-edges = [("persons/ali", "crimes/001", "committed", 1.0), ...]
+edges = [("persons/lucci", "crimes/001", "committed", 1.0), ...]
 db.edges().ingest(edges)
 
 db.flush()

@@ -29,12 +29,12 @@ db.init_hnsw(16)
 db.init_fulltext()
 
 # Write
-db.put("persons/ali", json.dumps({
-    "name": "Ali Hassan", "status": "wanted",
+db.put("persons/lucci", json.dumps({
+    "name": "Rob Lucci", "status": "wanted",
     "vectors": {"dense": [0.12, 0.87, ...]},
     "geo": {"loc": {"lat": 3.1105, "lon": 101.6682}}
 }))
-db.link("persons/ali", "crimes/robbery-001", "committed", 1.0)
+db.link("persons/lucci", "crimes/robbery-001", "committed", 1.0)
 
 # Query — SekejapQL
 result = db.query_skql("""
@@ -58,8 +58,8 @@ let db = SekejapDB::new(std::path::Path::new("./data"), 1_000_000)?;
 db.init_hnsw(16);
 db.init_fulltext(std::path::Path::new("./data"));
 
-db.nodes().put("persons/ali", r#"{"name":"Ali Hassan","status":"wanted"}"#)?;
-db.edges().link("persons/ali", "crimes/robbery-001", "committed", 1.0)?;
+db.nodes().put("persons/lucci", r#"{"name":"Rob Lucci","status":"wanted"}"#)?;
+db.edges().link("persons/lucci", "crimes/robbery-001", "committed", 1.0)?;
 
 // SekejapQL (auto-detected — anything not starting with '{')
 let result = db.query("collection \"crimes\"\nwhere_eq \"type\" \"robbery\"\ntake 20")?;
@@ -81,7 +81,7 @@ let result = db.nodes().collection("crimes")
 
 ```
 # Find all gang members → their crimes → near a location
-one "persons/ali"
+one "persons/lucci"
 forward "member_of"
 backward "member_of"
 forward "committed"
@@ -116,7 +116,7 @@ Pipe style also works: `collection "crimes" | where_eq "type" "robbery" | near 3
 cargo run -p skcli -- --path ./data
 
 sekejap> collection "crimes" | where_eq "type" "robbery" | take 10
-sekejap> one "persons/ali" | forward "committed"
+sekejap> one "persons/lucci" | forward "committed"
 sekejap> count collection "crimes"
 sekejap> explain collection "crimes" | take 5
 sekejap> mutate {"mutation":"put_json","data":{"_id":"crimes/001","type":"robbery"}}

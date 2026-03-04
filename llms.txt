@@ -34,10 +34,10 @@ db.init_fulltext(std::path::Path::new("./data")); // enable fulltext
 db.schema().define("persons", r#"{"hot_fields":{"hash":["status"],"range":["severity"]}}"#)?;
 
 // Write node
-db.nodes().put("persons/ali", r#"{"name":"Ali","status":"wanted","vectors":{"dense":[0.1,0.2,...]},"geo":{"loc":{"lat":3.11,"lon":101.67}},"title":"Ali","body":"Known criminal"}"#)?;
+db.nodes().put("persons/lucci", r#"{"name":"Rob Lucci","status":"wanted","vectors":{"dense":[0.1,0.2,...]},"geo":{"loc":{"lat":3.11,"lon":101.67}},"title":"Rob Lucci","body":"Covert operations specialist"}"#)?;
 
 // Write edge
-db.edges().link("persons/ali", "crimes/robbery-001", "committed", 1.0)?;
+db.edges().link("persons/lucci", "crimes/robbery-001", "committed", 1.0)?;
 
 // Query
 let result = db.nodes().collection("crimes")
@@ -57,13 +57,13 @@ db = sekejap.SekejapDB("./data", capacity=1_000_000)
 db.init_hnsw(16)
 db.init_fulltext()
 
-db.nodes().put("persons/ali", json.dumps({
-    "name": "Ali", "status": "wanted",
+db.nodes().put("persons/lucci", json.dumps({
+    "name": "Rob Lucci", "status": "wanted",
     "vectors": {"dense": [0.1, 0.2, ...]},
     "geo": {"loc": {"lat": 3.11, "lon": 101.67}},
-    "title": "Ali", "body": "Known criminal"
+    "title": "Rob Lucci", "body": "Covert operations specialist"
 }))
-db.edges().link("persons/ali", "crimes/robbery-001", "committed", 1.0)
+db.edges().link("persons/lucci", "crimes/robbery-001", "committed", 1.0)
 
 result = db.query_skql("""
     collection "crimes"
@@ -125,15 +125,15 @@ db.close()
 
 ```rust
 // Single write
-db.nodes().put("persons/ali", r#"{"name":"Ali"}"#)?;          // -> u32 (index)
-db.nodes().put_json(r#"{"_id":"persons/ali","name":"Ali"}"#)?; // auto-detect slug from _id
+db.nodes().put("persons/lucci", r#"{"name":"Rob Lucci"}"#)?;          // -> u32 (index)
+db.nodes().put_json(r#"{"_id":"persons/lucci","name":"Rob Lucci"}"#)?; // auto-detect slug from _id
 
 // Read / Delete
-let json: Option<String> = db.nodes().get("persons/ali");
-db.nodes().remove("persons/ali")?;
+let json: Option<String> = db.nodes().get("persons/lucci");
+db.nodes().remove("persons/lucci")?;
 
 // Batch (FAST — 10-100x faster than put())
-db.nodes().ingest(&[("persons/ali", r#"{...}"#), ("persons/bob", r#"{...}"#)])?;
+db.nodes().ingest(&[("persons/lucci", r#"{...}"#), ("persons/kaku", r#"{...}"#)])?;
 // Or split: ingest_raw (no HNSW) then build_hnsw separately
 db.nodes().ingest_raw(&items)?;
 db.nodes().build_hnsw()?;
@@ -142,11 +142,11 @@ db.nodes().build_hnsw()?;
 ### Rust — EdgeStore
 
 ```rust
-db.edges().link("persons/ali", "crimes/001", "committed", 1.0)?;
-db.edges().link_meta("persons/ali", "crimes/001", "committed", 1.0, r#"{"role":"mastermind"}"#)?;
-db.edges().unlink("persons/ali", "crimes/001", "committed")?;
+db.edges().link("persons/lucci", "crimes/001", "committed", 1.0)?;
+db.edges().link_meta("persons/lucci", "crimes/001", "committed", 1.0, r#"{"role":"mastermind"}"#)?;
+db.edges().unlink("persons/lucci", "crimes/001", "committed")?;
 // Batch
-db.edges().ingest(&[("persons/ali", "crimes/001", "committed", 1.0)])?;
+db.edges().ingest(&[("persons/lucci", "crimes/001", "committed", 1.0)])?;
 ```
 
 ### Rust — SchemaStore
@@ -159,15 +159,15 @@ db.schema().count("crimes"); // -> usize (O(1))
 ### Python
 
 ```python
-db.nodes().put("persons/ali", json.dumps({"name": "Ali"}))
-db.nodes().get("persons/ali")     # -> str or None
-db.nodes().remove("persons/ali")
-db.nodes().ingest([("persons/ali", json.dumps({...})), ...])
+db.nodes().put("persons/lucci", json.dumps({"name": "Rob Lucci"}))
+db.nodes().get("persons/lucci")     # -> str or None
+db.nodes().remove("persons/lucci")
+db.nodes().ingest([("persons/lucci", json.dumps({...})), ...])
 
-db.edges().link("persons/ali", "crimes/001", "committed", 1.0)
-db.edges().link_meta("persons/ali", "crimes/001", "committed", 1.0, '{"role":"mastermind"}')
-db.edges().unlink("persons/ali", "crimes/001", "committed")
-db.edges().ingest([("persons/ali", "crimes/001", "committed", 1.0), ...])
+db.edges().link("persons/lucci", "crimes/001", "committed", 1.0)
+db.edges().link_meta("persons/lucci", "crimes/001", "committed", 1.0, '{"role":"mastermind"}')
+db.edges().unlink("persons/lucci", "crimes/001", "committed")
+db.edges().ingest([("persons/lucci", "crimes/001", "committed", 1.0), ...])
 
 db.schema().define("crimes", '{"hot_fields":{"hash":["type"],"range":["severity"]}}')
 db.schema().count("crimes")
@@ -182,8 +182,8 @@ All queries start from a `Set` and chain operations. Terminal methods execute th
 ### Starters
 
 ```rust
-db.nodes().one("persons/ali")           // Single node by slug
-db.nodes().many(&["persons/ali", "persons/bob"])  // Multiple slugs
+db.nodes().one("persons/lucci")           // Single node by slug
+db.nodes().many(&["persons/lucci", "persons/kaku"])  // Multiple slugs
 db.nodes().collection("crimes")         // All nodes in collection
 db.nodes().all()                        // All nodes
 ```
@@ -292,7 +292,7 @@ let result = db.nodes().all()
     .collect()?;
 
 // Multi-hop graph traversal
-let result = db.nodes().one("persons/ali")
+let result = db.nodes().one("persons/lucci")
     .forward("follows")
     .hops(3)
     .collect()?;
@@ -306,8 +306,8 @@ One op per line, or pipe-separated. Compiles to same pipeline as fluent builder.
 
 ```
 # Starters
-one "persons/ali"
-many "persons/ali" "persons/bob"
+one "persons/lucci"
+many "persons/lucci" "persons/kaku"
 collection "crimes"
 all
 
@@ -317,7 +317,7 @@ backward "committed"
 hops 3
 
 # Vector
-similar "persons/ali" 10
+similar "persons/lucci" 10
 
 # Spatial
 near 3.1291 101.6710 1.0
@@ -382,9 +382,9 @@ let result = db.query(r#"{"pipeline":[...]}"#)?;
 
 ```rust
 db.mutate(r#"{"mutation":"put_json","data":{"_id":"crimes/001","type":"robbery"}}"#)?;
-db.mutate(r#"{"mutation":"link","source":"persons/ali","target":"crimes/001","type":"committed","weight":1.0}"#)?;
+db.mutate(r#"{"mutation":"link","source":"persons/lucci","target":"crimes/001","type":"committed","weight":1.0}"#)?;
 db.mutate(r#"{"mutation":"remove","slug":"crimes/001"}"#)?;
-db.mutate(r#"{"mutation":"unlink","source":"persons/ali","target":"crimes/001","type":"committed"}"#)?;
+db.mutate(r#"{"mutation":"unlink","source":"persons/lucci","target":"crimes/001","type":"committed"}"#)?;
 ```
 
 ---
