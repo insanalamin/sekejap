@@ -19,7 +19,7 @@ Completed now:
 # SeKejap Plan (SeKejap First, then ToraJu)
 
 ## Scope Lock
-- Priority order: **Graph -> Vector -> Spatial -> Fulltext**.
+- Priority order: **Graph -> Vector -> Spatial -> Temporal -> Fulltext**.
 - Keep atomic core as ground truth (`nodes/edges/schema`).
 - Keep one unified high-level interface: `query` and `mutate`.
 - No ToraJu implementation work before SeKejap contract + tests are stable.
@@ -57,11 +57,72 @@ Completed now:
 
 ## Next (SeKejap-only)
 
+### Phase 0: Temporal Index Foundation
+- Add first-class vague-time support as a dedicated engine module:
+  - `src/index/time_index.rs`
+- Keep canonical app storage external/file-based; SeKejap remains the derived local engine.
+- Do not reduce temporal support to a single timestamp field or only `where_between`.
+- Preserve spatial radius as a first-class composable filter with temporal overlap.
+
+### Phase 0.1: Temporal Data Contract
+- Freeze canonical compiled temporal entry fields:
+  - `start_year`
+  - `end_year`
+  - `expanded_start_year`
+  - `expanded_end_year`
+  - `month_mask`
+  - `weekday_mask`
+  - `day_of_month_mask`
+  - `time_of_day_start`
+  - `time_of_day_end`
+  - `time_of_day_fuzzy_radius`
+  - `recurrence_step_months`
+  - `global_fuzziness`
+- Freeze payload parsing contract for vague time input field (`time` / `_time`).
+- Add contract examples in docs for:
+  - exact time
+  - fuzzy year range
+  - month-only range
+  - weekday + time-of-day recurrence
+  - deep-history range
+
+### Phase 0.2: Temporal Query Ops
+- Add first-class query steps:
+  - `time_intersects`
+  - `time_within`
+  - `time_near`
+- Keep these composable with:
+  - graph traversal
+  - spatial radius queries
+  - vector ranking
+- Add `explain()` support so temporal steps appear in execution traces.
+
+### Phase 0.3: Incremental Reindex Lifecycle
+- On node write/update:
+  - remove old temporal index entry
+  - compile new temporal entry
+  - register bucket memberships
+- On node delete:
+  - remove temporal index entry
+  - remove bucket memberships
+- Match current spatial/hash/range update semantics.
+
+### Phase 0.4: Hybrid Query Validation
+- Add tests for:
+  - exact temporal overlap
+  - fuzzy temporal overlap
+  - recurring month/weekday/time-of-day patterns
+  - deep-history ranges
+  - time + spatial radius intersection
+  - graph + time + spatial hybrid query
+- Confirm temporal additions do not regress existing graph/vector/spatial/fulltext paths.
+
 ### Phase 1: Contract Hardening
 - Freeze canonical JSON shapes for:
   - graph traversal ops
   - vector `similar`
   - spatial bbox/polygon
+  - temporal overlap ops
   - fulltext `matching` with score.
 - Add explicit examples for each op in README and wrappers docs.
 
@@ -70,6 +131,7 @@ Completed now:
   - graph relation index state
   - vector index state (HNSW)
   - spatial index state (RTree)
+  - temporal index state
   - fulltext index state.
 - Add index-health checks in tests (existence + expected hit behavior).
 
@@ -85,6 +147,8 @@ Completed now:
   - graph traversal depth + filter
   - vector top-k
   - spatial bbox/polygon
+  - temporal overlap lookup
+  - hybrid graph + spatial + temporal
   - fulltext weighted ranking.
 - Record baseline numbers; fail CI only on severe regressions.
 
@@ -95,6 +159,6 @@ Completed now:
 
 ## Definition of Done (Before ToraJu Buildout)
 - Canonical interfaces and examples are documented.
-- 4-pillar query/mutate paths are tested end-to-end.
+- 5-pillar query/mutate paths are tested end-to-end.
 - `describe` clearly reports per-pillar index status.
 - Wrappers and CLI use unified naming (`query`/`mutate`).

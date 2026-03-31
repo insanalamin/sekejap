@@ -73,7 +73,7 @@ db.define_collection("items", '{"hot_fields":{"hash":["status"],"range":["score"
 ### CLI
 
 ```bash
-cargo run -p skcli -- --path ./data
+cargo run -p sekejap-cli -- --path ./data
 ```
 
 ---
@@ -388,7 +388,7 @@ let combined: Vec<&Hit> = similar.data.iter()
 
 ---
 
-## CLI (`skcli`) Usage
+## CLI (`sekejap-cli`) Usage
 
 ```
 sekejap> collection "crimes" | where_eq "type" "robbery" | take 10

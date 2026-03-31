@@ -25,7 +25,7 @@
 | `db.schema().define(name, json)` | implemented | Define collection hot fields + index intent. |
 | `db.schema().count(name)` | implemented | O(1) count by collection bitmap. |
 
-## Query Pipeline Ops (Graph -> Vector -> Spatial -> Fulltext)
+## Query Pipeline Ops (Graph -> Vector -> Spatial -> Temporal -> Fulltext)
 
 | keyword | status | description |
 |---|---|---|
@@ -36,6 +36,9 @@
 | `spatial_within_bbox` | implemented | Spatial bbox filter/query. |
 | `spatial_intersects_bbox` | implemented | Spatial bbox intersection semantics for point datasets. |
 | `spatial_within_polygon` | implemented | Polygon containment for point coordinates. |
+| `time_intersects` | planned | First-class vague time overlap query against compiled temporal index. |
+| `time_within` | planned | First-class temporal containment query. |
+| `time_near` | planned | First-class fuzzy temporal proximity query. |
 | `matching` | implemented | Fulltext search with `limit`, `title_weight`, `content_weight`, and score propagation. |
 | `where_eq`, `where_between`, `where_gt`, `where_lt`, `where_gte`, `where_lte`, `where_in` | implemented | Payload and index-based predicates. |
 | `intersect`, `union`, `subtract` | implemented | Set algebra. |
@@ -47,3 +50,11 @@
 |---|---|---|
 | `query_json`, `query_json_count`, `explain_json`, `mutate_json` | compatibility | Backward aliases to unified `query/query_count/explain/mutate`. |
 | `SekejapQL` type alias | compatibility | Backward type alias to `QueryCompiler`. |
+
+## Planned Engine Modules
+
+| keyword | status | description |
+|---|---|---|
+| `src/index/time_index.rs` | planned | Dedicated compiled vague-time index module. |
+| `TemporalIndex` | planned | Incremental insert/remove/update temporal index abstraction. |
+| `describe().collections[].indexes.temporal` | planned | Per-collection temporal index health/reporting. |
