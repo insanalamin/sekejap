@@ -11,8 +11,11 @@ use std::time::Instant;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the database directory
-    #[arg(short, long, default_value = "./sekejap_data")]
+    #[arg(default_value = "./sekejap_data")]
     path: String,
+
+    /// Optional one-shot query or command to execute and exit
+    input: Option<String>,
 
     /// Initial node capacity
     #[arg(short, long, default_value_t = 1_000_000)]
@@ -23,8 +26,8 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let db_path = Path::new(&args.path);
 
-    println!("{}", "SekejapDB CLI".bold().green());
-    println!("Connecting to {}...", args.path);
+    println!("{}", "sekejap".bold().green());
+    println!("Opening {}...", args.path);
 
     let db = match SekejapDB::new(db_path, args.capacity) {
         Ok(db) => db,
@@ -34,8 +37,17 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    if let Some(input) = args.input.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if input.starts_with('\\') || input.starts_with('.') || is_internal_command(input) {
+            handle_command(input, &db);
+        } else {
+            handle_query(input, &db);
+        }
+        return Ok(());
+    }
+
     println!("{}", "Connected!".green());
-    println!("Type 'help' or '\\?' for help.");
+    println!("Type '.help' or 'help' for help.");
 
     let mut rl = DefaultEditor::new()?;
     if rl.load_history("history.txt").is_err() {
@@ -52,7 +64,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let _ = rl.add_history_entry(line);
 
-                if line.starts_with('\\') || is_internal_command(line) {
+                if line.starts_with('\\') || line.starts_with('.') || is_internal_command(line) {
                     handle_command(line, &db);
                 } else {
                     handle_query(line, &db);
@@ -78,20 +90,26 @@ fn main() -> anyhow::Result<()> {
 
 fn is_internal_command(line: &str) -> bool {
     let cmd = line.split_whitespace().next().unwrap_or("");
+    let cmd = cmd.trim_start_matches('\\').trim_start_matches('.');
     matches!(
         cmd,
-        "help" | "exit" | "quit" | "ls" | "list" | "collections" | "clear" | "cls" | "describe"
+        "help" | "exit" | "quit" | "ls" | "list" | "collections" | "clear" | "cls" | "describe" | "flush"
     )
 }
 
 fn handle_command(line: &str, db: &SekejapDB) {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    let cmd = parts.get(0).unwrap_or(&"").trim_start_matches('\\');
+    let cmd = parts
+        .first()
+        .copied()
+        .unwrap_or("")
+        .trim_start_matches('\\')
+        .trim_start_matches('.');
 
     match cmd {
         "?" | "help" => print_help(),
         "q" | "exit" | "quit" => std::process::exit(0),
-        "l" | "ls" | "list" | "collections" => list_collections(db),
+        "l" | "ls" | "list" | "collections" | "tables" => list_collections(db),
         "d" | "desc" | "describe" => {
             if let Some(col) = parts.get(1) {
                 println!(
@@ -121,28 +139,35 @@ fn handle_command(line: &str, db: &SekejapDB) {
 
 fn print_help() {
     println!("\n{}", "Available Commands:".bold().underline());
-    println!("  \\? or help           Show this help");
-    println!("  \\q or exit           Quit the CLI");
-    println!("  \\l or ls             List all collections");
-    println!("  \\d <name>            Describe collection schema and index settings");
-    println!("  describe [name]      Show describe output (global or collection)");
-    println!("  \\flush               Flush data to disk");
-    println!("  clear                Clear the screen");
-    println!("\n{}", "Querying (SekejapQL):".bold().underline());
-    println!("  collection \"crimes\"                  SekejapQL query (auto-detected)");
+    println!("  .help or help         Show this help");
+    println!("  .quit or exit         Quit the CLI");
+    println!("  .tables or .ls        List all collections");
+    println!("  .describe [name]      Show describe output (global or collection)");
+    println!("  .flush                Flush data to disk");
+    println!("  .clear                Clear the screen");
+    println!("\n{}", "Querying (SQL):".bold().underline());
+    println!("  SELECT * FROM crimes LIMIT 5;");
+    println!("  SELECT id, title FROM crimes WHERE kind = 'robbery' LIMIT 10;");
+    println!("  SELECT id FROM cases TRAVERSE FORWARD caused_by TO causes HOPS 3 WHERE id = 'incident_00001';");
+    println!("  count SELECT id FROM crimes WHERE kind = 'robbery';");
+    println!("  explain SELECT id FROM crimes WHERE kind = 'robbery';");
+    println!("\n{}", "Mutations (SQL):".bold().underline());
+    println!("  CREATE COLLECTION crimes (id TEXT PRIMARY KEY, title TEXT) WITH (hash_index = [id]);");
+    println!("  INSERT INTO crimes (id, title) VALUES ('c1', 'Example');");
+    println!("  UPDATE crimes SET title = 'Updated' WHERE id = 'c1';");
+    println!("  DELETE FROM crimes WHERE id = 'c1';");
+    println!("  RELATE cases/incident_00001 -> caused_by -> causes/wet_road_00001;");
+    println!("  UNRELATE cases/incident_00001 -> caused_by -> causes/wet_road_00001;");
+    println!("\n{}", "Advanced / Legacy Inputs:".bold().underline());
     println!("  collection \"crimes\" | take 5         Pipe-style SekejapQL");
-    println!("  count collection \"crimes\"            Count results");
-    println!("  explain collection \"crimes\"          Show compiled pipeline steps");
-    println!("\n{}", "Querying (JSON):".bold().underline());
     println!("  query {{...}};                        Execute JSON query pipeline");
     println!("  count {{...}};                        Count results from JSON pipeline");
     println!("  explain {{...}};                      Show compiled steps from JSON");
-    println!("\n{}", "Mutations:".bold().underline());
     println!("  mutate {{...}};                       Execute JSON mutation");
     println!("\n{}", "Examples:".bold().underline());
-    println!("  collection \"crimes\" | where_eq \"type\" \"robbery\" | take 10");
-    println!("  one \"persons/ali\" | forward \"committed\" | take 5");
-    println!("  all | similar \"persons/ali\" 10");
+    println!("  sekejap ./data \"SELECT * FROM crimes LIMIT 10;\"");
+    println!("  SELECT id, name FROM researchers WHERE VECTOR_NEAR(embedding, [0.1, 0.2, 0.3], 20) LIMIT 20;");
+    println!("  RELATE researchers/a -> collaborates_with -> researchers/b;");
     println!("  query {{\"pipeline\": [{{\"op\": \"all\"}}, {{\"op\": \"take\", \"n\": 5}}]}};");
 }
 
@@ -160,7 +185,6 @@ fn list_collections(db: &SekejapDB) {
         table.add_row(vec![format!("{:x}", hash), count.to_string()]);
     }
 
-    // Also check collection_counts for ones that might not have a schema defined yet
     for entry in db.collection_counts.iter() {
         if !db.collections.contains_key(entry.key()) {
             table.add_row(vec![
@@ -182,15 +206,14 @@ fn handle_query(line: &str, db: &SekejapDB) {
         return;
     }
 
-    // describe (global or collection)
-    if line == "describe" {
+    if line == "describe" || line == ".describe" {
         println!(
             "{}",
             serde_json::to_string_pretty(&db.describe()).unwrap_or_else(|_| "{}".to_string())
         );
         return;
     }
-    if let Some(rest) = line.strip_prefix("describe ") {
+    if let Some(rest) = line.strip_prefix("describe ").or_else(|| line.strip_prefix(".describe ")) {
         println!(
             "{}",
             serde_json::to_string_pretty(&db.describe_collection(rest.trim()))
@@ -199,11 +222,11 @@ fn handle_query(line: &str, db: &SekejapDB) {
         return;
     }
 
-    // mutate
     if let Some(json) = line.strip_prefix("mutate ") {
         let start = Instant::now();
         match db.mutate(json.trim()) {
             Ok(out) => {
+                let _ = db.flush();
                 let duration = start.elapsed();
                 println!(
                     "{} mutation completed in {:.4}s",
@@ -220,7 +243,27 @@ fn handle_query(line: &str, db: &SekejapDB) {
         return;
     }
 
-    // explain — show compiled pipeline steps without executing
+    if looks_like_sql_mutation(line) {
+        let start = Instant::now();
+        match db.mutate(line) {
+            Ok(out) => {
+                let _ = db.flush();
+                let duration = start.elapsed();
+                println!(
+                    "{} mutation completed in {:.4}s",
+                    "Success:".green(),
+                    duration.as_secs_f64()
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+                );
+            }
+            Err(e) => eprintln!("{} {}", "Mutation Error:".red(), e),
+        }
+        return;
+    }
+
     if let Some(rest) = line.strip_prefix("explain ") {
         let input = rest.strip_prefix("query ").unwrap_or(rest).trim();
         match db.explain(input) {
@@ -235,7 +278,6 @@ fn handle_query(line: &str, db: &SekejapDB) {
         return;
     }
 
-    // count — return count only
     if let Some(rest) = line.strip_prefix("count ") {
         let input = rest.strip_prefix("query ").unwrap_or(rest).trim();
         let start = Instant::now();
@@ -255,7 +297,6 @@ fn handle_query(line: &str, db: &SekejapDB) {
         return;
     }
 
-    // query — SekejapQL text or JSON pipeline (auto-detected)
     let input = line.strip_prefix("query ").unwrap_or(line).trim();
     let start = Instant::now();
     match db.query(input) {
@@ -302,6 +343,16 @@ fn handle_query(line: &str, db: &SekejapDB) {
             eprintln!("{} {}", "Query Error:".red(), e);
         }
     }
+}
+
+fn looks_like_sql_mutation(line: &str) -> bool {
+    let upper = line.trim_start().to_uppercase();
+    upper.starts_with("CREATE COLLECTION ")
+        || upper.starts_with("INSERT INTO ")
+        || upper.starts_with("RELATE ")
+        || upper.starts_with("UPDATE ")
+        || upper.starts_with("DELETE FROM ")
+        || upper.starts_with("UNRELATE ")
 }
 
 fn print_trace(trace: &sekejap::Trace) {
