@@ -9,6 +9,7 @@ pub mod hnsw;
 pub mod index;
 pub mod mmap_hash;
 pub mod sekejapql;
+pub mod sql;
 pub mod set;
 pub mod stores;
 pub mod txn;
@@ -26,6 +27,9 @@ pub mod fulltext;
 // Re-export main types
 pub use db::SekejapDB;
 pub use sekejapql::{QueryCompiler, SecurityLimits};
+pub use sql::{lower_statement as lower_sql_statement, parse_sql, SqlCompiler, SqlError, SqlStatement};
 pub use set::Set;
 pub use stores::{EdgeStore, NodeStore, SchemaStore};
-pub use types::{Hit, Outcome, Plan, Step, Trace};
+pub use types::{Hit, Outcome, Plan, Step, TimeOfDayQuery, TimeQuery, Trace};
+
+

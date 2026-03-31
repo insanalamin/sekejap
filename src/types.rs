@@ -1,4 +1,5 @@
 use rstar::RTreeObject;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[repr(C)]
@@ -141,14 +142,47 @@ pub struct TraversalResult {
     pub path: Vec<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CollectionFieldDef {
+    pub name: String,
+    pub field_type: String,
+    pub primary_key: bool,
+    pub default_expr: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CollectionSchema {
+    pub name: String,
+    pub field_defs: Vec<CollectionFieldDef>,
     pub vector_fields: Vec<String>,
     pub spatial_fields: Vec<String>,
+    pub temporal_fields: Vec<String>,
     pub fulltext_fields: Vec<String>,
     /// Fields indexed for O(1) equality queries via HashIndex
     pub hash_indexed_fields: Vec<String>,
     /// Fields indexed for O(log N) range queries via RangeIndex
     pub range_indexed_fields: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TimeOfDayQuery {
+    pub start_minute: u16,
+    pub end_minute: u16,
+    pub fuzzy_radius_minute: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct TimeQuery {
+    pub start_year: i64,
+    pub end_year: i64,
+    pub start_fuzz_years: u16,
+    pub end_fuzz_years: u16,
+    pub months: Vec<u8>,
+    pub weekdays: Vec<u8>,
+    pub days_of_month: Vec<u8>,
+    pub time_of_day: Option<TimeOfDayQuery>,
+    pub recurrence_step_months: Option<u8>,
+    pub global_fuzziness: f32,
 }
 
 // ============ NEW TYPES FOR SCENARIO 12 ============
@@ -173,6 +207,9 @@ pub enum Step {
 
     // Search transforms
     Near(f32, f32, f32), // lat, lon, radius_km (radius is squared internally)
+    TimeIntersects(String, TimeQuery), // field, temporal overlap query
+    TimeWithin(String, TimeQuery), // field, temporal containment query
+    TimeNear(String, TimeQuery), // field, temporal proximity query
     SpatialWithinBbox(f32, f32, f32, f32), // min_lat, min_lon, max_lat, max_lon
     SpatialIntersectsBbox(f32, f32, f32, f32), // point dataset: same semantics as within bbox
     SpatialWithinPolygon(Vec<[f32; 2]>), // polygon ring points [lat, lon]
@@ -202,6 +239,7 @@ pub enum Step {
     WhereGte(String, f64),          // field, threshold (>=)
     WhereLte(String, f64),          // field, threshold (<=)
     WhereIn(String, Vec<Value>),    // field, values
+    Like(String, String, bool),     // field, pattern, case_insensitive
 
     // Set algebra
     Intersect(Vec<Step>), // another pipeline to intersect with
@@ -289,6 +327,60 @@ impl Step {
             Step::Near(lat, lon, radius) => {
                 serde_json::json!({ "op": "near", "lat": lat, "lon": lon, "radius": radius })
             }
+            Step::TimeIntersects(field, query) => serde_json::json!({
+                "op": "time_intersects",
+                "field": field,
+                "start_year": query.start_year,
+                "end_year": query.end_year,
+                "start_fuzz_years": query.start_fuzz_years,
+                "end_fuzz_years": query.end_fuzz_years,
+                "months": query.months,
+                "weekdays": query.weekdays,
+                "days_of_month": query.days_of_month,
+                "time_of_day": query.time_of_day.map(|tod| serde_json::json!({
+                    "start_minute": tod.start_minute,
+                    "end_minute": tod.end_minute,
+                    "fuzzy_radius_minute": tod.fuzzy_radius_minute
+                })),
+                "recurrence_step_months": query.recurrence_step_months,
+                "global_fuzziness": query.global_fuzziness
+            }),
+            Step::TimeWithin(field, query) => serde_json::json!({
+                "op": "time_within",
+                "field": field,
+                "start_year": query.start_year,
+                "end_year": query.end_year,
+                "start_fuzz_years": query.start_fuzz_years,
+                "end_fuzz_years": query.end_fuzz_years,
+                "months": query.months,
+                "weekdays": query.weekdays,
+                "days_of_month": query.days_of_month,
+                "time_of_day": query.time_of_day.map(|tod| serde_json::json!({
+                    "start_minute": tod.start_minute,
+                    "end_minute": tod.end_minute,
+                    "fuzzy_radius_minute": tod.fuzzy_radius_minute
+                })),
+                "recurrence_step_months": query.recurrence_step_months,
+                "global_fuzziness": query.global_fuzziness
+            }),
+            Step::TimeNear(field, query) => serde_json::json!({
+                "op": "time_near",
+                "field": field,
+                "start_year": query.start_year,
+                "end_year": query.end_year,
+                "start_fuzz_years": query.start_fuzz_years,
+                "end_fuzz_years": query.end_fuzz_years,
+                "months": query.months,
+                "weekdays": query.weekdays,
+                "days_of_month": query.days_of_month,
+                "time_of_day": query.time_of_day.map(|tod| serde_json::json!({
+                    "start_minute": tod.start_minute,
+                    "end_minute": tod.end_minute,
+                    "fuzzy_radius_minute": tod.fuzzy_radius_minute
+                })),
+                "recurrence_step_months": query.recurrence_step_months,
+                "global_fuzziness": query.global_fuzziness
+            }),
             Step::SpatialWithinBbox(min_lat, min_lon, max_lat, max_lon) => serde_json::json!({
                 "op": "spatial_within_bbox",
                 "min_lat": min_lat,
@@ -362,6 +454,9 @@ impl Step {
             Step::WhereIn(field, values) => {
                 serde_json::json!({ "op": "where_in", "field": field, "values": values })
             }
+            Step::Like(field, pattern, case_insensitive) => {
+                serde_json::json!({ "op": if *case_insensitive { "ilike" } else { "like" }, "field": field, "pattern": pattern })
+            }
             Step::Intersect(steps) => {
                 serde_json::json!({ "op": "intersect", "steps": steps.iter().map(|s| s.to_json()).collect::<Vec<_>>() })
             }
@@ -396,3 +491,4 @@ impl Trace {
         })
     }
 }
+

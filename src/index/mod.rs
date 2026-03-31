@@ -11,9 +11,11 @@
 
 mod hash_index;
 mod range_index;
+mod time_index;
 
 pub use hash_index::HashIndex;
 pub use range_index::RangeIndex;
+pub use time_index::TimeIndex;
 
 use dashmap::DashMap;
 use serde_json::Value;

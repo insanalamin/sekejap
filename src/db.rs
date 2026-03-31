@@ -3,16 +3,18 @@ use crate::collection_bitmap::CollectionBitmapIndex;
 #[cfg(feature = "fulltext")]
 use crate::fulltext::FullTextAdapter;
 use crate::hnsw::{ArenaVectorStore, CosineDistance, HyperHNSW};
-use crate::index::{HashIndex, PropertyIndex, RangeIndex};
+use crate::index::{HashIndex, PropertyIndex, RangeIndex, TimeIndex};
 use crate::mmap_hash::MmapHashIndex;
 use crate::sekejapql::QueryCompiler;
+use crate::sql::{execute_sql_mutation, lower_statement, lower_sql_query, parse_sql, SqlStatement};
 use crate::set::Set;
 use crate::stores::{EdgeStore, NodeStore, SchemaStore};
 use crate::types::{
-    AggOp, CollectionSchema, EdgeSlot, Hit, NodeSlot, Outcome, SpatialNode, Step, VectorSlot,
+    AggOp, CollectionFieldDef, CollectionSchema, EdgeSlot, Hit, NodeSlot, Outcome, SpatialNode, Step, VectorSlot,
 };
 use dashmap::DashMap;
 use rstar::RTree;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smallvec::SmallVec;
 use std::path::Path;
@@ -43,10 +45,17 @@ pub struct SekejapDB {
     pub field_hash_indexes: DashMap<String, Arc<HashIndex>>,
     /// field_name → RangeIndex (range queries, O(log N))
     pub field_range_indexes: DashMap<String, Arc<RangeIndex>>,
+    /// field_name → TimeIndex (vague temporal overlap queries)
+    pub field_time_indexes: DashMap<String, Arc<TimeIndex>>,
     #[cfg(feature = "fulltext")]
     pub fulltext: parking_lot::RwLock<Option<Box<dyn FullTextAdapter>>>,
     /// base path (kept for bitmap flush)
     base_path: std::path::PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedCollectionEntry {
+    schema: CollectionSchema,
 }
 
 impl SekejapDB {
@@ -80,14 +89,72 @@ impl SekejapDB {
             hnsw: parking_lot::RwLock::new(None),
             field_hash_indexes: DashMap::new(),
             field_range_indexes: DashMap::new(),
+            field_time_indexes: DashMap::new(),
             #[cfg(feature = "fulltext")]
             fulltext: parking_lot::RwLock::new(None),
             base_path: base_path.to_path_buf(),
         };
+        db.load_schema_catalog()?;
         if db.nodes.write_head.load(Ordering::Acquire) > 0 {
             db.rebuild_indexes();
         }
         Ok(db)
+    }
+
+    fn schema_catalog_path(&self) -> std::path::PathBuf {
+        self.base_path.join("collections.json")
+    }
+
+    fn activate_schema_indexes(&self, schema: &CollectionSchema) {
+        for field in &schema.hash_indexed_fields {
+            self.field_hash_indexes
+                .entry(field.clone())
+                .or_insert_with(|| Arc::new(HashIndex::new(field)));
+        }
+        for field in &schema.range_indexed_fields {
+            self.field_range_indexes
+                .entry(field.clone())
+                .or_insert_with(|| Arc::new(RangeIndex::new(field)));
+        }
+        for field in &schema.temporal_fields {
+            self.field_time_indexes
+                .entry(field.clone())
+                .or_insert_with(|| Arc::new(TimeIndex::new(field)));
+        }
+    }
+
+    fn persist_schema_catalog(&self) -> std::io::Result<()> {
+        let entries: Vec<PersistedCollectionEntry> = self
+            .collections
+            .iter()
+            .map(|entry| PersistedCollectionEntry {
+                schema: entry.value().clone(),
+            })
+            .collect();
+        let bytes = serde_json::to_vec_pretty(&entries)?;
+        let path = self.schema_catalog_path();
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, bytes)?;
+        std::fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    fn load_schema_catalog(&self) -> std::io::Result<()> {
+        let path = self.schema_catalog_path();
+        if !path.exists() {
+            return Ok(());
+        }
+        let bytes = std::fs::read(path)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let entries: Vec<PersistedCollectionEntry> = serde_json::from_slice(&bytes)?;
+        for entry in entries {
+            let hash = seahash::hash(entry.schema.name.as_bytes());
+            self.activate_schema_indexes(&entry.schema);
+            self.collections.insert(hash, entry.schema);
+        }
+        Ok(())
     }
 
     /// Rebuild slug_index, adj_fwd, adj_rev, spatial, collection_bitmaps from mmap.
@@ -150,7 +217,10 @@ impl SekejapDB {
 
     /// Scan mmap and populate any defined field_hash_indexes / field_range_indexes.
     pub(crate) fn rebuild_field_indexes(&self) {
-        if self.field_hash_indexes.is_empty() && self.field_range_indexes.is_empty() {
+        if self.field_hash_indexes.is_empty()
+            && self.field_range_indexes.is_empty()
+            && self.field_time_indexes.is_empty()
+        {
             return;
         }
         let node_count = self.nodes.write_head.load(Ordering::Acquire);
@@ -173,6 +243,9 @@ impl SekejapDB {
                 if let Some(v) = json.get(entry.key().as_str()).and_then(|v| v.as_f64()) {
                     entry.value().insert_f64(i as u32, v);
                 }
+            }
+            for entry in self.field_time_indexes.iter() {
+                entry.value().insert(i as u32, &json, entry.key().as_str());
             }
         }
     }
@@ -343,6 +416,9 @@ impl SekejapDB {
                 for entry in self.field_range_indexes.iter() {
                     entry.value().remove(n_idx as u32);
                 }
+                for entry in self.field_time_indexes.iter() {
+                    entry.value().remove(n_idx as u32);
+                }
                 if old_slot.collection_hash != collection_hash {
                     self.collection_bitmaps
                         .remove(old_slot.collection_hash, n_idx as u32);
@@ -420,6 +496,9 @@ impl SekejapDB {
                 entry.value().insert_f64(n_idx as u32, v);
             }
         }
+        for entry in self.field_time_indexes.iter() {
+            entry.value().insert(n_idx as u32, value, entry.key().as_str());
+        }
 
         let committed = self.nodes.write_head.load(Ordering::Acquire).max(n_idx + 1);
         self.nodes.commit(committed);
@@ -476,6 +555,9 @@ impl SekejapDB {
             if let Some(v) = value.get(entry.key().as_str()).and_then(|v| v.as_f64()) {
                 entry.value().insert_f64(n_idx as u32, v);
             }
+        }
+        for entry in self.field_time_indexes.iter() {
+            entry.value().insert(n_idx as u32, value, entry.key().as_str());
         }
 
         // Fulltext indexing (same as single-item path)
@@ -564,6 +646,50 @@ impl SekejapDB {
         self.blobs.commit();
 
         // Bulk-load spatial R-Tree — use cached Values (no re-parse from blob)
+        let mut spatial_nodes: Vec<SpatialNode> = node_meta
+            .iter()
+            .filter(|(_, _, lat, lon, _)| *lat != 0.0 || *lon != 0.0)
+            .map(|(idx, _, lat, lon, val)| {
+                Self::extract_spatial_node(*idx, val)
+                    .unwrap_or_else(|| SpatialNode::from_point(*idx, *lat, *lon))
+            })
+            .collect();
+        if !spatial_nodes.is_empty() {
+            {
+                let existing = self.spatial.read();
+                for node in existing.iter() {
+                    spatial_nodes.push(*node);
+                }
+            }
+            *self.spatial.write() = RTree::bulk_load(spatial_nodes);
+        }
+
+        let all_indices: Vec<u32> = node_meta.iter().map(|(idx, _, _, _, _)| *idx).collect();
+        let vec_indices: Vec<u32> = node_meta
+            .iter()
+            .filter(|(_, has_vec, _, _, _)| *has_vec)
+            .map(|(idx, _, _, _, _)| *idx)
+            .collect();
+
+        Ok((all_indices, vec_indices))
+    }
+
+    /// Phase 1+2+3: Raw data ingestion using already-materialized JSON Values.
+    /// Avoids reparsing SQL-built payloads before deferred writes and index updates.
+    pub(crate) fn ingest_nodes_raw_values(
+        &self,
+        items: &[(&str, &str, &Value)],
+    ) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
+        let mut node_meta: Vec<(u32, bool, f32, f32, &Value)> = Vec::with_capacity(items.len());
+        for &(slug, raw, value) in items {
+            let meta = self.write_node_deferred(slug, raw, value)?;
+            node_meta.push((meta.0, meta.1, meta.2, meta.3, value));
+        }
+
+        let node_count = self.nodes.write_head.load(Ordering::Acquire);
+        self.nodes.commit(node_count);
+        self.blobs.commit();
+
         let mut spatial_nodes: Vec<SpatialNode> = node_meta
             .iter()
             .filter(|(_, _, lat, lon, _)| *lat != 0.0 || *lon != 0.0)
@@ -879,6 +1005,9 @@ impl SekejapDB {
             for entry in self.field_range_indexes.iter() {
                 entry.value().remove(idx);
             }
+            for entry in self.field_time_indexes.iter() {
+                entry.value().remove(idx);
+            }
             self.slug_index.write().remove(slug_hash);
         }
         Ok(())
@@ -932,6 +1061,21 @@ impl SekejapDB {
             &v["hot"]
         };
         let col_schema = CollectionSchema {
+            name: name.to_string(),
+            field_defs: v["fields"]
+                .as_array()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|field| CollectionFieldDef {
+                            name: field["name"].as_str().unwrap_or("").to_string(),
+                            field_type: field["type"].as_str().unwrap_or("TEXT").to_string(),
+                            primary_key: field["primary_key"].as_bool().unwrap_or(false),
+                            default_expr: field["default"].as_str().map(|v| v.to_string()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             vector_fields: hot["vector"]
                 .as_array()
                 .map(|a| {
@@ -941,6 +1085,14 @@ impl SekejapDB {
                 })
                 .unwrap_or_default(),
             spatial_fields: hot["spatial"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            temporal_fields: hot["temporal"]
                 .as_array()
                 .map(|a| {
                     a.iter()
@@ -974,19 +1126,10 @@ impl SekejapDB {
                 .unwrap_or_default(),
         };
 
-        // Activate field indexes for newly defined hot fields
-        for field in &col_schema.hash_indexed_fields {
-            self.field_hash_indexes
-                .entry(field.clone())
-                .or_insert_with(|| Arc::new(HashIndex::new(field)));
-        }
-        for field in &col_schema.range_indexed_fields {
-            self.field_range_indexes
-                .entry(field.clone())
-                .or_insert_with(|| Arc::new(RangeIndex::new(field)));
-        }
+        self.activate_schema_indexes(&col_schema);
 
         self.collections.insert(hash, col_schema);
+        self.persist_schema_catalog()?;
         Ok(())
     }
 
@@ -1082,6 +1225,7 @@ impl SekejapDB {
     // --- System Methods ---
 
     pub fn flush(&self) -> std::io::Result<()> {
+        self.persist_schema_catalog()?;
         self.nodes.flush_written()?;
         self.edges.flush_written()?;
         self.vectors.read().flush_written()?;
@@ -1252,7 +1396,7 @@ impl SekejapDB {
 
     // --- Unified Query/Mutate Interface ---
 
-    /// Parse SekejapQL text or JSON pipeline — auto-detected by leading '{'.
+    /// Parse PipelineQL text or JSON pipeline - auto-detected by leading '{'.
     fn parse_input(input: &str) -> Result<Vec<Step>, Box<dyn std::error::Error>> {
         if input.trim_start().starts_with('{') {
             QueryCompiler::new().parse_pipeline_direct(input)
@@ -1261,23 +1405,60 @@ impl SekejapDB {
         }
     }
 
-    /// Execute a query. Accepts SekejapQL text or JSON pipeline (auto-detected).
+    fn looks_like_sql_query(input: &str) -> bool {
+        input.trim_start().to_uppercase().starts_with("SELECT ")
+    }
+
+    fn looks_like_sql_mutation(input: &str) -> bool {
+        let upper = input.trim_start().to_uppercase();
+        upper.starts_with("CREATE COLLECTION ")
+            || upper.starts_with("INSERT INTO ")
+            || upper.starts_with("RELATE ")
+            || upper.starts_with("UPDATE ")
+            || upper.starts_with("DELETE FROM ")
+            || upper.starts_with("UNRELATE ")
+    }
+
+    /// Execute a query. Accepts Sekejap SQL SELECT, PipelineQL text, or JSON pipeline.
     pub fn query(&self, input: &str) -> Result<Outcome<Vec<Hit>>, Box<dyn std::error::Error>> {
-        Set::from_steps(self, Self::parse_input(input)?).collect()
+        if Self::looks_like_sql_query(input) {
+            let statement = parse_sql(input)?;
+            match statement {
+                SqlStatement::Select(_) => Set::from_steps(self, lower_statement(&statement)?).collect(),
+                _ => Err("query() only executes SELECT for SQL input".into()),
+            }
+        } else {
+            Set::from_steps(self, Self::parse_input(input)?).collect()
+        }
     }
 
-    /// Count results. Accepts SekejapQL text or JSON pipeline (auto-detected).
+    /// Count results. Accepts Sekejap SQL SELECT, PipelineQL text, or JSON pipeline.
     pub fn count(&self, input: &str) -> Result<Outcome<usize>, Box<dyn std::error::Error>> {
-        Set::from_steps(self, Self::parse_input(input)?).count()
+        if Self::looks_like_sql_query(input) {
+            let statement = parse_sql(input)?;
+            match statement {
+                SqlStatement::Select(_) => Set::from_steps(self, lower_statement(&statement)?).count(),
+                _ => Err("count() only executes SELECT for SQL input".into()),
+            }
+        } else {
+            Set::from_steps(self, Self::parse_input(input)?).count()
+        }
     }
 
-    /// Compile to steps without executing. Accepts SekejapQL text or JSON (auto-detected).
+    /// Compile to steps without executing. Accepts Sekejap SQL SELECT, PipelineQL text, or JSON.
     pub fn explain(&self, input: &str) -> Result<Vec<Step>, Box<dyn std::error::Error>> {
-        Self::parse_input(input)
+        if Self::looks_like_sql_query(input) {
+            lower_sql_query(input)
+        } else {
+            Self::parse_input(input)
+        }
     }
 
-    pub fn mutate(&self, json: &str) -> Result<Value, Box<dyn std::error::Error>> {
-        let doc: Value = serde_json::from_str(json)?;
+    pub fn mutate(&self, input: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        if Self::looks_like_sql_mutation(input) {
+            return execute_sql_mutation(self, input);
+        }
+        let doc: Value = serde_json::from_str(input)?;
         let op = doc["mutation"].as_str().ok_or("Missing 'mutation' field")?;
         match op {
             "put" => {
@@ -1367,6 +1548,11 @@ impl SekejapDB {
             .iter()
             .map(|e| e.key().clone())
             .collect();
+        let temporal_fields: Vec<String> = self
+            .field_time_indexes
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
 
         let collections: Vec<Value> = self
             .collections
@@ -1401,13 +1587,30 @@ impl SekejapDB {
                         })
                     })
                     .collect();
+                let temporal_ready: Vec<Value> = schema
+                    .temporal_fields
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "field": field,
+                            "ready": self.field_time_indexes.contains_key(field)
+                        })
+                    })
+                    .collect();
 
                 serde_json::json!({
                     "hash": hash,
                     "count": count,
                     "schema": {
+                        "fields": schema.field_defs.iter().map(|field| serde_json::json!({
+                            "name": field.name,
+                            "type": field.field_type,
+                            "primary_key": field.primary_key,
+                            "default": field.default_expr,
+                        })).collect::<Vec<_>>(),
                         "vector_fields": schema.vector_fields,
                         "spatial_fields": schema.spatial_fields,
+                        "temporal_fields": schema.temporal_fields,
                         "fulltext_fields": schema.fulltext_fields,
                         "hash_indexed_fields": schema.hash_indexed_fields,
                         "range_indexed_fields": schema.range_indexed_fields
@@ -1428,6 +1631,11 @@ impl SekejapDB {
                             "rtree_ready": true,
                             "fields": schema.spatial_fields,
                             "indexed_nodes_global": spatial_indexed_nodes
+                        },
+                        "temporal": {
+                            "time_index_ready": !schema.temporal_fields.is_empty(),
+                            "fields": schema.temporal_fields,
+                            "ready": temporal_ready
                         },
                         "fulltext": {
                             "feature_enabled": cfg!(feature = "fulltext"),
@@ -1467,7 +1675,8 @@ impl SekejapDB {
             },
             "indexes": {
                 "hash_fields": hash_fields,
-                "range_fields": range_fields
+                "range_fields": range_fields,
+                "temporal_fields": temporal_fields
             },
             "collections": collections
         })
@@ -1489,7 +1698,7 @@ impl SekejapDB {
         let schema_entry = self.collections.get(&hash);
         let exists = schema_entry.is_some();
 
-        let (schema_json, hash_ready, range_ready, vector_fields, spatial_fields, fulltext_fields) =
+        let (schema_json, hash_ready, range_ready, temporal_ready, vector_fields, spatial_fields, temporal_fields, fulltext_fields) =
             if let Some(schema) = schema_entry {
                 let hash_ready: Vec<Value> = schema
                     .hash_indexed_fields
@@ -1511,24 +1720,45 @@ impl SekejapDB {
                         })
                     })
                     .collect();
+                let temporal_ready: Vec<Value> = schema
+                    .temporal_fields
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "field": field,
+                            "ready": self.field_time_indexes.contains_key(field)
+                        })
+                    })
+                    .collect();
 
                 (
                     serde_json::json!({
+                        "fields": schema.field_defs.iter().map(|field| serde_json::json!({
+                            "name": field.name,
+                            "type": field.field_type,
+                            "primary_key": field.primary_key,
+                            "default": field.default_expr,
+                        })).collect::<Vec<_>>(),
                         "vector_fields": schema.vector_fields,
                         "spatial_fields": schema.spatial_fields,
+                        "temporal_fields": schema.temporal_fields,
                         "fulltext_fields": schema.fulltext_fields,
                         "hash_indexed_fields": schema.hash_indexed_fields,
                         "range_indexed_fields": schema.range_indexed_fields
                     }),
                     hash_ready,
                     range_ready,
+                    temporal_ready,
                     schema.vector_fields.clone(),
                     schema.spatial_fields.clone(),
+                    schema.temporal_fields.clone(),
                     schema.fulltext_fields.clone(),
                 )
             } else {
                 (
                     serde_json::json!({}),
+                    Vec::new(),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -1559,6 +1789,11 @@ impl SekejapDB {
                     "rtree_ready": true,
                     "fields": spatial_fields,
                     "indexed_nodes_global": self.spatial.read().size()
+                },
+                "temporal": {
+                    "time_index_ready": !temporal_fields.is_empty(),
+                    "fields": temporal_fields,
+                    "ready": temporal_ready
                 },
                 "fulltext": {
                     "feature_enabled": cfg!(feature = "fulltext"),

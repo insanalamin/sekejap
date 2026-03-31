@@ -1,15 +1,19 @@
 use crate::db::SekejapDB;
+use crate::index::TimeIndex;
 use crate::index::PropertyIndex;
-use crate::types::{AggOp, EdgeHit, Hit, Outcome, Plan, Step, StepReport, Trace};
+use crate::types::{AggOp, EdgeHit, Hit, Outcome, Plan, Step, StepReport, TimeQuery, Trace};
 use roaring::RoaringBitmap;
 use rstar::AABB;
 use serde_json::Value;
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 #[cfg(feature = "fulltext")]
 use crate::fulltext::{SearchHit, SearchOptions};
+
+const SPATIAL_DIRECT_SCAN_THRESHOLD: u64 = 10_000;
 
 pub struct Set<'db> {
     db: &'db SekejapDB,
@@ -71,6 +75,69 @@ fn project_fields(payload: &str, fields: &[String]) -> String {
     serde_json::to_string(&projected).unwrap_or_else(|_| payload.to_string())
 }
 
+fn project_single_string_field_fast(payload: &[u8], field: &str) -> Option<String> {
+    let field_start = find_bytes(payload, format!("\"{field}\":").as_bytes())?;
+    let mut value_start = field_start + field.len() + 3;
+    while value_start < payload.len() && payload[value_start].is_ascii_whitespace() {
+        value_start += 1;
+    }
+    if value_start >= payload.len() || payload[value_start] != b'"' {
+        return None;
+    }
+    let raw_start = value_start;
+    let mut i = value_start + 1;
+    let mut escaped = false;
+    while i < payload.len() {
+        let b = payload[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => escaped = true,
+            b'"' => {
+                let raw_value = std::str::from_utf8(&payload[raw_start..=i]).ok()?;
+                return Some(format!("{{\"{field}\":{raw_value}}}"));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn extract_single_string_field_fast<'a>(payload: &'a [u8], field: &str) -> Option<&'a str> {
+    let field_start = find_bytes(payload, format!("\"{field}\":").as_bytes())?;
+    let mut value_start = field_start + field.len() + 3;
+    while value_start < payload.len() && payload[value_start].is_ascii_whitespace() {
+        value_start += 1;
+    }
+    if value_start >= payload.len() || payload[value_start] != b'"' {
+        return None;
+    }
+    let raw_start = value_start + 1;
+    let mut i = raw_start;
+    let mut escaped = false;
+    while i < payload.len() {
+        let b = payload[i];
+        if escaped {
+            return None;
+        }
+        match b {
+            b'\\' => escaped = true,
+            b'"' => return std::str::from_utf8(&payload[raw_start..i]).ok(),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
 fn inject_score(payload: Option<String>, score: f32) -> Option<String> {
     let mut obj = payload
         .as_deref()
@@ -104,6 +171,83 @@ fn point_in_polygon(lat: f32, lon: f32, polygon: &[[f32; 2]]) -> bool {
         j = i;
     }
     inside
+}
+
+fn polygon_bbox(polygon: &[[f32; 2]]) -> Option<(f32, f32, f32, f32)> {
+    if polygon.is_empty() {
+        return None;
+    }
+    let (min_lat, max_lat, min_lon, max_lon) = polygon.iter().fold(
+        (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
+        |(mn_la, mx_la, mn_lo, mx_lo), p| {
+            (
+                mn_la.min(p[0]),
+                mx_la.max(p[0]),
+                mn_lo.min(p[1]),
+                mx_lo.max(p[1]),
+            )
+        },
+    );
+    Some((min_lat, max_lat, min_lon, max_lon))
+}
+
+fn polygon_is_axis_aligned_rectangle(polygon: &[[f32; 2]]) -> bool {
+    if polygon.len() != 5 || polygon.first() != polygon.last() {
+        return false;
+    }
+    let Some((min_lat, max_lat, min_lon, max_lon)) = polygon_bbox(polygon) else {
+        return false;
+    };
+    let expected = [
+        [min_lat, min_lon],
+        [min_lat, max_lon],
+        [max_lat, max_lon],
+        [max_lat, min_lon],
+    ];
+    let corners = &polygon[..4];
+    corners.iter().all(|p| expected.contains(p))
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+fn payload_looks_like_point_geometry(bytes: &[u8]) -> bool {
+    bytes_contains(bytes, br#""type":"Point""#)
+        || bytes_contains(bytes, br#""type": "Point""#)
+        || bytes_contains(bytes, br#""geo":{"loc""#)
+        || bytes_contains(bytes, br#""coords":{"lat""#)
+        || bytes_contains(bytes, br#""coordinates":{"lat""#)
+}
+
+fn spatial_scan_all_live_if_small<F>(
+    db: &SekejapDB,
+    limit: Option<u32>,
+    mut predicate: F,
+) -> Option<RoaringBitmap>
+where
+    F: FnMut(f32, f32) -> bool,
+{
+    let node_count = db.nodes.write_head.load(Ordering::Acquire);
+    if node_count > SPATIAL_DIRECT_SCAN_THRESHOLD {
+        return None;
+    }
+    let mut filtered = RoaringBitmap::new();
+    for idx in 0..node_count {
+        let slot = db.nodes.read_at(idx);
+        if slot.flags == 0 {
+            continue;
+        }
+        if predicate(slot.lat, slot.lon) {
+            filtered.insert(idx as u32);
+            if let Some(limit) = limit {
+                if filtered.len() >= limit as u64 {
+                    break;
+                }
+            }
+        }
+    }
+    Some(filtered)
 }
 
 impl<'db> Set<'db> {
@@ -156,6 +300,18 @@ impl<'db> Set<'db> {
 
     pub fn near(mut self, lat: f32, lon: f32, radius_km: f32) -> Self {
         self.steps.push(Step::Near(lat, lon, radius_km));
+        self
+    }
+    pub fn time_intersects(mut self, field: &str, query: TimeQuery) -> Self {
+        self.steps.push(Step::TimeIntersects(field.to_string(), query));
+        self
+    }
+    pub fn time_within(mut self, field: &str, query: TimeQuery) -> Self {
+        self.steps.push(Step::TimeWithin(field.to_string(), query));
+        self
+    }
+    pub fn time_near(mut self, field: &str, query: TimeQuery) -> Self {
+        self.steps.push(Step::TimeNear(field.to_string(), query));
         self
     }
     pub fn within_bbox(
@@ -251,6 +407,16 @@ impl<'db> Set<'db> {
             .push(Step::WhereGte(field.to_string(), threshold));
         self
     }
+    pub fn like(mut self, field: &str, pattern: &str) -> Self {
+        self.steps
+            .push(Step::Like(field.to_string(), pattern.to_string(), false));
+        self
+    }
+    pub fn ilike(mut self, field: &str, pattern: &str) -> Self {
+        self.steps
+            .push(Step::Like(field.to_string(), pattern.to_string(), true));
+        self
+    }
 
     /// Sort results by a field. Applied after bitmap execution at terminal time.
     pub fn sort(mut self, field: &str, ascending: bool) -> Self {
@@ -324,17 +490,37 @@ impl<'db> Set<'db> {
 
         // Load payloads now for remaining hits (after sort + skip)
         if !needs_payload_for_sort {
+            let fast_single_field = select_fields.as_ref().and_then(|fields| {
+                if fields.len() == 1 {
+                    match fields[0].as_str() {
+                        "id" | "_id" => Some(fields[0].clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
             for hit in &mut hits {
                 let slot = self.db.nodes.read_at(hit.idx as u64);
                 if slot.flags != 0 {
                     let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
-                    hit.payload = Some(String::from_utf8_lossy(bytes).into_owned());
+                    hit.payload = if let Some(ref field) = fast_single_field {
+                        project_single_string_field_fast(bytes, field)
+                            .or_else(|| Some(String::from_utf8_lossy(bytes).into_owned()))
+                    } else {
+                        Some(String::from_utf8_lossy(bytes).into_owned())
+                    };
                 }
             }
         }
 
         if let Some(ref fields) = select_fields {
+            let already_fast_projected =
+                fields.len() == 1 && matches!(fields[0].as_str(), "id" | "_id") && !needs_payload_for_sort;
             for hit in &mut hits {
+                if already_fast_projected {
+                    continue;
+                }
                 if let Some(ref payload) = hit.payload.clone() {
                     hit.payload = Some(project_fields(payload, fields));
                 }
@@ -482,10 +668,14 @@ impl<'db> Set<'db> {
         let mut score_map: HashMap<u32, f32> = HashMap::new();
         let mut pending_hops: Option<u32> = None;
 
-        for step in &self.steps {
+        for (step_idx, step) in self.steps.iter().enumerate() {
             let step_start = Instant::now();
             let input_size = candidates.as_ref().map_or(0, |b| b.len() as usize);
             let mut index_used = "scan";
+            let next_take_limit = match self.steps.get(step_idx + 1) {
+                Some(Step::Take(n)) => Some(*n as u32),
+                _ => None,
+            };
 
             match step {
                 Step::One(hash) => {
@@ -536,14 +726,22 @@ impl<'db> Set<'db> {
                 }
                 Step::Forward(type_hash) => {
                     let hops = pending_hops.take().unwrap_or(1);
-                    candidates =
-                        Some(self.bfs_forward(candidates.as_ref(), *type_hash, hops as usize));
+                    candidates = Some(self.bfs_forward(
+                        candidates.as_ref(),
+                        *type_hash,
+                        hops as usize,
+                        next_take_limit,
+                    ));
                     index_used = "adj_fwd";
                 }
                 Step::Backward(type_hash) => {
                     let hops = pending_hops.take().unwrap_or(1);
-                    candidates =
-                        Some(self.bfs_backward(candidates.as_ref(), *type_hash, hops as usize));
+                    candidates = Some(self.bfs_backward(
+                        candidates.as_ref(),
+                        *type_hash,
+                        hops as usize,
+                        next_take_limit,
+                    ));
                     index_used = "adj_rev";
                 }
                 Step::ForwardParallel(type_hash) => {
@@ -552,6 +750,7 @@ impl<'db> Set<'db> {
                         candidates.as_ref(),
                         *type_hash,
                         hops as usize,
+                        next_take_limit,
                     ));
                     index_used = "adj_fwd_parallel";
                 }
@@ -561,6 +760,7 @@ impl<'db> Set<'db> {
                         candidates.as_ref(),
                         *type_hash,
                         hops as usize,
+                        next_take_limit,
                     ));
                     index_used = "adj_rev_parallel";
                 }
@@ -611,7 +811,7 @@ impl<'db> Set<'db> {
                 Step::Near(lat, lon, radius) => {
                     let r_sq = radius * radius;
                     match candidates {
-                        Some(ref mut curr) if curr.len() < 500 => {
+                        Some(ref mut curr) if curr.len() < SPATIAL_DIRECT_SCAN_THRESHOLD => {
                             let mut filtered = RoaringBitmap::new();
                             for idx in curr.iter() {
                                 let slot = self.db.nodes.read_at(idx as u64);
@@ -619,10 +819,38 @@ impl<'db> Set<'db> {
                                 let dy = slot.lon - lon;
                                 if dx * dx + dy * dy <= r_sq {
                                     filtered.insert(idx);
+                                    if let Some(limit) = next_take_limit {
+                                        if filtered.len() >= limit as u64 {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             *curr = filtered;
                             index_used = "filter";
+                        }
+                        None => {
+                            if let Some(results) =
+                                spatial_scan_all_live_if_small(self.db, next_take_limit, |slot_lat, slot_lon| {
+                                    let dx = slot_lat - lat;
+                                    let dy = slot_lon - lon;
+                                    dx * dx + dy * dy <= r_sq
+                                })
+                            {
+                                candidates = Some(results);
+                                index_used = "filter_all";
+                            } else {
+                                let results: RoaringBitmap = self
+                                    .db
+                                    .spatial
+                                    .read()
+                                    .locate_within_distance([*lat, *lon], r_sq)
+                                    .take(next_take_limit.unwrap_or(u32::MAX) as usize)
+                                    .map(|n| n.id)
+                                    .collect();
+                                candidates = Some(results);
+                                index_used = "rtree";
+                            }
                         }
                         _ => {
                             let results: RoaringBitmap = self
@@ -641,11 +869,95 @@ impl<'db> Set<'db> {
                         }
                     }
                 }
+                Step::TimeIntersects(field, query) => {
+                    if let Some(time_idx) = self.db.field_time_indexes.get(field) {
+                        let hits: RoaringBitmap =
+                            time_idx.lookup_intersects(query).into_iter().collect();
+                        if let Some(ref mut curr) = candidates {
+                            *curr &= hits;
+                        } else {
+                            candidates = Some(hits);
+                        }
+                        index_used = "temporal_index";
+                    } else if let Some(ref mut bm) = candidates {
+                        let mut filtered = RoaringBitmap::new();
+                        for idx in bm.iter() {
+                            let slot = self.db.nodes.read_at(idx as u64);
+                            if slot.flags == 0 {
+                                continue;
+                            }
+                            let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                                if TimeIndex::payload_intersects(&json, field, query) {
+                                    filtered.insert(idx);
+                                }
+                            }
+                        }
+                        *bm = filtered;
+                        index_used = "temporal_payload";
+                    }
+                }
+                Step::TimeWithin(field, query) => {
+                    if let Some(time_idx) = self.db.field_time_indexes.get(field) {
+                        let hits: RoaringBitmap =
+                            time_idx.lookup_within(query).into_iter().collect();
+                        if let Some(ref mut curr) = candidates {
+                            *curr &= hits;
+                        } else {
+                            candidates = Some(hits);
+                        }
+                        index_used = "temporal_index";
+                    } else if let Some(ref mut bm) = candidates {
+                        let mut filtered = RoaringBitmap::new();
+                        for idx in bm.iter() {
+                            let slot = self.db.nodes.read_at(idx as u64);
+                            if slot.flags == 0 {
+                                continue;
+                            }
+                            let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                                if TimeIndex::payload_within(&json, field, query) {
+                                    filtered.insert(idx);
+                                }
+                            }
+                        }
+                        *bm = filtered;
+                        index_used = "temporal_payload";
+                    }
+                }
+                Step::TimeNear(field, query) => {
+                    if let Some(time_idx) = self.db.field_time_indexes.get(field) {
+                        let hits: RoaringBitmap =
+                            time_idx.lookup_near(query).into_iter().collect();
+                        if let Some(ref mut curr) = candidates {
+                            *curr &= hits;
+                        } else {
+                            candidates = Some(hits);
+                        }
+                        index_used = "temporal_index";
+                    } else if let Some(ref mut bm) = candidates {
+                        let mut filtered = RoaringBitmap::new();
+                        for idx in bm.iter() {
+                            let slot = self.db.nodes.read_at(idx as u64);
+                            if slot.flags == 0 {
+                                continue;
+                            }
+                            let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                                if TimeIndex::payload_near(&json, field, query) {
+                                    filtered.insert(idx);
+                                }
+                            }
+                        }
+                        *bm = filtered;
+                        index_used = "temporal_payload";
+                    }
+                }
                 Step::SpatialWithinBbox(min_lat, min_lon, max_lat, max_lon)
                 | Step::SpatialIntersectsBbox(min_lat, min_lon, max_lat, max_lon) => {
                     let env = AABB::from_corners([*min_lat, *min_lon], [*max_lat, *max_lon]);
                     match candidates {
-                        Some(ref mut curr) if curr.len() < 500 => {
+                        Some(ref mut curr) if curr.len() < SPATIAL_DIRECT_SCAN_THRESHOLD => {
                             let mut filtered = RoaringBitmap::new();
                             for idx in curr.iter() {
                                 let slot = self.db.nodes.read_at(idx as u64);
@@ -655,10 +967,39 @@ impl<'db> Set<'db> {
                                     && slot.lon <= *max_lon
                                 {
                                     filtered.insert(idx);
+                                    if let Some(limit) = next_take_limit {
+                                        if filtered.len() >= limit as u64 {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             *curr = filtered;
                             index_used = "filter";
+                        }
+                        None => {
+                            if let Some(results) =
+                                spatial_scan_all_live_if_small(self.db, next_take_limit, |slot_lat, slot_lon| {
+                                    slot_lat >= *min_lat
+                                        && slot_lat <= *max_lat
+                                        && slot_lon >= *min_lon
+                                        && slot_lon <= *max_lon
+                                })
+                            {
+                                candidates = Some(results);
+                                index_used = "filter_all";
+                            } else {
+                                let results: RoaringBitmap = self
+                                    .db
+                                    .spatial
+                                    .read()
+                                    .locate_in_envelope_intersecting(&env)
+                                    .take(next_take_limit.unwrap_or(u32::MAX) as usize)
+                                    .map(|n| n.id)
+                                    .collect();
+                                candidates = Some(results);
+                                index_used = "rtree";
+                            }
                         }
                         _ => {
                             let results: RoaringBitmap = self
@@ -732,19 +1073,27 @@ impl<'db> Set<'db> {
                         continue;
                     }
                     // R-Tree pre-filter on envelope
-                    let (min_lat, max_lat, min_lon, max_lon) = polygon.iter().fold(
-                        (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
-                        |(mn_la, mx_la, mn_lo, mx_lo), p| (
-                            mn_la.min(p[0]), mx_la.max(p[0]),
-                            mn_lo.min(p[1]), mx_lo.max(p[1]),
-                        ),
-                    );
+                    let (min_lat, max_lat, min_lon, max_lon) = polygon_bbox(polygon)
+                        .expect("validated non-empty polygon");
+                    let point_rectangle_fast_path = matches!(step, Step::StWithin(_) | Step::StIntersects(_))
+                        && polygon_is_axis_aligned_rectangle(polygon);
                     let env = AABB::from_corners([min_lat, min_lon], [max_lat, max_lon]);
                     let mut filtered = RoaringBitmap::new();
                     let test_node = |idx: u32, db: &SekejapDB, polygon: &[[f32; 2]]| -> bool {
                         let slot = db.nodes.read_at(idx as u64);
                         if slot.flags == 0 { return false; }
+                        if point_rectangle_fast_path {
+                            return slot.lat >= min_lat
+                                && slot.lat <= max_lat
+                                && slot.lon >= min_lon
+                                && slot.lon <= max_lon;
+                        }
                         let bytes = db.blobs.read(slot.blob_offset, slot.blob_len);
+                        if matches!(step, Step::StWithin(_) | Step::StIntersects(_))
+                            && payload_looks_like_point_geometry(bytes)
+                        {
+                            return point_in_polygon(slot.lat, slot.lon, polygon);
+                        }
                         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                             predicate(&json, polygon)
                         } else {
@@ -756,13 +1105,51 @@ impl<'db> Set<'db> {
                             for idx in curr.iter() {
                                 if test_node(idx, self.db, polygon) {
                                     filtered.insert(idx);
+                                    if let Some(limit) = next_take_limit {
+                                        if filtered.len() >= limit as u64 {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
                         None => {
-                            for n in self.db.spatial.read().locate_in_envelope_intersecting(&env) {
-                                if test_node(n.id, self.db, polygon) {
-                                    filtered.insert(n.id);
+                            if let Some(results) = spatial_scan_all_live_if_small(
+                                self.db,
+                                next_take_limit,
+                                |slot_lat, slot_lon| {
+                                    slot_lat >= min_lat
+                                        && slot_lat <= max_lat
+                                        && slot_lon >= min_lon
+                                        && slot_lon <= max_lon
+                                        && if point_rectangle_fast_path {
+                                            true
+                                        } else {
+                                            point_in_polygon(slot_lat, slot_lon, polygon)
+                                        }
+                                },
+                            ) {
+                                filtered = results;
+                                index_used = if point_rectangle_fast_path {
+                                    "filter_all_bbox"
+                                } else {
+                                    "filter_all_polygon"
+                                };
+                            } else {
+                                for n in self
+                                    .db
+                                    .spatial
+                                    .read()
+                                    .locate_in_envelope_intersecting(&env)
+                                {
+                                    if test_node(n.id, self.db, polygon) {
+                                        filtered.insert(n.id);
+                                        if let Some(limit) = next_take_limit {
+                                            if filtered.len() >= limit as u64 {
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -775,7 +1162,7 @@ impl<'db> Set<'db> {
                     // Uses centroid distance (slot.lat/lon) — same as Near but named for PostGIS familiarity
                     let r_sq = distance_km * distance_km;
                     match candidates {
-                        Some(ref mut curr) if curr.len() < 500 => {
+                        Some(ref mut curr) if curr.len() < SPATIAL_DIRECT_SCAN_THRESHOLD => {
                             let mut filtered = RoaringBitmap::new();
                             for idx in curr.iter() {
                                 let slot = self.db.nodes.read_at(idx as u64);
@@ -783,10 +1170,38 @@ impl<'db> Set<'db> {
                                 let dy = slot.lon - lon;
                                 if dx * dx + dy * dy <= r_sq {
                                     filtered.insert(idx);
+                                    if let Some(limit) = next_take_limit {
+                                        if filtered.len() >= limit as u64 {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             *curr = filtered;
                             index_used = "filter";
+                        }
+                        None => {
+                            if let Some(results) =
+                                spatial_scan_all_live_if_small(self.db, next_take_limit, |slot_lat, slot_lon| {
+                                    let dx = slot_lat - lat;
+                                    let dy = slot_lon - lon;
+                                    dx * dx + dy * dy <= r_sq
+                                })
+                            {
+                                candidates = Some(results);
+                                index_used = "filter_all";
+                            } else {
+                                let results: RoaringBitmap = self
+                                    .db
+                                    .spatial
+                                    .read()
+                                    .locate_within_distance([*lat, *lon], r_sq)
+                                    .take(next_take_limit.unwrap_or(u32::MAX) as usize)
+                                    .map(|n| n.id)
+                                    .collect();
+                                candidates = Some(results);
+                                index_used = "rtree";
+                            }
                         }
                         _ => {
                             let results: RoaringBitmap = self
@@ -965,6 +1380,33 @@ impl<'db> Set<'db> {
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
                                 if let Some(v) = json.get(field) {
                                     if values_set.contains(&v) {
+                                        filtered.insert(idx);
+                                    }
+                                }
+                            }
+                        }
+                        *bm = filtered;
+                    }
+                    index_used = "payload";
+                }
+                Step::Like(field, pattern, case_insensitive) => {
+                    if let Some(ref mut bm) = candidates {
+                        let mut filtered = RoaringBitmap::new();
+                        for idx in bm.iter() {
+                            let slot = self.db.nodes.read_at(idx as u64);
+                            if slot.flags == 0 {
+                                continue;
+                            }
+                            let bytes = self.db.blobs.read(slot.blob_offset, slot.blob_len);
+                            if let Some(value) = extract_single_string_field_fast(bytes, field) {
+                                if like_matches_fast(value, pattern, *case_insensitive) {
+                                    filtered.insert(idx);
+                                }
+                                continue;
+                            }
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                                if let Some(value) = payload_field_text(&json, field) {
+                                    if like_matches_fast(value, pattern, *case_insensitive) {
                                         filtered.insert(idx);
                                     }
                                 }
@@ -1159,6 +1601,7 @@ impl<'db> Set<'db> {
         candidates: Option<&RoaringBitmap>,
         type_hash: u64,
         max_hops: usize,
+        limit: Option<u32>,
     ) -> RoaringBitmap {
         let mut visited = RoaringBitmap::new();
         let mut frontier: RoaringBitmap = candidates.cloned().unwrap_or_default();
@@ -1178,6 +1621,12 @@ impl<'db> Set<'db> {
                             && !visited.contains(edge.to_node)
                         {
                             next_frontier.insert(edge.to_node);
+                            if let Some(limit) = limit {
+                                if visited.len() + next_frontier.len() >= limit as u64 {
+                                    visited |= next_frontier;
+                                    return visited;
+                                }
+                            }
                         }
                     }
                 }
@@ -1193,6 +1642,7 @@ impl<'db> Set<'db> {
         candidates: Option<&RoaringBitmap>,
         type_hash: u64,
         max_hops: usize,
+        limit: Option<u32>,
     ) -> RoaringBitmap {
         let mut visited = RoaringBitmap::new();
         let mut frontier: RoaringBitmap = candidates.cloned().unwrap_or_default();
@@ -1212,6 +1662,12 @@ impl<'db> Set<'db> {
                             && !visited.contains(edge.from_node)
                         {
                             next_frontier.insert(edge.from_node);
+                            if let Some(limit) = limit {
+                                if visited.len() + next_frontier.len() >= limit as u64 {
+                                    visited |= next_frontier;
+                                    return visited;
+                                }
+                            }
                         }
                     }
                 }
@@ -1229,7 +1685,11 @@ impl<'db> Set<'db> {
         candidates: Option<&RoaringBitmap>,
         type_hash: u64,
         max_hops: usize,
+        limit: Option<u32>,
     ) -> RoaringBitmap {
+        if limit.is_some() {
+            return self.bfs_forward(candidates, type_hash, max_hops, limit);
+        }
         use rayon::prelude::*;
         use std::sync::Mutex;
 
@@ -1275,9 +1735,10 @@ impl<'db> Set<'db> {
         candidates: Option<&RoaringBitmap>,
         type_hash: u64,
         max_hops: usize,
+        limit: Option<u32>,
     ) -> RoaringBitmap {
         // Fallback to sequential when parallel feature is disabled
-        self.bfs_forward(candidates, type_hash, max_hops)
+        self.bfs_forward(candidates, type_hash, max_hops, limit)
     }
 
     /// Parallel backward BFS using Rayon - faster for deep traversals (hops > 3)
@@ -1287,7 +1748,11 @@ impl<'db> Set<'db> {
         candidates: Option<&RoaringBitmap>,
         type_hash: u64,
         max_hops: usize,
+        limit: Option<u32>,
     ) -> RoaringBitmap {
+        if limit.is_some() {
+            return self.bfs_backward(candidates, type_hash, max_hops, limit);
+        }
         use rayon::prelude::*;
         use std::sync::Mutex;
 
@@ -1333,9 +1798,10 @@ impl<'db> Set<'db> {
         candidates: Option<&RoaringBitmap>,
         type_hash: u64,
         max_hops: usize,
+        limit: Option<u32>,
     ) -> RoaringBitmap {
         // Fallback to sequential when parallel feature is disabled
-        self.bfs_backward(candidates, type_hash, max_hops)
+        self.bfs_backward(candidates, type_hash, max_hops, limit)
     }
 
     /// Convert pipeline to JSON format (round-trip serialization).
@@ -1355,8 +1821,9 @@ impl<'db> Set<'db> {
     }
 
     /// Build a Set from a parsed step list, extracting Sort/Skip/Select into Set state.
-    /// Also optimizes the pipeline: removes redundant `All` before spatial steps,
-    /// since spatial steps already handle `candidates = None` via direct R-Tree lookup.
+    /// Also optimizes the pipeline:
+    /// - removes redundant `All` before seedable search steps
+    /// - reorders unanchored retrieval filters so sharper seeds run before vague time
     pub fn from_steps(db: &'db SekejapDB, steps: Vec<Step>) -> Self {
         let mut set = Self {
             db,
@@ -1365,6 +1832,7 @@ impl<'db> Set<'db> {
             skip_n: 0,
             select_fields: None,
         };
+        let mut normalized: Vec<Step> = Vec::new();
         let mut iter = steps.into_iter().peekable();
         while let Some(step) = iter.next() {
             match step {
@@ -1372,21 +1840,229 @@ impl<'db> Set<'db> {
                 Step::Skip(n) => set.skip_n = n,
                 Step::Select(fields) => set.select_fields = Some(fields),
                 Step::All => {
-                    // Drop All when the next step is spatial — spatial steps use the
-                    // R-Tree directly when candidates is None, avoiding an O(N) scan.
-                    let next_is_spatial = iter.peek().map_or(false, |next| matches!(next,
-                        Step::Near(..) | Step::SpatialWithinBbox(..) |
-                        Step::SpatialIntersectsBbox(..) | Step::SpatialWithinPolygon(..) |
-                        Step::StWithin(..) | Step::StContains(..) |
-                        Step::StIntersects(..) | Step::StDWithin(..)
-                    ));
-                    if !next_is_spatial {
-                        set.steps.push(Step::All);
+                    // Drop All when the next step can seed candidates directly.
+                    let next_is_direct_seed = iter.peek().map_or(false, is_direct_seed_step);
+                    if !next_is_direct_seed {
+                        normalized.push(Step::All);
                     }
                 }
-                other => set.steps.push(other),
+                other => normalized.push(other),
             }
         }
+        reorder_unanchored_seed_steps(&mut normalized);
+        set.steps.extend(normalized);
         set
+    }
+}
+
+fn is_graph_step(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::Forward(..)
+            | Step::Backward(..)
+            | Step::ForwardParallel(..)
+            | Step::BackwardParallel(..)
+            | Step::Hops(..)
+            | Step::Leaves
+            | Step::Roots
+    )
+}
+
+fn is_anchored_start(step: &Step) -> bool {
+    matches!(step, Step::One(..) | Step::Many(..))
+}
+
+fn seed_priority(step: &Step) -> usize {
+    match step {
+        Step::WhereEq(..) => 0,
+        Step::WhereBetween(..) | Step::WhereGt(..) | Step::WhereLt(..) | Step::WhereGte(..) | Step::WhereLte(..) | Step::WhereIn(..) => 1,
+        Step::Near(..)
+        | Step::StDWithin(..)
+        | Step::SpatialWithinBbox(..)
+        | Step::SpatialIntersectsBbox(..)
+        | Step::SpatialWithinPolygon(..)
+        | Step::StWithin(..)
+        | Step::StContains(..)
+        | Step::StIntersects(..) => 2,
+        #[cfg(feature = "fulltext")]
+        Step::Matching { .. } => 3,
+        Step::Similar(..) => 4,
+        Step::TimeIntersects(..) | Step::TimeWithin(..) | Step::TimeNear(..) => 5,
+        Step::Like(..) => 6,
+        _ => usize::MAX,
+    }
+}
+
+fn can_reorder_seed(step: &Step) -> bool {
+    seed_priority(step) != usize::MAX
+}
+
+fn reorder_unanchored_seed_steps(steps: &mut Vec<Step>) {
+    if steps.is_empty() || is_anchored_start(&steps[0]) {
+        return;
+    }
+
+    let start = if matches!(steps.first(), Some(Step::Collection(..) | Step::All)) {
+        1
+    } else {
+        0
+    };
+
+    let mut end = start;
+    while end < steps.len() && !is_graph_step(&steps[end]) && can_reorder_seed(&steps[end]) {
+        end += 1;
+    }
+    if end - start <= 1 {
+        return;
+    }
+
+    let mut indexed: Vec<(usize, Step)> = steps[start..end]
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect();
+    indexed.sort_by_key(|(idx, step)| (seed_priority(step), *idx));
+    for (offset, (_, step)) in indexed.into_iter().enumerate() {
+        steps[start + offset] = step;
+    }
+}
+
+fn is_direct_seed_step(step: &Step) -> bool {
+    match step {
+        Step::Near(..)
+        | Step::TimeIntersects(..)
+        | Step::TimeWithin(..)
+        | Step::TimeNear(..)
+        | Step::SpatialWithinBbox(..)
+        | Step::SpatialIntersectsBbox(..)
+        | Step::SpatialWithinPolygon(..)
+        | Step::StWithin(..)
+        | Step::StContains(..)
+        | Step::StIntersects(..)
+        | Step::StDWithin(..)
+        | Step::WhereEq(..)
+        | Step::WhereBetween(..)
+        | Step::WhereGt(..)
+        | Step::WhereLt(..)
+        | Step::WhereGte(..)
+        | Step::WhereLte(..)
+        | Step::WhereIn(..)
+        | Step::Similar(..) => true,
+        #[cfg(feature = "fulltext")]
+        Step::Matching { .. } => true,
+        _ => false,
+    }
+}
+
+fn payload_field_text<'a>(json: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    let key = field.rsplit('.').next().unwrap_or(field);
+    json.get(key).and_then(|value| value.as_str())
+}
+
+fn like_matches(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let value_chars: Vec<char> = if case_insensitive {
+        value.to_lowercase().chars().collect()
+    } else {
+        value.chars().collect()
+    };
+    let pattern_chars: Vec<char> = if case_insensitive {
+        pattern.to_lowercase().chars().collect()
+    } else {
+        pattern.chars().collect()
+    };
+
+    let mut v = 0usize;
+    let mut p = 0usize;
+    let mut star: Option<usize> = None;
+    let mut match_idx = 0usize;
+
+    while v < value_chars.len() {
+        if p < pattern_chars.len() && (pattern_chars[p] == '_' || pattern_chars[p] == value_chars[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern_chars.len() && pattern_chars[p] == '%' {
+            star = Some(p);
+            p += 1;
+            match_idx = v;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            match_idx += 1;
+            v = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern_chars.len() && pattern_chars[p] == '%' {
+        p += 1;
+    }
+
+    p == pattern_chars.len()
+}
+
+enum LikePatternKind<'a> {
+    Exact(&'a str),
+    Prefix(&'a str),
+    Suffix(&'a str),
+    Contains(&'a str),
+    Generic,
+}
+
+fn classify_like_pattern(pattern: &str) -> LikePatternKind<'_> {
+    if pattern.contains('_') {
+        return LikePatternKind::Generic;
+    }
+    let percent_count = pattern.as_bytes().iter().filter(|&&b| b == b'%').count();
+    match percent_count {
+        0 => LikePatternKind::Exact(pattern),
+        1 if pattern.ends_with('%') => LikePatternKind::Prefix(&pattern[..pattern.len() - 1]),
+        1 if pattern.starts_with('%') => LikePatternKind::Suffix(&pattern[1..]),
+        2 if pattern.starts_with('%') && pattern.ends_with('%') => {
+            let inner = &pattern[1..pattern.len() - 1];
+            if inner.contains('%') {
+                LikePatternKind::Generic
+            } else {
+                LikePatternKind::Contains(inner)
+            }
+        }
+        _ => LikePatternKind::Generic,
+    }
+}
+
+fn like_matches_fast(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    match classify_like_pattern(pattern) {
+        LikePatternKind::Generic => like_matches(value, pattern, case_insensitive),
+        LikePatternKind::Exact(needle) => simple_text_match(value, needle, case_insensitive, "exact"),
+        LikePatternKind::Prefix(needle) => {
+            simple_text_match(value, needle, case_insensitive, "prefix")
+        }
+        LikePatternKind::Suffix(needle) => {
+            simple_text_match(value, needle, case_insensitive, "suffix")
+        }
+        LikePatternKind::Contains(needle) => {
+            simple_text_match(value, needle, case_insensitive, "contains")
+        }
+    }
+}
+
+fn simple_text_match(value: &str, needle: &str, case_insensitive: bool, mode: &str) -> bool {
+    if case_insensitive {
+        let value_l = value.to_lowercase();
+        let needle_l = needle.to_lowercase();
+        match mode {
+            "exact" => value_l == needle_l,
+            "prefix" => value_l.starts_with(&needle_l),
+            "suffix" => value_l.ends_with(&needle_l),
+            "contains" => value_l.contains(&needle_l),
+            _ => false,
+        }
+    } else {
+        match mode {
+            "exact" => value == needle,
+            "prefix" => value.starts_with(needle),
+            "suffix" => value.ends_with(needle),
+            "contains" => value.contains(needle),
+            _ => false,
+        }
     }
 }

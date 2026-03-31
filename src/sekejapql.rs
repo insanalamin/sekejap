@@ -1,5 +1,5 @@
 // Query Compiler - JSON pipeline query language
-use crate::types::Step;
+use crate::types::{Step, TimeOfDayQuery, TimeQuery};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
@@ -72,6 +72,54 @@ pub enum StepDef {
         #[serde(rename = "radius")]
         radius: Option<f32>,
     },
+    #[serde(rename = "time_intersects")]
+    TimeIntersects {
+        field: Option<String>,
+        start_year: Option<i64>,
+        end_year: Option<i64>,
+        start_fuzz_years: Option<u16>,
+        end_fuzz_years: Option<u16>,
+        months: Option<Vec<u8>>,
+        weekdays: Option<Vec<u8>>,
+        days_of_month: Option<Vec<u8>>,
+        time_of_day_start: Option<u16>,
+        time_of_day_end: Option<u16>,
+        time_of_day_fuzzy_radius: Option<u16>,
+        recurrence_step_months: Option<u8>,
+        global_fuzziness: Option<f32>,
+    },
+    #[serde(rename = "time_within")]
+    TimeWithin {
+        field: Option<String>,
+        start_year: Option<i64>,
+        end_year: Option<i64>,
+        start_fuzz_years: Option<u16>,
+        end_fuzz_years: Option<u16>,
+        months: Option<Vec<u8>>,
+        weekdays: Option<Vec<u8>>,
+        days_of_month: Option<Vec<u8>>,
+        time_of_day_start: Option<u16>,
+        time_of_day_end: Option<u16>,
+        time_of_day_fuzzy_radius: Option<u16>,
+        recurrence_step_months: Option<u8>,
+        global_fuzziness: Option<f32>,
+    },
+    #[serde(rename = "time_near")]
+    TimeNear {
+        field: Option<String>,
+        start_year: Option<i64>,
+        end_year: Option<i64>,
+        start_fuzz_years: Option<u16>,
+        end_fuzz_years: Option<u16>,
+        months: Option<Vec<u8>>,
+        weekdays: Option<Vec<u8>>,
+        days_of_month: Option<Vec<u8>>,
+        time_of_day_start: Option<u16>,
+        time_of_day_end: Option<u16>,
+        time_of_day_fuzzy_radius: Option<u16>,
+        recurrence_step_months: Option<u8>,
+        global_fuzziness: Option<f32>,
+    },
     #[serde(rename = "spatial_within_bbox")]
     SpatialWithinBbox {
         min_lat: Option<f32>,
@@ -141,6 +189,16 @@ pub enum StepDef {
         field: Option<String>,
         #[serde(rename = "values")]
         values: Option<Vec<Value>>,
+    },
+    #[serde(rename = "like")]
+    Like {
+        field: Option<String>,
+        pattern: Option<String>,
+    },
+    #[serde(rename = "ilike")]
+    ILike {
+        field: Option<String>,
+        pattern: Option<String>,
     },
     #[serde(rename = "intersect")]
     Intersect {
@@ -234,6 +292,114 @@ impl StepDef {
                 lon.unwrap_or(0.0),
                 radius.unwrap_or(10.0),
             )),
+            StepDef::TimeIntersects {
+                field,
+                start_year,
+                end_year,
+                start_fuzz_years,
+                end_fuzz_years,
+                months,
+                weekdays,
+                days_of_month,
+                time_of_day_start,
+                time_of_day_end,
+                time_of_day_fuzzy_radius,
+                recurrence_step_months,
+                global_fuzziness,
+            } => Ok(Step::TimeIntersects(
+                field.clone().unwrap_or_else(|| "time".to_string()),
+                TimeQuery {
+                    start_year: start_year.ok_or("time_intersects: missing start_year")?,
+                    end_year: end_year.ok_or("time_intersects: missing end_year")?,
+                    start_fuzz_years: start_fuzz_years.unwrap_or(0),
+                    end_fuzz_years: end_fuzz_years.unwrap_or(0),
+                    months: months.clone().unwrap_or_default(),
+                    weekdays: weekdays.clone().unwrap_or_default(),
+                    days_of_month: days_of_month.clone().unwrap_or_default(),
+                    time_of_day: match (time_of_day_start, time_of_day_end) {
+                        (Some(start), Some(end)) => Some(TimeOfDayQuery {
+                            start_minute: *start,
+                            end_minute: *end,
+                            fuzzy_radius_minute: time_of_day_fuzzy_radius.unwrap_or(0),
+                        }),
+                        _ => None,
+                    },
+                    recurrence_step_months: *recurrence_step_months,
+                    global_fuzziness: global_fuzziness.unwrap_or(0.0),
+                },
+            )),
+            StepDef::TimeWithin {
+                field,
+                start_year,
+                end_year,
+                start_fuzz_years,
+                end_fuzz_years,
+                months,
+                weekdays,
+                days_of_month,
+                time_of_day_start,
+                time_of_day_end,
+                time_of_day_fuzzy_radius,
+                recurrence_step_months,
+                global_fuzziness,
+            } => Ok(Step::TimeWithin(
+                field.clone().unwrap_or_else(|| "time".to_string()),
+                TimeQuery {
+                    start_year: start_year.ok_or("time_within: missing start_year")?,
+                    end_year: end_year.ok_or("time_within: missing end_year")?,
+                    start_fuzz_years: start_fuzz_years.unwrap_or(0),
+                    end_fuzz_years: end_fuzz_years.unwrap_or(0),
+                    months: months.clone().unwrap_or_default(),
+                    weekdays: weekdays.clone().unwrap_or_default(),
+                    days_of_month: days_of_month.clone().unwrap_or_default(),
+                    time_of_day: match (time_of_day_start, time_of_day_end) {
+                        (Some(start), Some(end)) => Some(TimeOfDayQuery {
+                            start_minute: *start,
+                            end_minute: *end,
+                            fuzzy_radius_minute: time_of_day_fuzzy_radius.unwrap_or(0),
+                        }),
+                        _ => None,
+                    },
+                    recurrence_step_months: *recurrence_step_months,
+                    global_fuzziness: global_fuzziness.unwrap_or(0.0),
+                },
+            )),
+            StepDef::TimeNear {
+                field,
+                start_year,
+                end_year,
+                start_fuzz_years,
+                end_fuzz_years,
+                months,
+                weekdays,
+                days_of_month,
+                time_of_day_start,
+                time_of_day_end,
+                time_of_day_fuzzy_radius,
+                recurrence_step_months,
+                global_fuzziness,
+            } => Ok(Step::TimeNear(
+                field.clone().unwrap_or_else(|| "time".to_string()),
+                TimeQuery {
+                    start_year: start_year.ok_or("time_near: missing start_year")?,
+                    end_year: end_year.ok_or("time_near: missing end_year")?,
+                    start_fuzz_years: start_fuzz_years.unwrap_or(0),
+                    end_fuzz_years: end_fuzz_years.unwrap_or(0),
+                    months: months.clone().unwrap_or_default(),
+                    weekdays: weekdays.clone().unwrap_or_default(),
+                    days_of_month: days_of_month.clone().unwrap_or_default(),
+                    time_of_day: match (time_of_day_start, time_of_day_end) {
+                        (Some(start), Some(end)) => Some(TimeOfDayQuery {
+                            start_minute: *start,
+                            end_minute: *end,
+                            fuzzy_radius_minute: time_of_day_fuzzy_radius.unwrap_or(0),
+                        }),
+                        _ => None,
+                    },
+                    recurrence_step_months: *recurrence_step_months,
+                    global_fuzziness: global_fuzziness.unwrap_or(0.0),
+                },
+            )),
             StepDef::SpatialWithinBbox {
                 min_lat,
                 min_lon,
@@ -312,6 +478,16 @@ impl StepDef {
             StepDef::WhereIn { field, values } => Ok(Step::WhereIn(
                 field.as_ref().ok_or("where_in: missing field")?.clone(),
                 values.clone().ok_or("where_in: missing values")?,
+            )),
+            StepDef::Like { field, pattern } => Ok(Step::Like(
+                field.as_ref().ok_or("like: missing field")?.clone(),
+                pattern.as_ref().ok_or("like: missing pattern")?.clone(),
+                false,
+            )),
+            StepDef::ILike { field, pattern } => Ok(Step::Like(
+                field.as_ref().ok_or("ilike: missing field")?.clone(),
+                pattern.as_ref().ok_or("ilike: missing pattern")?.clone(),
+                true,
             )),
             StepDef::Intersect { other } => Ok(Step::Intersect(
                 other
@@ -503,6 +679,167 @@ impl QueryCompiler {
                     .or(obj.get("radius_km"))
                     .and_then(|v| v.as_f64())
                     .unwrap_or(10.0) as f32,
+            )),
+            "time_intersects" => Ok(Step::TimeIntersects(
+                obj.get("field")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("time")
+                    .to_string(),
+                TimeQuery {
+                    start_year: obj
+                        .get("start_year")
+                        .or(obj.get("startYear"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or("time_intersects: missing start_year")?,
+                    end_year: obj
+                        .get("end_year")
+                        .or(obj.get("endYear"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or("time_intersects: missing end_year")?,
+                    start_fuzz_years: obj
+                        .get("start_fuzz_years")
+                        .or(obj.get("startFuzzYears"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16,
+                    end_fuzz_years: obj
+                        .get("end_fuzz_years")
+                        .or(obj.get("endFuzzYears"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16,
+                    months: obj
+                        .get("months")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                        .unwrap_or_default(),
+                    weekdays: obj
+                        .get("weekdays")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                        .unwrap_or_default(),
+                    days_of_month: obj
+                        .get("days_of_month")
+                        .or(obj.get("daysOfMonth"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                        .unwrap_or_default(),
+                    time_of_day: match (
+                        obj.get("time_of_day_start")
+                            .or(obj.get("timeOfDayStart"))
+                            .and_then(|v| v.as_u64()),
+                        obj.get("time_of_day_end")
+                            .or(obj.get("timeOfDayEnd"))
+                            .and_then(|v| v.as_u64()),
+                    ) {
+                        (Some(start), Some(end)) => Some(TimeOfDayQuery {
+                            start_minute: start as u16,
+                            end_minute: end as u16,
+                            fuzzy_radius_minute: obj
+                                .get("time_of_day_fuzzy_radius")
+                                .or(obj.get("timeOfDayFuzzyRadius"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u16,
+                        }),
+                        _ => None,
+                    },
+                    recurrence_step_months: obj
+                        .get("recurrence_step_months")
+                        .or(obj.get("recurrenceStepMonths"))
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u8),
+                    global_fuzziness: obj
+                        .get("global_fuzziness")
+                        .or(obj.get("globalFuzziness"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as f32,
+                },
+            )),
+            "time_within" => Ok(Step::TimeWithin(
+                obj.get("field")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("time")
+                    .to_string(),
+                TimeQuery {
+                    start_year: obj
+                        .get("start_year")
+                        .or(obj.get("startYear"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or("time_within: missing start_year")?,
+                    end_year: obj
+                        .get("end_year")
+                        .or(obj.get("endYear"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or("time_within: missing end_year")?,
+                    start_fuzz_years: obj
+                        .get("start_fuzz_years")
+                        .or(obj.get("startFuzzYears"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16,
+                    end_fuzz_years: obj
+                        .get("end_fuzz_years")
+                        .or(obj.get("endFuzzYears"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16,
+                    months: obj.get("months").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()).unwrap_or_default(),
+                    weekdays: obj.get("weekdays").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()).unwrap_or_default(),
+                    days_of_month: obj.get("days_of_month").or(obj.get("daysOfMonth")).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()).unwrap_or_default(),
+                    time_of_day: match (
+                        obj.get("time_of_day_start").or(obj.get("timeOfDayStart")).and_then(|v| v.as_u64()),
+                        obj.get("time_of_day_end").or(obj.get("timeOfDayEnd")).and_then(|v| v.as_u64()),
+                    ) {
+                        (Some(start), Some(end)) => Some(TimeOfDayQuery {
+                            start_minute: start as u16,
+                            end_minute: end as u16,
+                            fuzzy_radius_minute: obj.get("time_of_day_fuzzy_radius").or(obj.get("timeOfDayFuzzyRadius")).and_then(|v| v.as_u64()).unwrap_or(0) as u16,
+                        }),
+                        _ => None,
+                    },
+                    recurrence_step_months: obj.get("recurrence_step_months").or(obj.get("recurrenceStepMonths")).and_then(|v| v.as_u64()).map(|n| n as u8),
+                    global_fuzziness: obj.get("global_fuzziness").or(obj.get("globalFuzziness")).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                },
+            )),
+            "time_near" => Ok(Step::TimeNear(
+                obj.get("field")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("time")
+                    .to_string(),
+                TimeQuery {
+                    start_year: obj
+                        .get("start_year")
+                        .or(obj.get("startYear"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or("time_near: missing start_year")?,
+                    end_year: obj
+                        .get("end_year")
+                        .or(obj.get("endYear"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or("time_near: missing end_year")?,
+                    start_fuzz_years: obj
+                        .get("start_fuzz_years")
+                        .or(obj.get("startFuzzYears"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16,
+                    end_fuzz_years: obj
+                        .get("end_fuzz_years")
+                        .or(obj.get("endFuzzYears"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16,
+                    months: obj.get("months").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()).unwrap_or_default(),
+                    weekdays: obj.get("weekdays").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()).unwrap_or_default(),
+                    days_of_month: obj.get("days_of_month").or(obj.get("daysOfMonth")).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()).unwrap_or_default(),
+                    time_of_day: match (
+                        obj.get("time_of_day_start").or(obj.get("timeOfDayStart")).and_then(|v| v.as_u64()),
+                        obj.get("time_of_day_end").or(obj.get("timeOfDayEnd")).and_then(|v| v.as_u64()),
+                    ) {
+                        (Some(start), Some(end)) => Some(TimeOfDayQuery {
+                            start_minute: start as u16,
+                            end_minute: end as u16,
+                            fuzzy_radius_minute: obj.get("time_of_day_fuzzy_radius").or(obj.get("timeOfDayFuzzyRadius")).and_then(|v| v.as_u64()).unwrap_or(0) as u16,
+                        }),
+                        _ => None,
+                    },
+                    recurrence_step_months: obj.get("recurrence_step_months").or(obj.get("recurrenceStepMonths")).and_then(|v| v.as_u64()).map(|n| n as u8),
+                    global_fuzziness: obj.get("global_fuzziness").or(obj.get("globalFuzziness")).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                },
             )),
             "spatial_within_bbox" => Ok(Step::SpatialWithinBbox(
                 obj.get("min_lat").and_then(|v| v.as_f64()).unwrap_or(-90.0) as f32,
@@ -876,6 +1213,51 @@ impl QueryCompiler {
                     require_f32(args, 1, "near lon")?,
                     require_f32(args, 2, "near radius_km")?,
                 ),
+                "time_intersects" => Step::TimeIntersects(
+                    require_str(args, 0, "time_intersects field")?.to_string(),
+                    TimeQuery {
+                        start_year: require_i64(args, 1, "time_intersects start_year")?,
+                        end_year: require_i64(args, 2, "time_intersects end_year")?,
+                        start_fuzz_years: args.get(3).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0),
+                        end_fuzz_years: args.get(4).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0),
+                        months: Vec::new(),
+                        weekdays: Vec::new(),
+                        days_of_month: Vec::new(),
+                        time_of_day: None,
+                        recurrence_step_months: None,
+                        global_fuzziness: 0.0,
+                    },
+                ),
+                "time_within" => Step::TimeWithin(
+                    require_str(args, 0, "time_within field")?.to_string(),
+                    TimeQuery {
+                        start_year: require_i64(args, 1, "time_within start_year")?,
+                        end_year: require_i64(args, 2, "time_within end_year")?,
+                        start_fuzz_years: args.get(3).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0),
+                        end_fuzz_years: args.get(4).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0),
+                        months: Vec::new(),
+                        weekdays: Vec::new(),
+                        days_of_month: Vec::new(),
+                        time_of_day: None,
+                        recurrence_step_months: None,
+                        global_fuzziness: 0.0,
+                    },
+                ),
+                "time_near" => Step::TimeNear(
+                    require_str(args, 0, "time_near field")?.to_string(),
+                    TimeQuery {
+                        start_year: require_i64(args, 1, "time_near start_year")?,
+                        end_year: require_i64(args, 2, "time_near end_year")?,
+                        start_fuzz_years: args.get(3).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0),
+                        end_fuzz_years: args.get(4).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0),
+                        months: Vec::new(),
+                        weekdays: Vec::new(),
+                        days_of_month: Vec::new(),
+                        time_of_day: None,
+                        recurrence_step_months: None,
+                        global_fuzziness: 0.0,
+                    },
+                ),
                 "spatial_within_bbox" => Step::SpatialWithinBbox(
                     require_f32(args, 0, "spatial_within_bbox min_lat")?,
                     require_f32(args, 1, "spatial_within_bbox min_lon")?,
@@ -1117,6 +1499,12 @@ fn require_f64(args: &[String], idx: usize, ctx: &str) -> Result<f64, Box<dyn Er
     args.get(idx)
         .and_then(|s| s.parse::<f64>().ok())
         .ok_or_else(|| format!("{}: expected number", ctx).into())
+}
+
+fn require_i64(args: &[String], idx: usize, ctx: &str) -> Result<i64, Box<dyn Error>> {
+    args.get(idx)
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| format!("{}: expected integer", ctx).into())
 }
 
 fn require_u32(args: &[String], idx: usize, ctx: &str) -> Result<u32, Box<dyn Error>> {
