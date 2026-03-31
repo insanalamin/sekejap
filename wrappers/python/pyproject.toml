@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin"]
+requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -11,6 +11,10 @@ requires-python = ">=3.8"
 homepage = "https://sekejap.mecha.id"
 repository = "https://github.com/insanalamin/sekejap"
 
+[project.scripts]
+sekejap = "sekejap.__main__:main"
+
 [tool.maturin]
 module-name = "sekejap"
 bindings = "pyo3"
+python-source = "python"
