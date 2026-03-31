@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/browser", "skcli", "sekejap-benchmark"]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -10,7 +10,7 @@ homepage = "https://db.sekejap.life"
 description = "A graph-first, embedded multi-model database engine"
 
 [workspace.dependencies]
-sekejap = { path = ".", version = "0.5.0" }
+sekejap = { path = ".", version = "0.5.3" }
 
 [package]
 name = "sekejap"
