@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/browser", "skcli", "sekejap-benchmark"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
