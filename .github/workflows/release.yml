@@ -3,10 +3,9 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
-  # --- 1. Publish Rust Library ---
   publish-rust-library:
     name: Publish Rust Library
     runs-on: ubuntu-latest
@@ -22,7 +21,6 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
           RUSTFLAGS: "-C target-feature=+aes,+sse2"
 
-  # --- 2. Publish Rust CLI ---
   publish-rust-cli:
     name: Publish Rust CLI
     runs-on: ubuntu-latest
@@ -39,30 +37,75 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
           RUSTFLAGS: "-C target-feature=+aes,+sse2"
 
-  # --- 3. Build and Publish Python Wheels ---
-  publish-python:
-    name: Build & Publish Python Wheels
-    runs-on: ubuntu-latest
+  build-python-wheels:
+    name: Build Python Wheels
+    runs-on: ${{ matrix.os }}
     permissions:
       id-token: write
-    environment:
-      name: release
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-latest
+            target: aarch64
+          - os: windows-latest
+            target: x64
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Build Wheels
+      - name: Build wheels
         uses: PyO3/maturin-action@v1
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         with:
           target: ${{ matrix.target }}
-          # Limit to stable Python versions to avoid 3.14-dev errors
           args: --release --out dist -i python3.8 -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
           working-directory: wrappers/python
-          
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist-${{ matrix.os }}-${{ matrix.target }}
+          path: wrappers/python/dist
+
+  build-python-sdist:
+    name: Build Python sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: wrappers/python
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: wrappers/python/dist
+
+  publish-python:
+    name: Publish Python Distributions
+    runs-on: ubuntu-latest
+    needs:
+      - build-python-wheels
+      - build-python-sdist
+    permissions:
+      id-token: write
+    environment:
+      name: release
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-dist-*
+          path: wrappers/python/dist
+          merge-multiple: true
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: python-sdist
+          path: wrappers/python/dist
       - name: Publish to PyPI via Trusted Publisher
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
