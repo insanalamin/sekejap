@@ -1,8 +1,8 @@
 [workspace]
-members = [".", "wrappers/python", "wrappers/browser", "skcli"]
+members = [".", "wrappers/python", "wrappers/browser", "skcli", "sekejap-benchmark"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -40,8 +40,11 @@ geo = "0.28"
 geojson = { version = "0.24", features = ["geo-types"] }
 rand = "0.8"
 rayon = "1.10"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = { version = "1", features = ["v4"] }
 tantivy = { version = "0.25", optional = true }
 seekstorm = { version = "2.3", optional = true, default-features = false }
+sqlparser = "0.53"
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -83,3 +86,4 @@ parallel = []
 
 [package.metadata.docs.rs]
 all-features = true
+
