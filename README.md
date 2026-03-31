@@ -1,168 +1,211 @@
-# Sekejap DB
+# Sekejap
 
-A **graph-first**, embedded multi-model database engine for Rust and Python.
+Sekejap is an embedded, graph-first multimodel database engine for workloads that combine graph, time, space, vector, and text.
 
-Graph is the primary structure. **Vector**, **Spatial**, and **Full-Text** are first-class attributes on nodes, queryable in the same pipeline. Runs in-process — zero network overhead.
+Built for cases like:
+- root-cause analysis
+- hybrid retrieval and graph-aware RAG
+- memory retrieval around time and place
+- researcher, article, music, and knowledge graph discovery
 
----
+## Hello World: Root Cause Analysis
 
-## Features
+Rust:
 
-- **Graph-First**: Edges are first-class. Queries traverse the graph to prune the search space before applying other indexes.
-- **HNSW Engine**: Parallel construction (Rayon), NEON/AVX2 SIMD CosineDistance, `ef_construction=32`. 44x faster batch build vs v0.2.
-- **Spatial (PostGIS-par)**: R-Tree index on full GeoJSON geometry envelopes. Point, Polygon, LineString, Multi* — with DE-9IM predicates (`st_within`, `st_contains`, `st_intersects`, `st_dwithin`).
-- **Full-Text**: Pluggable adapters — Tantivy (default) or SeekStorm.
-- **Embedded**: Memory-mapped arenas, zero-copy storage.
-- **SekejapQL**: Lightweight text query language — one op per line, compiles to the same pipeline as JSON.
-- **CLI**: Interactive REPL (`skcli`) — SekejapQL and JSON queries, mutations, introspection.
-
----
-
-## Quick Start
-
-### Python
-```python
-import sekejap, json
-
-db = sekejap.SekejapDB("./data", capacity=1_000_000)
-db.init_hnsw(16)
-db.init_fulltext()
-
-# Write
-db.put("persons/lucci", json.dumps({
-    "name": "Rob Lucci", "status": "wanted",
-    "vectors": {"dense": [0.12, 0.87, ...]},
-    "geo": {"loc": {"lat": 3.1105, "lon": 101.6682}}
-}))
-db.link("persons/lucci", "crimes/robbery-001", "committed", 1.0)
-
-# Query — SekejapQL
-result = db.query_skql("""
-    one "crimes/robbery-001"
-    backward "committed"
-    where_eq "status" "wanted"
-    forward "lives_at"
-    near 3.1291 101.6710 5.0
-    select "name" "alias" "geo"
-""")
-
-db.flush()
-db.close()
-```
-
-### Rust
 ```rust
 use sekejap::SekejapDB;
+use std::path::Path;
 
-let db = SekejapDB::new(std::path::Path::new("./data"), 1_000_000)?;
-db.init_hnsw(16);
-db.init_fulltext(std::path::Path::new("./data"));
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = SekejapDB::new(Path::new("./data"), 1_000_000)?;
 
-db.nodes().put("persons/lucci", r#"{"name":"Rob Lucci","status":"wanted"}"#)?;
-db.edges().link("persons/lucci", "crimes/robbery-001", "committed", 1.0)?;
+    let rows = db.query(
+        "SELECT id
+         FROM cases
+         TRAVERSE FORWARD caused_by TO causes HOPS 5
+         WHERE id = 'incident_00001'
+           AND MATCHING('wet road OR drainage OR education')
+         LIMIT 20",
+    )?;
 
-// SekejapQL (auto-detected — anything not starting with '{')
-let result = db.query("collection \"crimes\"\nwhere_eq \"type\" \"robbery\"\ntake 20")?;
-
-// JSON pipeline (auto-detected — starts with '{')
-let result = db.query(r#"{"pipeline":[{"op":"collection","name":"crimes"},{"op":"take","n":5}]}"#)?;
-
-// Fluent builder (Rust only)
-let result = db.nodes().collection("crimes")
-    .where_eq("type", serde_json::json!("robbery"))
-    .near(3.13, 101.67, 1.0)
-    .take(20)
-    .collect()?;
+    println!("hits = {}", rows.data.len());
+    Ok(())
+}
 ```
 
----
+Python:
 
-## SekejapQL — One Op Per Line
+```python
+import json
+import sekejap
 
-```
-# Find all gang members → their crimes → near a location
-one "persons/lucci"
-forward "member_of"
-backward "member_of"
-forward "committed"
-near 3.1291 101.6710 2.0
-sort "severity" desc
-take 10
-select "type" "severity" "occurred_at"
+db = sekejap.SekejapDB("./data", capacity=1_000_000)
 
-# News → crime → suspect network inside a polygon
-collection "articles"
-matching "armed robbery Bangsar 2024"
-forward "reported_by"
-backward "committed"
-forward "member_of"
-backward "member_of"
-spatial_within_polygon (3.128,101.665) (3.135,101.665) (3.135,101.678) (3.128,101.678) (3.128,101.665)
-where_eq "status" "wanted"
-select "name" "alias" "geo" "priors"
+rows = json.loads(db.query("""
+SELECT id
+FROM cases
+TRAVERSE FORWARD caused_by TO causes HOPS 5
+WHERE id = 'incident_00001'
+  AND MATCHING('wet road OR drainage OR education')
+LIMIT 20
+"""))
 
-# PostGIS-par geometry predicates
-collection "zones"
-st_intersects (3.128,101.665) (3.128,101.678) (3.135,101.678) (3.135,101.665) (3.128,101.665)
+print(len(rows))
 ```
 
-Pipe style also works: `collection "crimes" | where_eq "type" "robbery" | near 3.1 101.6 1.0 | take 20`
+## Hello World: Hybrid Retrieval
 
----
+Rust:
 
-## CLI (`skcli`)
+```rust
+let rows = db.query(
+    "SELECT id
+     FROM researchers
+     TRAVERSE FORWARD collaborates_with TO researchers HOPS 2
+     WHERE id = 'researcher_00000'
+       AND VECTOR_NEAR(embedding, [0.12, 0.34, 0.56, 0.78], 100)
+       AND ST_DWithin(geometry, POINT(144.9631 -37.8136), 40.0)
+     LIMIT 20",
+)?;
+```
+
+Python:
+
+```python
+rows = json.loads(db.query("""
+SELECT id
+FROM researchers
+TRAVERSE FORWARD collaborates_with TO researchers HOPS 2
+WHERE id = 'researcher_00000'
+  AND VECTOR_NEAR(embedding, [0.12, 0.34, 0.56, 0.78], 100)
+  AND ST_DWithin(geometry, POINT(144.9631 -37.8136), 40.0)
+LIMIT 20
+"""))
+```
+
+## Available As
+
+- Rust library
+- Rust CLI
+- Python library
+- Python bindings with both SQL and Atomic interfaces
+
+Common-user recommendation:
+- use SQL first
+
+Lower-level control:
+- use Atomic / fluent builder when you need it
+
+## Installation
+
+### Rust
+
+Library:
 
 ```bash
-cargo run -p skcli -- --path ./data
-
-sekejap> collection "crimes" | where_eq "type" "robbery" | take 10
-sekejap> one "persons/lucci" | forward "committed"
-sekejap> count collection "crimes"
-sekejap> explain collection "crimes" | take 5
-sekejap> mutate {"mutation":"put_json","data":{"_id":"crimes/001","type":"robbery"}}
-sekejap> \d crimes
-sekejap> \l
+cargo add sekejap
 ```
 
----
-
-## Benchmark (10k Records, Apple Silicon)
-
-| Operation | SQLite (Rust) | Sekejap (Rust) | Speedup |
-|---|---|---|---|
-| Simple retrieval (1k lookups) | 3.4ms | 1.9ms | **1.8x** |
-| Vector retrieval (k-NN) | 9.3ms | 0.3ms | **31x** |
-| Graph traversal (100x 3-hop) | 8.5ms | 1.1ms | **7.7x** |
-| V+S retrieval | 5.3ms | 1.7ms | **3.1x** |
-| V+F retrieval | 3.7ms | <0.1ms | **instant** |
-
-See [`docs/benchmark-results.md`](docs/benchmark-results.md) for full Rust vs Python results and methodology.
-
----
-
-## Full Documentation
-
-See the [`docs/`](docs/) folder:
-- [`docs/skill.md`](docs/skill.md) — Skill guide for AI agents and developers (setup recipes, all query ops, common patterns, gotchas)
-- [`docs/api-reference.md`](docs/api-reference.md) — Complete API reference (setup, schema, mutations, all SekejapQL ops, JSON pipeline, data conventions, performance)
-- [`docs/interface-table.md`](docs/interface-table.md) — Interface inventory and status
-- [`docs/roadmap.md`](docs/roadmap.md) — Development roadmap and execution notes
-- [`docs/benchmark-results.md`](docs/benchmark-results.md) — Benchmark results (Rust vs Python vs SQLite)
-
----
-
-## Build
+CLI:
 
 ```bash
-cargo test
-cargo build --release
-
-# CLI
-cargo run -p skcli -- --path ./data
-
-# Python wheel
-maturin develop --release
+cargo install sekejap-cli
 ```
+
+Then run:
+
+```bash
+sekejap
+```
+
+### Python
+
+Library and CLI:
+
+```bash
+pip install sekejap
+```
+
+Then use either:
+
+```bash
+sekejap --help
+```
+
+or:
+
+```python
+import sekejap
+```
+
+### npm
+
+Planned later for CLI distribution.
+
+## Quick Usage
+
+Rust main API:
+
+- `SekejapDB::new(path, capacity)`
+- `db.query(input)`
+- `db.count(input)`
+- `db.explain(input)`
+- `db.mutate(input)`
+- `db.flush()`
+- `db.nodes()`
+- `db.edges()`
+- `db.schema()`
+
+Python main API:
+
+- `sekejap.SekejapDB(path, capacity=...)`
+- `db.query(input)`
+- `db.count(input)`
+- `db.explain(input)`
+- `db.mutate(input)`
+- `db.flush()`
+- `db.nodes()`
+- `db.edges()`
+- `db.schema()`
+
+Input styles:
+- SQL
+- SekejapQL / pipeline text
+- JSON pipeline and JSON mutation payloads
+
+Recommended usage:
+- Rust app code: SQL first, Atomic when lower-level control is needed
+- Python app code: SQL first
+- CLI: SQL first
+
+## Current Status
+
+Rust library is ready for production testing for the core surface:
+- `CREATE COLLECTION`
+- `INSERT INTO`
+- `SELECT`
+- `TRAVERSE`
+- `RELATE`
+- `RELATE MANY`
+- `UPDATE`
+- `DELETE FROM`
+- `UNRELATE`
+
+Collection schemas now persist across reopen, so SQL create/write/query survives process restarts.
+
+Current strongest benchmark areas:
+- anchored graph traversal
+- exact-time filtering
+- vector retrieval
+- point-centric spatial filtering
+
+Current weakest area:
+- vague time and vague-time-heavy hybrid planning
+
+## Docs
+
+- [docs/user-guide.md](docs/user-guide.md)
+- [docs/sekejap-sql.md](docs/sekejap-sql.md)
 
 ## License
 
