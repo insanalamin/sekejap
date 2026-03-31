@@ -6,9 +6,9 @@ on:
       - 'v*'
 
 jobs:
-  # --- 1. Publish Rust Crate ---
-  publish-rust:
-    name: Publish to Crates.io
+  # --- 1. Publish Rust Library ---
+  publish-rust-library:
+    name: Publish Rust Library
     runs-on: ubuntu-latest
     environment:
       name: release
@@ -16,13 +16,30 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Publish to Crates.io
-        run: cargo publish --all-features
+      - name: Publish sekejap to Crates.io
+        run: cargo publish -p sekejap --all-features
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
           RUSTFLAGS: "-C target-feature=+aes,+sse2"
 
-  # --- 2. Build and Publish Python Wheels ---
+  # --- 2. Publish Rust CLI ---
+  publish-rust-cli:
+    name: Publish Rust CLI
+    runs-on: ubuntu-latest
+    needs: publish-rust-library
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish sekejap-cli to Crates.io
+        run: cargo publish -p sekejap-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          RUSTFLAGS: "-C target-feature=+aes,+sse2"
+
+  # --- 3. Build and Publish Python Wheels ---
   publish-python:
     name: Build & Publish Python Wheels
     runs-on: ubuntu-latest
