@@ -9,6 +9,9 @@ repository = "https://github.com/insanalamin/sekejap"
 homepage = "https://db.sekejap.life"
 description = "A graph-first, embedded multi-model database engine"
 
+[workspace.dependencies]
+sekejap = { path = "." }
+
 [package]
 name = "sekejap"
 version.workspace = true
