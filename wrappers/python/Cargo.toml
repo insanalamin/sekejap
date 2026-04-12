@@ -28,29 +28,18 @@ name = "sekejap"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# SekejapDB core (same workspace)
-sekejap = { path = "../..", default-features = false }
+# sekejap core (same workspace)
+sekejap = { path = "../.." }
 
 # Python bindings
 pyo3 = { version = "0.22", features = ["extension-module", "auto-initialize", "generate-import-lib"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Hashing
-seahash = "4.1"
 
 [build-dependencies]
 pyo3-build-config = "0.22"
 
-[features]
-default = ["fulltext"]
-fulltext = ["sekejap/fulltext"]
-
 [tool.maturin]
 module-name = "sekejap"
 package-name = "sekejap"
-
-#[project.metadata]
-#name = "sekejap"

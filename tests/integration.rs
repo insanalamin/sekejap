@@ -1,0 +1,2788 @@
+use sekejap::CoreDB;
+
+// ── Basics ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn put_and_get() {
+    let mut db = CoreDB::new();
+    db.put("alice", r#"{"name":"Alice","age":30}"#).unwrap();
+    let json = db.get("alice").unwrap();
+    assert!(json.contains("Alice"));
+}
+
+#[test]
+fn put_bad_json_returns_error() {
+    let mut db = CoreDB::new();
+    assert!(db.put("x", "not json!!").is_err());
+}
+
+#[test]
+fn remove_node() {
+    let mut db = CoreDB::new();
+    db.put("alice", r#"{"name":"Alice"}"#).unwrap();
+    assert!(db.contains("alice"));
+    db.remove("alice");
+    assert!(!db.contains("alice"));
+    assert_eq!(db.get("alice"), None);
+}
+
+#[test]
+fn upsert_updates_collection_index() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"_collection":"x"}"#).unwrap();
+    db.put("a", r#"{"_collection":"y"}"#).unwrap(); // upsert into different collection
+
+    // "a" should now be in "y", NOT "x"
+    let in_y = db.collection("y").count();
+    let in_x = db.collection("x").count();
+    assert_eq!(in_y, 1);
+    assert_eq!(in_x, 0);
+}
+
+// ── Graph traversal ───────────────────────────────────────────────────────────
+
+#[test]
+fn forward_traversal() {
+    let mut db = CoreDB::new();
+    db.put("alice", r#"{"name":"Alice"}"#).unwrap();
+    db.put("bob",   r#"{"name":"Bob"}"#).unwrap();
+    db.put("carol", r#"{"name":"Carol"}"#).unwrap();
+    db.link("alice", "bob",   "follows", 1.0);
+    db.link("alice", "carol", "follows", 1.0);
+
+    let hits = db.one("alice").forward("follows").collect();
+    let names: Vec<&str> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"Bob"));
+    assert!(names.contains(&"Carol"));
+}
+
+#[test]
+fn backward_traversal() {
+    let mut db = CoreDB::new();
+    db.put("alice", r#"{"name":"Alice"}"#).unwrap();
+    db.put("bob",   r#"{"name":"Bob"}"#).unwrap();
+    db.link("alice", "bob", "follows", 1.0);
+
+    let hits = db.one("bob").backward("follows").collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "alice");
+}
+
+#[test]
+fn hops_bfs() {
+    let mut db = CoreDB::new();
+    for n in ["a","b","c","d"] {
+        db.put(n, &format!(r#"{{"id":"{}"}}"#, n)).unwrap();
+    }
+    db.link("a", "b", "e", 1.0);
+    db.link("b", "c", "e", 1.0);
+    db.link("c", "d", "e", 1.0);
+
+    // 2 hops from "a" should reach "a","b","c" but not "d"
+    let reached = db.one("a").hops(2).count();
+    assert_eq!(reached, 3); // a, b, c
+
+    // 3 hops from "a" should reach all four
+    let reached = db.one("a").hops(3).count();
+    assert_eq!(reached, 4);
+}
+
+#[test]
+fn roots_and_leaves() {
+    let mut db = CoreDB::new();
+    db.put("root",  r#"{}"#).unwrap();
+    db.put("mid",   r#"{}"#).unwrap();
+    db.put("leaf",  r#"{}"#).unwrap();
+    db.link("root", "mid",  "e", 1.0);
+    db.link("mid",  "leaf", "e", 1.0);
+
+    assert_eq!(db.all().roots().count(), 1);
+    assert_eq!(db.all().roots().first().unwrap().slug, "root");
+    assert_eq!(db.all().leaves().count(), 1);
+    assert_eq!(db.all().leaves().first().unwrap().slug, "leaf");
+}
+
+#[test]
+fn unlink_removes_edge() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{}"#).unwrap();
+    db.put("b", r#"{}"#).unwrap();
+    db.link("a", "b", "e", 1.0);
+    db.unlink("a", "b", "e");
+
+    assert_eq!(db.one("a").forward("e").count(), 0);
+    assert_eq!(db.one("b").backward("e").count(), 0);
+}
+
+// ── Collection queries ────────────────────────────────────────────────────────
+
+#[test]
+fn collection_query() {
+    let mut db = CoreDB::new();
+    db.put("alice", r#"{"_collection":"users","name":"Alice"}"#).unwrap();
+    db.put("bob",   r#"{"_collection":"users","name":"Bob"}"#).unwrap();
+    db.put("post1", r#"{"_collection":"posts","title":"Hi"}"#).unwrap();
+
+    assert_eq!(db.collection("users").count(), 2);
+    assert_eq!(db.collection("posts").count(), 1);
+    assert_eq!(db.collection("unknown").count(), 0);
+}
+
+// ── Payload filters ───────────────────────────────────────────────────────────
+
+#[test]
+fn where_eq() {
+    let mut db = CoreDB::new();
+    db.put("alice", r#"{"name":"Alice","role":"admin"}"#).unwrap();
+    db.put("bob",   r#"{"name":"Bob",  "role":"user"}"#).unwrap();
+
+    let hits = db.all().where_eq("role", "admin").collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "alice");
+}
+
+#[test]
+fn where_gt_lt() {
+    let mut db = CoreDB::new();
+    db.put("young", r#"{"age":20}"#).unwrap();
+    db.put("mid",   r#"{"age":35}"#).unwrap();
+    db.put("old",   r#"{"age":60}"#).unwrap();
+
+    assert_eq!(db.all().where_gt("age", 30.0).count(), 2);
+    assert_eq!(db.all().where_lt("age", 30.0).count(), 1);
+    assert_eq!(db.all().where_between("age", 25.0, 50.0).count(), 1);
+}
+
+#[test]
+fn where_in_filter() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"status":"active"}"#).unwrap();
+    db.put("b", r#"{"status":"inactive"}"#).unwrap();
+    db.put("c", r#"{"status":"pending"}"#).unwrap();
+
+    let hits = db.all()
+        .where_in("status", vec![
+            serde_json::json!("active"),
+            serde_json::json!("pending"),
+        ])
+        .count();
+    assert_eq!(hits, 2);
+}
+
+#[test]
+fn like_filter() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"email":"alice@example.com"}"#).unwrap();
+    db.put("b", r#"{"email":"bob@corp.com"}"#).unwrap();
+
+    assert_eq!(db.all().like("email", "example.com").count(), 1);
+}
+
+// ── Set algebra ───────────────────────────────────────────────────────────────
+
+#[test]
+fn intersect() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"role":"admin","active":true}"#).unwrap();
+    db.put("b", r#"{"role":"admin","active":false}"#).unwrap();
+    db.put("c", r#"{"role":"user", "active":true}"#).unwrap();
+
+    let admins = db.all().where_eq("role", "admin");
+    let active = db.all().where_eq("active", true);
+    let hits = admins.intersect(active).count();
+    assert_eq!(hits, 1); // only "a"
+}
+
+#[test]
+fn union() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"tag":"rust"}"#).unwrap();
+    db.put("b", r#"{"tag":"python"}"#).unwrap();
+    db.put("c", r#"{"tag":"go"}"#).unwrap();
+
+    let rust = db.all().where_eq("tag", "rust");
+    let go   = db.all().where_eq("tag", "go");
+    assert_eq!(rust.union(go).count(), 2);
+}
+
+#[test]
+fn subtract() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"score":10}"#).unwrap();
+    db.put("b", r#"{"score":20}"#).unwrap();
+    db.put("c", r#"{"score":30}"#).unwrap();
+
+    let all  = db.all();
+    let high = db.all().where_gt("score", 15.0);
+    // all minus high = just "a"
+    assert_eq!(all.subtract(high).count(), 1);
+}
+
+// ── Shaping ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn sort_and_take() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"score":30}"#).unwrap();
+    db.put("b", r#"{"score":10}"#).unwrap();
+    db.put("c", r#"{"score":20}"#).unwrap();
+
+    let hits = db.all().sort("score", true).take(2).collect();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["score"], 10);
+    assert_eq!(hits[1].payload.as_ref().unwrap()["score"], 20);
+}
+
+#[test]
+fn skip_and_take() {
+    let mut db = CoreDB::new();
+    for i in 0..10u32 {
+        db.put(&format!("node{i}"), &format!(r#"{{"i":{i}}}"#)).unwrap();
+    }
+    let hits = db.all().sort("i", true).skip(3).take(4).collect();
+    assert_eq!(hits.len(), 4);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["i"], 3);
+}
+
+#[test]
+fn select_projection() {
+    let mut db = CoreDB::new();
+    db.put("alice", r#"{"name":"Alice","age":30,"secret":"xyz"}"#).unwrap();
+
+    let hits = db.one("alice")
+        .select(["name", "age"])
+        .collect();
+    let p = hits[0].payload.as_ref().unwrap();
+    assert!(p.get("name").is_some());
+    assert!(p.get("age").is_some());
+    assert!(p.get("secret").is_none());
+}
+
+// ── Edge inspection ───────────────────────────────────────────────────────────
+
+#[test]
+fn edges_from_and_to() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{}"#).unwrap();
+    db.put("b", r#"{}"#).unwrap();
+    db.link("a", "b", "edge", 0.5);
+
+    let fwd = db.edges_from("a");
+    assert_eq!(fwd.len(), 1);
+    assert_eq!(fwd[0].to_slug.as_deref(), Some("b"));
+    assert!((fwd[0].strength - 0.5).abs() < 1e-6);
+
+    let rev = db.edges_to("b");
+    assert_eq!(rev.len(), 1);
+    assert_eq!(rev[0].from_slug.as_deref(), Some("a"));
+}
+
+#[test]
+fn link_meta_stores_metadata() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{}"#).unwrap();
+    db.put("b", r#"{}"#).unwrap();
+    db.link_meta("a", "b", "knows", 1.0, r#"{"since":2020}"#).unwrap();
+
+    let edges = db.edges_from("a");
+    let meta = edges[0].meta.as_ref().unwrap();
+    assert_eq!(meta["since"], 2020);
+}
+
+// ── Many nodes ────────────────────────────────────────────────────────────────
+
+#[test]
+fn put_many_and_count() {
+    let mut db = CoreDB::new();
+    let items: Vec<(String, String)> = (0..100)
+        .map(|i| (format!("node{i}"), format!(r#"{{"i":{i}}}"#)))
+        .collect();
+
+    db.put_many(items.iter().map(|(s, j)| (s.as_str(), j.as_str()))).unwrap();
+    assert_eq!(db.node_count(), 100);
+}
+
+#[test]
+fn many_starter() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"v":1}"#).unwrap();
+    db.put("b", r#"{"v":2}"#).unwrap();
+    db.put("c", r#"{"v":3}"#).unwrap();
+
+    let hits = db.many(["a", "c"]).collect();
+    assert_eq!(hits.len(), 2);
+}
+
+// ── SQL execute (INSERT / DELETE) ──────────────────────────────────────────────
+
+#[test]
+fn execute_insert_creates_node() {
+    let mut db = CoreDB::new();
+    let n = db.execute(
+        "INSERT INTO users (_key, name, age) VALUES ('alice', 'Alice', 30)"
+    ).unwrap();
+    assert_eq!(n, 1);
+    assert!(db.contains("users/alice"));
+    let payload = db.get("users/alice").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(v["name"], "Alice");
+    assert_eq!(v["_collection"], "users");
+}
+
+#[test]
+fn execute_insert_is_queryable() {
+    let mut db = CoreDB::new();
+    db.execute("INSERT INTO products (_key, price) VALUES ('p1', 10)").unwrap();
+    db.execute("INSERT INTO products (_key, price) VALUES ('p2', 50)").unwrap();
+    db.execute("INSERT INTO products (_key, price) VALUES ('p3', 100)").unwrap();
+
+    let hits = db.query("SELECT * FROM products WHERE price > 20").unwrap().collect();
+    assert_eq!(hits.len(), 2);
+
+    // Verify slug is collection/_key
+    let all = db.query("SELECT * FROM products").unwrap().collect();
+    assert!(all.iter().any(|h| h.slug == "products/p1"));
+}
+
+#[test]
+fn execute_delete_removes_matching_nodes() {
+    let mut db = CoreDB::new();
+    db.put("keep",   r#"{"_collection":"items","active":true}"#).unwrap();
+    db.put("remove", r#"{"_collection":"items","active":false}"#).unwrap();
+
+    let n = db.execute("DELETE FROM items WHERE active = false").unwrap();
+    assert_eq!(n, 1);
+    assert!(db.contains("keep"));
+    assert!(!db.contains("remove"));
+}
+
+#[test]
+fn execute_delete_all() {
+    let mut db = CoreDB::new();
+    for i in 0..5u32 {
+        db.put(&format!("n{i}"), "{}").unwrap();
+    }
+    let n = db.execute("DELETE FROM ALL").unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(db.node_count(), 0);
+}
+
+#[test]
+fn execute_insert_error_on_missing_key() {
+    let mut db = CoreDB::new();
+    let err = db.execute("INSERT INTO users (name) VALUES ('Alice')").unwrap_err();
+    assert!(matches!(err, sekejap::SqlError::MissingField { field: "_key" }));
+}
+
+// ── MATCH integration tests ──────────────────────────────────────────────────
+
+fn setup_music_db() -> CoreDB {
+    let mut db = CoreDB::new();
+    db.put("artist/the-vines", r#"{"_collection":"artist","_key":"the-vines","name":"The Vines"}"#).unwrap();
+    db.put("genre/garage-rock", r#"{"_collection":"genre","_key":"garage-rock","name":"Garage Rock"}"#).unwrap();
+    db.put("genre/alternative", r#"{"_collection":"genre","_key":"alternative","name":"Alternative"}"#).unwrap();
+    db.put("city/melbourne", r#"{"_collection":"city","_key":"melbourne","name":"Melbourne"}"#).unwrap();
+    db.link("artist/the-vines", "genre/garage-rock", "has_genre", 10.0);
+    db.link("artist/the-vines", "genre/alternative", "has_genre", 5.0);
+    db.link("artist/the-vines", "city/melbourne", "origin", 1.0);
+    db
+}
+
+#[test]
+fn match_forward_one_hop() {
+    let db = setup_music_db();
+    let hits = db.query(
+        "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g"
+    ).unwrap().collect();
+    let names: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"Garage Rock"), "got: {:?}", names);
+    assert!(names.contains(&"Alternative"), "got: {:?}", names);
+    assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn match_backward_one_hop() {
+    let db = setup_music_db();
+    let hits = db.query(
+        "MATCH (g:genre)<-[:has_genre]-(a:artist) WHERE g._key = 'garage-rock' RETURN a"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].payload.as_ref().unwrap().get("name").unwrap().as_str() == Some("The Vines"));
+}
+
+#[test]
+fn match_strength_filter() {
+    let db = setup_music_db();
+    // Only has_genre edges with strength >= 7 should pass (garage-rock=10, alternative=5)
+    let hits = db.query(
+        "MATCH (a:artist)-[r:has_genre]->(g:genre) WHERE a._key = 'the-vines' AND r.strength >= 7 RETURN g"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].payload.as_ref().unwrap().get("name").unwrap().as_str() == Some("Garage Rock"));
+}
+
+#[test]
+fn match_inline_props_end_node() {
+    let db = setup_music_db();
+    let hits = db.query(
+        "MATCH (a:artist)-[:has_genre]->(:genre {_key: 'garage-rock'}) RETURN a"
+    ).unwrap().collect();
+    // This should find nodes reachable from any artist via has_genre, filtered to _key=garage-rock
+    // The result is the genre node itself (end node), filtered by inline props
+    assert!(!hits.is_empty());
+}
+
+#[test]
+fn match_typed_multihop_bfs() {
+    let mut db = CoreDB::new();
+    // Chain: flood -> drainage_failure -> budget_cut -> policy_change
+    db.put("event/flood", r#"{"_collection":"event","_key":"flood","name":"Maribyrnong Flood"}"#).unwrap();
+    db.put("event/drainage", r#"{"_collection":"event","_key":"drainage","name":"Drainage Failure"}"#).unwrap();
+    db.put("event/budget", r#"{"_collection":"event","_key":"budget","name":"Budget Cut"}"#).unwrap();
+    db.put("event/policy", r#"{"_collection":"event","_key":"policy","name":"Policy Change"}"#).unwrap();
+    db.link("event/flood", "event/drainage", "caused_by", 0.9);
+    db.link("event/drainage", "event/budget", "caused_by", 0.8);
+    db.link("event/budget", "event/policy", "caused_by", 0.7);
+
+    let hits = db.query(
+        "MATCH (e:event)-[:caused_by*1..5]->(root) WHERE e._key = 'flood' RETURN root"
+    ).unwrap().collect();
+    let names: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"Drainage Failure"), "got: {:?}", names);
+    assert!(names.contains(&"Budget Cut"), "got: {:?}", names);
+    assert!(names.contains(&"Policy Change"), "got: {:?}", names);
+    assert_eq!(names.len(), 3);
+}
+
+#[test]
+fn match_union_two_patterns() {
+    let db = setup_music_db();
+    let hits = db.query(
+        "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g \
+         UNION \
+         MATCH (a:artist)-[:origin]->(c:city) WHERE a._key = 'the-vines' RETURN c"
+    ).unwrap().collect();
+    let names: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    // Should have genres + city
+    assert!(names.contains(&"Garage Rock"), "got: {:?}", names);
+    assert!(names.contains(&"Melbourne"), "got: {:?}", names);
+}
+
+#[test]
+fn match_with_limit() {
+    let db = setup_music_db();
+    let hits = db.query(
+        "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g LIMIT 1"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+}
+
+// ── MATCH optimisation integration tests ─────────────────────────────────────
+
+/// End _key condition in WHERE → One() inside Intersect (O(1) end-node lookup).
+#[test]
+fn match_end_node_key_in_where() {
+    let db = setup_music_db();
+    // Both start AND end have _key — should return exactly the targeted genre
+    let hits = db.query(
+        "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' AND g._key = 'garage-rock' RETURN g"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let name = hits[0].payload.as_ref().unwrap()["name"].as_str().unwrap();
+    assert_eq!(name, "Garage Rock");
+}
+
+/// End WHERE filter (non-_key) moves inside Intersect and still filters correctly.
+#[test]
+fn match_end_node_filter_in_where() {
+    let db = setup_music_db();
+    let hits = db.query(
+        "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' AND g.name = 'Garage Rock' RETURN g"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1, "should return only Garage Rock genre");
+    assert_eq!(
+        hits[0].payload.as_ref().unwrap()["name"].as_str().unwrap(),
+        "Garage Rock"
+    );
+}
+
+/// End node without a label: fall back to plain WhereEq filter (still correct).
+#[test]
+fn match_end_no_label_where_filter() {
+    let db = setup_music_db();
+    // (a:artist)-[:has_genre]->(b)  — no label on end, filter by name
+    let hits = db.query(
+        "MATCH (a:artist)-[:has_genre]->(b) WHERE a._key = 'the-vines' AND b.name = 'Garage Rock' RETURN b"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn ilike_filter() {
+    let db = setup_music_db();
+    let hits = db.query(
+        "SELECT * FROM artist WHERE name ILIKE 'VINES'"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].payload.as_ref().unwrap().get("name").unwrap().as_str() == Some("The Vines"));
+}
+
+// ── Spatial integration tests ────────────────────────────────────────────────
+
+fn setup_spatial_db() -> CoreDB {
+    let mut db = CoreDB::new();
+
+    // Points: Melbourne landmarks
+    db.put("places/melb-central", r#"{
+        "_collection": "places",
+        "_key": "melb-central",
+        "name": "Melbourne Central",
+        "category": "landmark",
+        "geometry": {"type": "Point", "coordinates": [144.9631, -37.8102]}
+    }"#).unwrap();
+
+    db.put("places/flinders-st", r#"{
+        "_collection": "places",
+        "_key": "flinders-st",
+        "name": "Flinders Street Station",
+        "category": "landmark",
+        "geometry": {"type": "Point", "coordinates": [144.9671, -37.8183]}
+    }"#).unwrap();
+
+    db.put("places/exhibition-bldg", r#"{
+        "_collection": "places",
+        "_key": "exhibition-bldg",
+        "name": "Royal Exhibition Building",
+        "category": "landmark",
+        "geometry": {"type": "Point", "coordinates": [144.9717, -37.8047]}
+    }"#).unwrap();
+
+    // Far away point: Geelong
+    db.put("places/geelong-station", r#"{
+        "_collection": "places",
+        "_key": "geelong-station",
+        "name": "Geelong Station",
+        "category": "transport",
+        "geometry": {"type": "Point", "coordinates": [144.3617, -38.1499]}
+    }"#).unwrap();
+
+    // Polygons: zones
+    db.put("zones/cbd", r#"{
+        "_collection": "zones",
+        "_key": "cbd",
+        "name": "CBD Zone",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [144.95, -37.80],
+                [144.98, -37.80],
+                [144.98, -37.83],
+                [144.95, -37.83],
+                [144.95, -37.80]
+            ]]
+        }
+    }"#).unwrap();
+
+    db.put("zones/fitzroy", r#"{
+        "_collection": "zones",
+        "_key": "fitzroy",
+        "name": "Fitzroy Zone",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [144.97, -37.79],
+                [145.00, -37.79],
+                [145.00, -37.81],
+                [144.97, -37.81],
+                [144.97, -37.79]
+            ]]
+        }
+    }"#).unwrap();
+
+    // LineString: tram route
+    db.put("routes/tram96", r#"{
+        "_collection": "routes",
+        "_key": "tram96",
+        "name": "Tram Route 96",
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [
+                [144.95, -37.81],
+                [144.96, -37.81],
+                [144.97, -37.81],
+                [144.98, -37.81]
+            ]
+        }
+    }"#).unwrap();
+
+    db.build_spatial_index();
+    db
+}
+
+#[test]
+fn spatial_st_dwithin() {
+    let db = setup_spatial_db();
+    // Find places within 2km of Melbourne Central
+    let hits = db.query(
+        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 2.0)"
+    ).unwrap().collect();
+    let names: Vec<&str> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"Melbourne Central"));
+    assert!(names.contains(&"Flinders Street Station"));
+    assert!(names.contains(&"Royal Exhibition Building"));
+    assert!(!names.contains(&"Geelong Station"), "Geelong should be too far: {:?}", names);
+}
+
+#[test]
+fn spatial_st_contains_point() {
+    let db = setup_spatial_db();
+    // Find zones containing Melbourne Central's coordinates
+    let hits = db.query(
+        "SELECT * FROM zones WHERE ST_Contains(geometry, POINT(144.9631 -37.8102))"
+    ).unwrap().collect();
+    let names: Vec<&str> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"CBD Zone"), "CBD should contain Melbourne Central: {:?}", names);
+}
+
+#[test]
+fn spatial_st_within_polygon() {
+    let db = setup_spatial_db();
+    // Find places within a big box around CBD
+    let hits = db.query(
+        "SELECT * FROM places WHERE ST_Within(geometry, POLYGON((144.94 -37.79, 144.99 -37.79, 144.99 -37.83, 144.94 -37.83, 144.94 -37.79)))"
+    ).unwrap().collect();
+    let names: Vec<&str> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"Melbourne Central"));
+    assert!(names.contains(&"Flinders Street Station"));
+    assert!(names.contains(&"Royal Exhibition Building"));
+    assert!(!names.contains(&"Geelong Station"));
+}
+
+#[test]
+fn spatial_st_intersects() {
+    let db = setup_spatial_db();
+    // The tram route crosses a rectangle overlapping its path
+    let hits = db.query(
+        "SELECT * FROM routes WHERE ST_Intersects(geometry, POLYGON((144.955 -37.815, 144.975 -37.815, 144.975 -37.805, 144.955 -37.805, 144.955 -37.815)))"
+    ).unwrap().collect();
+    let names: Vec<&str> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"Tram Route 96"), "Tram route should intersect: {:?}", names);
+}
+
+#[test]
+fn spatial_atomic_api() {
+    let db = setup_spatial_db();
+    // Test atomic API: st_dwithin
+    let hits = db.collection("places")
+        .st_dwithin(-37.8102, 144.9631, 2.0)
+        .collect();
+    let names: Vec<&str> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"Melbourne Central"));
+    assert!(names.contains(&"Flinders Street Station"));
+    assert!(!names.contains(&"Geelong Station"));
+
+    // Test atomic API: near (alias)
+    let near_count = db.collection("places")
+        .near(-37.8102, 144.9631, 2.0)
+        .count();
+    assert_eq!(near_count, hits.len());
+}
+
+#[test]
+fn spatial_sql_combined() {
+    let db = setup_spatial_db();
+    // Combine spatial with regular filter
+    let hits = db.query(
+        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 2.0) AND category = 'landmark'"
+    ).unwrap().collect();
+    let names: Vec<&str> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"Melbourne Central"));
+    assert!(names.contains(&"Flinders Street Station"));
+    assert!(names.contains(&"Royal Exhibition Building"));
+    assert_eq!(names.len(), 3);
+}
+
+#[test]
+fn spatial_st_contains_point_atomic() {
+    let db = setup_spatial_db();
+    let hits = db.collection("zones")
+        .st_contains_point(-37.8102, 144.9631)
+        .collect();
+    let names: Vec<&str> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"CBD Zone"));
+}
+
+#[test]
+fn spatial_execute_insert_then_query() {
+    let mut db = CoreDB::new();
+    db.execute(
+        "INSERT INTO places (_key, name, geometry) VALUES ('melb-central', 'Melbourne Central', '{\"type\":\"Point\",\"coordinates\":[144.9631,-37.8102]}')"
+    ).unwrap();
+    let hits = db.query(
+        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8136), 1.0)"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "places/melb-central");
+    assert!(hits[0].payload.as_ref().unwrap().get("name").unwrap().as_str() == Some("Melbourne Central"));
+}
+
+// ── Spatial grid specific tests ──────────────────────────────────────────────
+
+#[test]
+fn spatial_grid_same_results_as_brute_force() {
+    // Run the same queries with and without grid, compare results
+    let mut db_brute = CoreDB::new();
+    let mut db_grid = CoreDB::new();
+
+    let nodes = [
+        ("p1", r#"{"_collection":"places","geometry":{"type":"Point","coordinates":[144.96,-37.81]}}"#),
+        ("p2", r#"{"_collection":"places","geometry":{"type":"Point","coordinates":[144.97,-37.82]}}"#),
+        ("p3", r#"{"_collection":"places","geometry":{"type":"Point","coordinates":[145.50,-38.00]}}"#),
+    ];
+    for (slug, json) in &nodes {
+        db_brute.put(slug, json).unwrap();
+        db_grid.put(slug, json).unwrap();
+    }
+    db_grid.build_spatial_index();
+
+    // ST_DWithin
+    let brute = db_brute.collection("places").st_dwithin(-37.81, 144.96, 2.0).count();
+    let grid  = db_grid.collection("places").st_dwithin(-37.81, 144.96, 2.0).count();
+    assert_eq!(brute, grid, "ST_DWithin mismatch");
+
+    // ST_ContainsPoint (need polygon nodes)
+    let mut db_brute2 = CoreDB::new();
+    let mut db_grid2 = CoreDB::new();
+    let zone = r#"{"_collection":"zones","geometry":{"type":"Polygon","coordinates":[[
+        [144.95,-37.80],[144.98,-37.80],[144.98,-37.83],[144.95,-37.83],[144.95,-37.80]
+    ]]}}"#;
+    db_brute2.put("z1", zone).unwrap();
+    db_grid2.put("z1", zone).unwrap();
+    db_grid2.build_spatial_index();
+
+    let brute2 = db_brute2.collection("zones").st_contains_point(-37.81, 144.96).count();
+    let grid2  = db_grid2.collection("zones").st_contains_point(-37.81, 144.96).count();
+    assert_eq!(brute2, grid2, "ST_ContainsPoint mismatch");
+}
+
+#[test]
+fn spatial_grid_incremental_update() {
+    let mut db = CoreDB::new();
+    db.put("p1", r#"{"_collection":"places","geometry":{"type":"Point","coordinates":[144.96,-37.81]}}"#).unwrap();
+    db.build_spatial_index();
+
+    // Verify initial state
+    assert_eq!(db.collection("places").st_dwithin(-37.81, 144.96, 1.0).count(), 1);
+
+    // Insert after grid build — should be found via incremental update
+    db.put("p2", r#"{"_collection":"places","geometry":{"type":"Point","coordinates":[144.97,-37.82]}}"#).unwrap();
+    assert_eq!(db.collection("places").st_dwithin(-37.81, 144.96, 2.0).count(), 2);
+
+    // Remove — should no longer be found
+    db.remove("p1");
+    let hits = db.collection("places").st_dwithin(-37.81, 144.96, 2.0).collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "p2");
+}
+
+// ── INSERT with geometry JSON tests ──────────────────────────────────────────
+
+#[test]
+fn insert_geometry_json_auto_parsed() {
+    let mut db = CoreDB::new();
+    db.execute(
+        r#"INSERT INTO places (_key, name, geometry) VALUES ('fed-square', 'Federation Square', '{"type":"Point","coordinates":[144.9694,-37.8180]}')"#
+    ).unwrap();
+    db.build_spatial_index();
+
+    // The geometry should have been parsed into a native JSON object, not kept as string
+    let raw = db.get("places/fed-square").unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(payload["geometry"].is_object(), "geometry should be parsed object, not string");
+    assert_eq!(payload["geometry"]["type"], "Point");
+
+    // Should be queryable via spatial SQL
+    let hits = db.query(
+        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9694 -37.8180), 1.0)"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "places/fed-square");
+}
+
+#[test]
+fn insert_geometry_polygon_json_auto_parsed() {
+    let mut db = CoreDB::new();
+    db.execute(
+        r#"INSERT INTO zones (_key, name, geometry) VALUES ('fitzroy', 'Fitzroy', '{"type":"Polygon","coordinates":[[[144.97,-37.79],[145.00,-37.79],[145.00,-37.82],[144.97,-37.82],[144.97,-37.79]]]}')"#
+    ).unwrap();
+    db.build_spatial_index();
+
+    let hits = db.query(
+        "SELECT * FROM zones WHERE ST_Contains(geometry, POINT(144.98 -37.80))"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "zones/fitzroy");
+}
+
+// ── INSERT edge integration tests ────────────────────────────────────────────
+
+#[test]
+fn insert_edge_single() {
+    let mut db = CoreDB::new();
+    db.put("artist/the-vines", r#"{"name":"The Vines","_collection":"artist","_key":"the-vines"}"#).unwrap();
+    db.put("genre/garage-rock", r#"{"name":"Garage Rock","_collection":"genre","_key":"garage-rock"}"#).unwrap();
+
+    let count = db.execute("INSERT ('artist/the-vines')-[:has_genre {strength: 10}]->('genre/garage-rock')").unwrap();
+    assert_eq!(count, 1);
+
+    // Verify edge via atomic API
+    let hits = db.one("artist/the-vines").forward("has_genre").collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "genre/garage-rock");
+
+    // Verify via MATCH
+    let hits = db.query(
+        "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "genre/garage-rock");
+}
+
+#[test]
+fn insert_edge_with_meta() {
+    let mut db = CoreDB::new();
+    db.put("city/melbourne", r#"{"name":"Melbourne","_collection":"city"}"#).unwrap();
+    db.put("suburb/fitzroy", r#"{"name":"Fitzroy","_collection":"suburb"}"#).unwrap();
+
+    db.execute("INSERT ('city/melbourne')-[:contains {strength: 1, distance: 3.2}]->('suburb/fitzroy')").unwrap();
+
+    let edges = db.edges_from("city/melbourne");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].strength, 1.0);
+    let meta = edges[0].meta.as_ref().unwrap();
+    assert_eq!(meta["distance"], 3.2);
+}
+
+#[test]
+fn insert_edge_multiple() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"_collection":"node"}"#).unwrap();
+    db.put("b", r#"{"_collection":"node"}"#).unwrap();
+    db.put("c", r#"{"_collection":"node"}"#).unwrap();
+
+    let count = db.execute(
+        "INSERT ('a')-[:links {strength: 5}]->('b'), ('b')-[:links {strength: 3}]->('c')"
+    ).unwrap();
+    assert_eq!(count, 2);
+
+    let hits_b = db.one("a").forward("links").collect();
+    assert_eq!(hits_b.len(), 1);
+    assert_eq!(hits_b[0].slug, "b");
+
+    let hits_c = db.one("b").forward("links").collect();
+    assert_eq!(hits_c.len(), 1);
+    assert_eq!(hits_c[0].slug, "c");
+
+    // Full chain
+    let chain = db.one("a").forward("links").forward("links").collect();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].slug, "c");
+}
+
+#[test]
+fn insert_edge_default_strength() {
+    let mut db = CoreDB::new();
+    db.put("x", r#"{"_collection":"node"}"#).unwrap();
+    db.put("y", r#"{"_collection":"node"}"#).unwrap();
+
+    db.execute("INSERT ('x')-[:knows]->('y')").unwrap();
+
+    let edges = db.edges_from("x");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].strength, 1.0);
+}
+
+#[test]
+fn delete_edge_removes_edge() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"_collection":"node"}"#).unwrap();
+    db.put("b", r#"{"_collection":"node"}"#).unwrap();
+    db.link("a", "b", "knows", 1.0);
+
+    // Verify edge exists
+    assert_eq!(db.one("a").forward("knows").count(), 1);
+
+    // Delete it
+    let count = db.execute("DELETE ('a')-[:knows]->('b')").unwrap();
+    assert_eq!(count, 1);
+
+    // Verify gone
+    assert_eq!(db.one("a").forward("knows").count(), 0);
+    assert_eq!(db.one("b").backward("knows").count(), 0);
+}
+
+
+// ── JSON path operators (-> / ->>) ────────────────────────────────────────────
+
+#[test]
+fn json_path_text_where() {
+    let mut db = CoreDB::new();
+    db.put(
+        "users/alice",
+        r#"{"_collection":"users","_key":"alice","profile":{"role":"admin","age":30}}"#,
+    )
+    .unwrap();
+    db.put(
+        "users/bob",
+        r#"{"_collection":"users","_key":"bob","profile":{"role":"viewer","age":25}}"#,
+    )
+    .unwrap();
+
+    // ->> returns TEXT; compare to string literal
+    let hits = db
+        .query("SELECT * FROM users WHERE profile->>'role' = 'admin'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/alice");
+}
+
+#[test]
+fn json_path_obj_where() {
+    let mut db = CoreDB::new();
+    db.put(
+        "items/a",
+        r#"{"_collection":"items","_key":"a","meta":{"status":{"active":true},"score":9}}"#,
+    )
+    .unwrap();
+    db.put(
+        "items/b",
+        r#"{"_collection":"items","_key":"b","meta":{"status":{"active":false},"score":3}}"#,
+    )
+    .unwrap();
+
+    // -> returns JSON value; compare to number
+    let hits = db
+        .query("SELECT * FROM items WHERE meta->'score' > 5")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "items/a");
+}
+
+#[test]
+fn json_path_deep_chain() {
+    let mut db = CoreDB::new();
+    db.put(
+        "nodes/x",
+        r#"{"_collection":"nodes","_key":"x","a":{"b":{"c":"deep"}}}"#,
+    )
+    .unwrap();
+    db.put(
+        "nodes/y",
+        r#"{"_collection":"nodes","_key":"y","a":{"b":{"c":"other"}}}"#,
+    )
+    .unwrap();
+
+    // Three-level deep path with ->>
+    let hits = db
+        .query("SELECT * FROM nodes WHERE a->'b'->>'c' = 'deep'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "nodes/x");
+}
+
+#[test]
+fn json_path_select_projection() {
+    let mut db = CoreDB::new();
+    db.put(
+        "users/u1",
+        r#"{"_collection":"users","_key":"u1","profile":{"name":"Alice","role":"admin"}}"#,
+    )
+    .unwrap();
+
+    let hits = db
+        .query("SELECT profile->>'role' FROM users")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    // Output key should be the last path segment ("role"), value should be the text
+    let payload = hits[0].payload.as_ref().unwrap();
+    assert_eq!(payload["role"], serde_json::json!("admin"));
+}
+
+#[test]
+fn json_path_combined_where_and_plain() {
+    let mut db = CoreDB::new();
+    db.put(
+        "orders/1",
+        r#"{"_collection":"orders","_key":"1","status":"active","extra":{"priority":"high"}}"#,
+    )
+    .unwrap();
+    db.put(
+        "orders/2",
+        r#"{"_collection":"orders","_key":"2","status":"active","extra":{"priority":"low"}}"#,
+    )
+    .unwrap();
+    db.put(
+        "orders/3",
+        r#"{"_collection":"orders","_key":"3","status":"closed","extra":{"priority":"high"}}"#,
+    )
+    .unwrap();
+
+    // Combine plain field + JSON path in WHERE
+    let hits = db
+        .query("SELECT * FROM orders WHERE status = 'active' AND extra->>'priority' = 'high'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "orders/1");
+}
+
+// ── IS NULL / IS NOT NULL ─────────────────────────────────────────────────────
+
+#[test]
+fn where_is_null() {
+    let mut db = CoreDB::new();
+    db.put("users/1", r#"{"_collection":"users","_key":"1","name":"Alice","email":"a@x.com"}"#)
+        .unwrap();
+    db.put("users/2", r#"{"_collection":"users","_key":"2","name":"Bob"}"#)
+        .unwrap();
+    db.put("users/3", r#"{"_collection":"users","_key":"3","name":"Carol","email":null}"#)
+        .unwrap();
+
+    // IS NULL should match Bob (missing) and Carol (explicit null)
+    let hits = db
+        .query("SELECT * FROM users WHERE email IS NULL")
+        .unwrap()
+        .collect();
+    let slugs: std::collections::HashSet<_> = hits.iter().map(|h| h.slug.as_str()).collect();
+    assert_eq!(slugs.len(), 2);
+    assert!(slugs.contains("users/2"));
+    assert!(slugs.contains("users/3"));
+}
+
+#[test]
+fn where_is_not_null() {
+    let mut db = CoreDB::new();
+    db.put("users/1", r#"{"_collection":"users","_key":"1","name":"Alice","email":"a@x.com"}"#)
+        .unwrap();
+    db.put("users/2", r#"{"_collection":"users","_key":"2","name":"Bob"}"#)
+        .unwrap();
+
+    let hits = db
+        .query("SELECT * FROM users WHERE email IS NOT NULL")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/1");
+}
+
+// ── NOT condition ─────────────────────────────────────────────────────────────
+
+#[test]
+fn where_not_eq() {
+    let mut db = CoreDB::new();
+    db.put("items/1", r#"{"_collection":"items","_key":"1","status":"active"}"#)
+        .unwrap();
+    db.put("items/2", r#"{"_collection":"items","_key":"2","status":"inactive"}"#)
+        .unwrap();
+    db.put("items/3", r#"{"_collection":"items","_key":"3","status":"active"}"#)
+        .unwrap();
+
+    let hits = db
+        .query("SELECT * FROM items WHERE NOT status = 'active'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "items/2");
+}
+
+// ── OR conditions ─────────────────────────────────────────────────────────────
+
+#[test]
+fn where_or_basic() {
+    let mut db = CoreDB::new();
+    db.put("products/1", r#"{"_collection":"products","_key":"1","category":"books"}"#)
+        .unwrap();
+    db.put("products/2", r#"{"_collection":"products","_key":"2","category":"music"}"#)
+        .unwrap();
+    db.put("products/3", r#"{"_collection":"products","_key":"3","category":"food"}"#)
+        .unwrap();
+
+    let hits = db
+        .query("SELECT * FROM products WHERE category = 'books' OR category = 'music'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 2);
+    let slugs: std::collections::HashSet<_> = hits.iter().map(|h| h.slug.as_str()).collect();
+    assert!(slugs.contains("products/1"));
+    assert!(slugs.contains("products/2"));
+}
+
+#[test]
+fn where_or_and_precedence() {
+    // (A AND B) OR C — AND binds tighter than OR
+    let mut db = CoreDB::new();
+    db.put(
+        "events/1",
+        r#"{"_collection":"events","_key":"1","type":"sale","region":"eu"}"#,
+    )
+    .unwrap();
+    db.put(
+        "events/2",
+        r#"{"_collection":"events","_key":"2","type":"sale","region":"us"}"#,
+    )
+    .unwrap();
+    db.put(
+        "events/3",
+        r#"{"_collection":"events","_key":"3","type":"view","region":"eu"}"#,
+    )
+    .unwrap();
+
+    // type='sale' AND region='eu'  OR  type='view'
+    let hits = db
+        .query("SELECT * FROM events WHERE type = 'sale' AND region = 'eu' OR type = 'view'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 2);
+    let slugs: std::collections::HashSet<_> = hits.iter().map(|h| h.slug.as_str()).collect();
+    assert!(slugs.contains("events/1")); // sale AND eu
+    assert!(slugs.contains("events/3")); // view
+}
+
+// ── SELECT … AS alias ─────────────────────────────────────────────────────────
+
+#[test]
+fn select_as_alias() {
+    let mut db = CoreDB::new();
+    db.put(
+        "employees/1",
+        r#"{"_collection":"employees","_key":"1","first_name":"Alice","dept":"eng"}"#,
+    )
+    .unwrap();
+
+    let hits = db
+        .query("SELECT first_name AS name, dept AS department FROM employees")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap().as_object().unwrap();
+    assert!(p.contains_key("name"), "expected key 'name', got {:?}", p.keys().collect::<Vec<_>>());
+    assert_eq!(p["name"], "Alice");
+    assert!(p.contains_key("department"));
+    assert_eq!(p["department"], "eng");
+    // Original keys should NOT be present
+    assert!(!p.contains_key("first_name"));
+    assert!(!p.contains_key("dept"));
+}
+
+// ── ORDER BY JSON path ────────────────────────────────────────────────────────
+
+#[test]
+fn order_by_json_path() {
+    let mut db = CoreDB::new();
+    db.put(
+        "scores/1",
+        r#"{"_collection":"scores","_key":"1","meta":{"val":30}}"#,
+    )
+    .unwrap();
+    db.put(
+        "scores/2",
+        r#"{"_collection":"scores","_key":"2","meta":{"val":10}}"#,
+    )
+    .unwrap();
+    db.put(
+        "scores/3",
+        r#"{"_collection":"scores","_key":"3","meta":{"val":20}}"#,
+    )
+    .unwrap();
+
+    let hits = db
+        .query("SELECT * FROM scores ORDER BY meta->'val' ASC")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 3);
+    assert_eq!(hits[0].slug, "scores/2"); // val=10
+    assert_eq!(hits[1].slug, "scores/3"); // val=20
+    assert_eq!(hits[2].slug, "scores/1"); // val=30
+}
+
+// ── Aggregations ──────────────────────────────────────────────────────────────
+
+#[test]
+fn aggregate_count_star() {
+    let mut db = CoreDB::new();
+    for i in 1..=5 {
+        db.put(
+            &format!("log/{}", i),
+            &format!(r#"{{"_collection":"log","_key":"{}","level":"info"}}"#, i),
+        )
+        .unwrap();
+    }
+
+    let hits = db
+        .query("SELECT COUNT(*) FROM log")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["count"], 5);
+}
+
+#[test]
+fn aggregate_sum_avg() {
+    let mut db = CoreDB::new();
+    db.put("sales/1", r#"{"_collection":"sales","_key":"1","amount":100}"#)
+        .unwrap();
+    db.put("sales/2", r#"{"_collection":"sales","_key":"2","amount":200}"#)
+        .unwrap();
+    db.put("sales/3", r#"{"_collection":"sales","_key":"3","amount":300}"#)
+        .unwrap();
+
+    let hits = db
+        .query("SELECT SUM(amount), AVG(amount) FROM sales")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["sum"].as_f64().unwrap(), 600.0);
+    assert_eq!(p["avg"].as_f64().unwrap(), 200.0);
+}
+
+#[test]
+fn aggregate_min_max() {
+    let mut db = CoreDB::new();
+    db.put("temps/1", r#"{"_collection":"temps","_key":"1","c":5}"#)
+        .unwrap();
+    db.put("temps/2", r#"{"_collection":"temps","_key":"2","c":42}"#)
+        .unwrap();
+    db.put("temps/3", r#"{"_collection":"temps","_key":"3","c":17}"#)
+        .unwrap();
+
+    let hits = db
+        .query("SELECT MIN(c), MAX(c) FROM temps")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["min"].as_f64().unwrap(), 5.0);
+    assert_eq!(p["max"].as_f64().unwrap(), 42.0);
+}
+
+#[test]
+fn aggregate_count_star_with_alias() {
+    let mut db = CoreDB::new();
+    for i in 1..=3 {
+        db.put(
+            &format!("things/{}", i),
+            &format!(r#"{{"_collection":"things","_key":"{}"}}"#, i),
+        )
+        .unwrap();
+    }
+
+    let hits = db
+        .query("SELECT COUNT(*) AS total FROM things")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap().as_object().unwrap();
+    assert!(p.contains_key("total"), "expected 'total', got {:?}", p.keys().collect::<Vec<_>>());
+    assert_eq!(p["total"], 3);
+}
+
+#[test]
+fn aggregate_with_where_filter() {
+    let mut db = CoreDB::new();
+    db.put("orders/1", r#"{"_collection":"orders","_key":"1","status":"paid","amount":50}"#)
+        .unwrap();
+    db.put("orders/2", r#"{"_collection":"orders","_key":"2","status":"paid","amount":75}"#)
+        .unwrap();
+    db.put("orders/3", r#"{"_collection":"orders","_key":"3","status":"pending","amount":30}"#)
+        .unwrap();
+
+    let hits = db
+        .query("SELECT COUNT(*), SUM(amount) FROM orders WHERE status = 'paid'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["count"], 2);
+    assert_eq!(p["sum"].as_f64().unwrap(), 125.0);
+}
+
+// ── HNSW approximate nearest-neighbour ───────────────────────────────────────
+
+#[test]
+fn hnsw_build_and_search_rust_api() {
+    let mut db = CoreDB::new();
+    // Insert nodes with 4-d embeddings.
+    db.put("docs/a", r#"{"_collection":"docs","_key":"a","text":"alpha"}"#).unwrap();
+    db.put("docs/b", r#"{"_collection":"docs","_key":"b","text":"beta"}"#).unwrap();
+    db.put("docs/c", r#"{"_collection":"docs","_key":"c","text":"gamma"}"#).unwrap();
+    db.put("docs/d", r#"{"_collection":"docs","_key":"d","text":"delta"}"#).unwrap();
+
+    // Vectors: a and b are close; c and d are close but far from a/b.
+    db.put_vector("docs/a", "emb", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+    db.put_vector("docs/b", "emb", &[0.9, 0.1, 0.0, 0.0]).unwrap();
+    db.put_vector("docs/c", "emb", &[0.0, 0.0, 1.0, 0.0]).unwrap();
+    db.put_vector("docs/d", "emb", &[0.0, 0.0, 0.9, 0.1]).unwrap();
+
+    // Build HNSW index.
+    db.build_hnsw_index("emb", 4, 50).unwrap();
+
+    // Query near [1, 0, 0, 0] → should return docs/a and docs/b.
+    let results = db
+        .collection("docs")
+        .vector_near("emb", vec![1.0f32, 0.0, 0.0, 0.0], 2)
+        .collect();
+
+    assert_eq!(results.len(), 2);
+    let slugs: std::collections::HashSet<_> = results.iter().map(|h| h.slug.as_str()).collect();
+    assert!(slugs.contains("docs/a"), "expected docs/a in results, got {:?}", slugs);
+    assert!(slugs.contains("docs/b"), "expected docs/b in results, got {:?}", slugs);
+}
+
+#[test]
+fn hnsw_sql_vector_near() {
+    let mut db = CoreDB::new();
+    for (key, emb) in [
+        ("items/1", [1.0f32, 0.0, 0.0, 0.0]),
+        ("items/2", [0.95, 0.05, 0.0, 0.0]),
+        ("items/3", [0.0, 1.0, 0.0, 0.0]),
+        ("items/4", [0.0, 0.95, 0.05, 0.0]),
+    ] {
+        db.put(key, &format!(r#"{{"_collection":"items","_key":"{}"}}"#, key.split('/').last().unwrap()))
+            .unwrap();
+        db.put_vector(key, "vec", &emb).unwrap();
+    }
+    db.build_hnsw_index("vec", 4, 50).unwrap();
+
+    let hits = db
+        .query("SELECT * FROM items WHERE VECTOR_NEAR(vec, [1.0, 0.0, 0.0, 0.0], 2)")
+        .unwrap()
+        .collect();
+
+    assert_eq!(hits.len(), 2);
+    let slugs: std::collections::HashSet<_> = hits.iter().map(|h| h.slug.as_str()).collect();
+    assert!(slugs.contains("items/1"));
+    assert!(slugs.contains("items/2"));
+}
+
+#[test]
+fn hnsw_build_error_no_vectors() {
+    let mut db = CoreDB::new();
+    db.put("things/1", r#"{"_collection":"things","_key":"1"}"#).unwrap();
+    // No vectors stored — build_hnsw_index should return Err.
+    let result = db.build_hnsw_index("nonexistent_field", 8, 100);
+    assert!(result.is_err());
+    // Main store untouched.
+    assert!(db.collection("things").count() == 1);
+}
+
+#[test]
+fn hnsw_error_leaves_main_store_intact() {
+    let mut db = CoreDB::new();
+    db.put("nodes/1", r#"{"_collection":"nodes","_key":"1","score":42}"#).unwrap();
+    db.put_vector("nodes/1", "emb", &[1.0, 0.0]).unwrap();
+
+    // First build succeeds.
+    db.build_hnsw_index("emb", 4, 20).unwrap();
+
+    // The original node is still reachable and correct.
+    let hits = db.query("SELECT * FROM nodes WHERE score = 42").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "nodes/1");
+
+    // Attempting to build for a field with no vectors returns Err
+    // and must not corrupt the existing HNSW index.
+    let err = db.build_hnsw_index("missing_field", 4, 20);
+    assert!(err.is_err());
+
+    // Original HNSW index still works.
+    let vec_hits = db
+        .query("SELECT * FROM nodes WHERE VECTOR_NEAR(emb, [1.0, 0.0], 1)")
+        .unwrap()
+        .collect();
+    assert_eq!(vec_hits.len(), 1);
+    assert_eq!(vec_hits[0].slug, "nodes/1");
+}
+
+// ── WHERE parenthesized groups ─────────────────────────────────────────────────
+
+#[test]
+fn where_paren_or_and() {
+    // (a OR b) AND c
+    let mut db = CoreDB::new();
+    db.put("t/1", r#"{"_collection":"t","_key":"1","color":"red","active":true}"#).unwrap();
+    db.put("t/2", r#"{"_collection":"t","_key":"2","color":"blue","active":true}"#).unwrap();
+    db.put("t/3", r#"{"_collection":"t","_key":"3","color":"red","active":false}"#).unwrap();
+    db.put("t/4", r#"{"_collection":"t","_key":"4","color":"green","active":true}"#).unwrap();
+
+    // (color='red' OR color='blue') AND active=true → items 1 and 2
+    let hits = db.query("SELECT * FROM t WHERE (color = 'red' OR color = 'blue') AND active = true")
+        .unwrap().collect();
+    let slugs: std::collections::HashSet<_> = hits.iter().map(|h| h.slug.as_str()).collect();
+    assert_eq!(hits.len(), 2);
+    assert!(slugs.contains("t/1"));
+    assert!(slugs.contains("t/2"));
+}
+
+#[test]
+fn where_paren_and_or() {
+    // a AND (b OR c)
+    let mut db = CoreDB::new();
+    db.put("t/1", r#"{"_collection":"t","_key":"1","type":"A","score":10}"#).unwrap();
+    db.put("t/2", r#"{"_collection":"t","_key":"2","type":"A","score":20}"#).unwrap();
+    db.put("t/3", r#"{"_collection":"t","_key":"3","type":"B","score":10}"#).unwrap();
+
+    // type='A' AND (score=10 OR score=20) → items 1 and 2
+    let hits = db.query("SELECT * FROM t WHERE type = 'A' AND (score = 10 OR score = 20)")
+        .unwrap().collect();
+    assert_eq!(hits.len(), 2);
+}
+
+#[test]
+fn where_not_paren_group() {
+    // NOT (a OR b)
+    let mut db = CoreDB::new();
+    db.put("t/1", r#"{"_collection":"t","_key":"1","status":"active"}"#).unwrap();
+    db.put("t/2", r#"{"_collection":"t","_key":"2","status":"pending"}"#).unwrap();
+    db.put("t/3", r#"{"_collection":"t","_key":"3","status":"deleted"}"#).unwrap();
+
+    // NOT (status='active' OR status='pending') → only item 3
+    let hits = db.query("SELECT * FROM t WHERE NOT (status = 'active' OR status = 'pending')")
+        .unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "t/3");
+}
+
+// ── ORDER BY DESC ──────────────────────────────────────────────────────────────
+
+#[test]
+fn order_by_desc() {
+    let mut db = CoreDB::new();
+    db.put("p/1", r#"{"_collection":"p","_key":"1","price":10}"#).unwrap();
+    db.put("p/2", r#"{"_collection":"p","_key":"2","price":30}"#).unwrap();
+    db.put("p/3", r#"{"_collection":"p","_key":"3","price":20}"#).unwrap();
+
+    let hits = db.query("SELECT * FROM p ORDER BY price DESC").unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    let prices: Vec<f64> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["price"].as_f64().unwrap())
+        .collect();
+    assert_eq!(prices, vec![30.0, 20.0, 10.0]);
+}
+
+// ── LIMIT / OFFSET any order ───────────────────────────────────────────────────
+
+#[test]
+fn limit_offset_any_order() {
+    let mut db = CoreDB::new();
+    for i in 1..=10u32 {
+        db.put(&format!("n/{i}"), &format!(r#"{{"_collection":"n","_key":"{i}","v":{i}}}"#)).unwrap();
+    }
+
+    // OFFSET before LIMIT
+    let hits = db.query("SELECT * FROM n ORDER BY v ASC OFFSET 2 LIMIT 3").unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    let vals: Vec<f64> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["v"].as_f64().unwrap())
+        .collect();
+    assert_eq!(vals, vec![3.0, 4.0, 5.0]);
+}
+
+// ── SELECT DISTINCT ────────────────────────────────────────────────────────────
+
+#[test]
+fn select_distinct_basic() {
+    let mut db = CoreDB::new();
+    db.put("u/1", r#"{"_collection":"u","_key":"1","city":"Paris"}"#).unwrap();
+    db.put("u/2", r#"{"_collection":"u","_key":"2","city":"London"}"#).unwrap();
+    db.put("u/3", r#"{"_collection":"u","_key":"3","city":"Paris"}"#).unwrap();
+    db.put("u/4", r#"{"_collection":"u","_key":"4","city":"Berlin"}"#).unwrap();
+
+    // Three distinct city values
+    let hits = db.query("SELECT DISTINCT city FROM u").unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    let cities: std::collections::HashSet<String> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["city"].as_str().unwrap().to_string())
+        .collect();
+    assert!(cities.contains("Paris"));
+    assert!(cities.contains("London"));
+    assert!(cities.contains("Berlin"));
+}
+
+#[test]
+fn select_distinct_all_dupes() {
+    let mut db = CoreDB::new();
+    for i in 1..=5u32 {
+        db.put(&format!("x/{i}"), &format!(r#"{{"_collection":"x","_key":"{i}","kind":"widget"}}"#)).unwrap();
+    }
+    let hits = db.query("SELECT DISTINCT kind FROM x").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+}
+
+// ── GROUP BY ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn group_by_count() {
+    let mut db = CoreDB::new();
+    db.put("o/1", r#"{"_collection":"o","_key":"1","cat":"A","val":1}"#).unwrap();
+    db.put("o/2", r#"{"_collection":"o","_key":"2","cat":"A","val":2}"#).unwrap();
+    db.put("o/3", r#"{"_collection":"o","_key":"3","cat":"B","val":3}"#).unwrap();
+    db.put("o/4", r#"{"_collection":"o","_key":"4","cat":"B","val":4}"#).unwrap();
+    db.put("o/5", r#"{"_collection":"o","_key":"5","cat":"C","val":5}"#).unwrap();
+
+    let hits = db.query("SELECT cat, COUNT(*) FROM o GROUP BY cat ORDER BY cat ASC")
+        .unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    // First group = A with count 2
+    let first = hits[0].payload.as_ref().unwrap();
+    assert_eq!(first["cat"].as_str().unwrap(), "A");
+    assert_eq!(first["count"].as_f64().unwrap(), 2.0);
+}
+
+#[test]
+fn group_by_sum_avg() {
+    let mut db = CoreDB::new();
+    db.put("s/1", r#"{"_collection":"s","_key":"1","dept":"eng","salary":100}"#).unwrap();
+    db.put("s/2", r#"{"_collection":"s","_key":"2","dept":"eng","salary":200}"#).unwrap();
+    db.put("s/3", r#"{"_collection":"s","_key":"3","dept":"hr","salary":150}"#).unwrap();
+
+    let hits = db.query("SELECT dept, SUM(salary), AVG(salary) FROM s GROUP BY dept ORDER BY dept ASC")
+        .unwrap().collect();
+    assert_eq!(hits.len(), 2);
+    let eng = hits[0].payload.as_ref().unwrap();
+    assert_eq!(eng["dept"].as_str().unwrap(), "eng");
+    assert_eq!(eng["sum"].as_f64().unwrap(), 300.0);
+    assert_eq!(eng["avg"].as_f64().unwrap(), 150.0);
+}
+
+// ── GROUP BY + HAVING ─────────────────────────────────────────────────────────
+
+#[test]
+fn group_by_having_count() {
+    let mut db = CoreDB::new();
+    db.put("o/1", r#"{"_collection":"o","_key":"1","cat":"A"}"#).unwrap();
+    db.put("o/2", r#"{"_collection":"o","_key":"2","cat":"A"}"#).unwrap();
+    db.put("o/3", r#"{"_collection":"o","_key":"3","cat":"A"}"#).unwrap();
+    db.put("o/4", r#"{"_collection":"o","_key":"4","cat":"B"}"#).unwrap();
+    db.put("o/5", r#"{"_collection":"o","_key":"5","cat":"B"}"#).unwrap();
+    db.put("o/6", r#"{"_collection":"o","_key":"6","cat":"C"}"#).unwrap();
+
+    // Only groups with count >= 2 (A=3, B=2 pass; C=1 excluded)
+    let hits = db.query("SELECT cat, COUNT(*) FROM o GROUP BY cat HAVING COUNT(*) >= 2 ORDER BY cat ASC")
+        .unwrap().collect();
+    assert_eq!(hits.len(), 2);
+    let cats: Vec<&str> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["cat"].as_str().unwrap())
+        .collect();
+    assert_eq!(cats, vec!["A", "B"]);
+}
+
+#[test]
+fn group_by_having_sum() {
+    let mut db = CoreDB::new();
+    db.put("tx/1", r#"{"_collection":"tx","_key":"1","acct":"X","amount":500}"#).unwrap();
+    db.put("tx/2", r#"{"_collection":"tx","_key":"2","acct":"X","amount":600}"#).unwrap();
+    db.put("tx/3", r#"{"_collection":"tx","_key":"3","acct":"Y","amount":100}"#).unwrap();
+    db.put("tx/4", r#"{"_collection":"tx","_key":"4","acct":"Y","amount":200}"#).unwrap();
+
+    // Accounts with total > 500 (X=1100 passes, Y=300 excluded)
+    let hits = db.query("SELECT acct, SUM(amount) FROM tx GROUP BY acct HAVING SUM(amount) > 500")
+        .unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["acct"].as_str().unwrap(), "X");
+}
+
+// ── Multi-column ORDER BY ─────────────────────────────────────────────────────
+
+#[test]
+fn order_by_multi_column_sql() {
+    let mut db = CoreDB::new();
+    db.put("u/1", r#"{"_collection":"u","dept":"eng","salary":90}"#).unwrap();
+    db.put("u/2", r#"{"_collection":"u","dept":"eng","salary":70}"#).unwrap();
+    db.put("u/3", r#"{"_collection":"u","dept":"hr","salary":80}"#).unwrap();
+    db.put("u/4", r#"{"_collection":"u","dept":"hr","salary":60}"#).unwrap();
+
+    let hits = db.query("SELECT * FROM u ORDER BY dept ASC, salary DESC").unwrap().collect();
+    // dept ASC: eng before hr
+    // within eng, salary DESC: 90 then 70
+    // within hr, salary DESC: 80 then 60
+    let names: Vec<String> = hits.iter()
+        .map(|h| {
+            let p = h.payload.as_ref().unwrap();
+            format!("{}/{}", p["dept"].as_str().unwrap(), p["salary"].as_f64().unwrap())
+        })
+        .collect();
+    assert_eq!(names, ["eng/90", "eng/70", "hr/80", "hr/60"]);
+}
+
+#[test]
+fn order_by_multi_column_api() {
+    let mut db = CoreDB::new();
+    db.put("p/1", r#"{"_collection":"p","cat":"b","rank":2}"#).unwrap();
+    db.put("p/2", r#"{"_collection":"p","cat":"a","rank":3}"#).unwrap();
+    db.put("p/3", r#"{"_collection":"p","cat":"a","rank":1}"#).unwrap();
+
+    let hits = db
+        .collection("p")
+        .sort_multi(vec![("cat".to_string(), true), ("rank".to_string(), true)])
+        .collect();
+    // cat ASC, then rank ASC within same cat
+    // a/1, a/3, b/2
+    let ranks: Vec<i64> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["rank"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ranks, [1, 3, 2]);
+}
+
+#[test]
+fn order_by_single_column_unchanged() {
+    let mut db = CoreDB::new();
+    for i in [5u64, 3, 8, 1, 9, 2] {
+        db.put(&format!("n/{i}"), &format!(r#"{{"_collection":"n","v":{i}}}"#)).unwrap();
+    }
+    let hits = db.query("SELECT * FROM n ORDER BY v ASC").unwrap().collect();
+    let vals: Vec<i64> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["v"].as_i64().unwrap())
+        .collect();
+    assert_eq!(vals, [1, 2, 3, 5, 8, 9]);
+}
+
+// ── Transactions ──────────────────────────────────────────────────────────────
+
+#[test]
+fn transaction_commit_applies_all_writes() {
+    let mut db = CoreDB::new();
+    let mut txn = db.begin();
+    txn.put("users/alice", r#"{"_collection":"users","name":"Alice"}"#).unwrap();
+    txn.put("users/bob",   r#"{"_collection":"users","name":"Bob"}"#).unwrap();
+    txn.commit().unwrap();
+
+    assert!(db.contains("users/alice"));
+    assert!(db.contains("users/bob"));
+    assert_eq!(db.collection("users").count(), 2);
+}
+
+#[test]
+fn transaction_rollback_applies_nothing() {
+    let mut db = CoreDB::new();
+    {
+        let mut txn = db.begin();
+        txn.put("users/ghost", r#"{"_collection":"users","name":"Ghost"}"#).unwrap();
+        txn.rollback(); // explicit rollback
+    }
+    assert!(!db.contains("users/ghost"), "ghost must not exist after rollback");
+
+    {
+        let mut txn = db.begin();
+        txn.put("users/phantom", r#"{"_collection":"users","name":"Phantom"}"#).unwrap();
+        // implicit rollback — drop without commit
+    }
+    assert!(!db.contains("users/phantom"), "phantom must not exist after implicit rollback");
+}
+
+#[test]
+fn transaction_commit_returns_op_count() {
+    let mut db = CoreDB::new();
+    let mut txn = db.begin();
+    txn.put("a/1", r#"{"_collection":"a"}"#).unwrap();
+    txn.put("a/2", r#"{"_collection":"a"}"#).unwrap();
+    txn.remove("a/99"); // remove of non-existent — still counted
+    txn.link("a/1", "a/2", "rel", 1.0);
+    let n = txn.commit().unwrap();
+    assert_eq!(n, 4);
+}
+
+#[test]
+fn transaction_put_validates_json_eagerly() {
+    let mut db = CoreDB::new();
+    let mut txn = db.begin();
+    let err = txn.put("bad", "not json!!");
+    assert!(err.is_err(), "bad JSON must error at put() time");
+    // Even though put errored, commit/rollback are still valid
+    txn.rollback();
+    assert!(!db.contains("bad"));
+}
+
+#[test]
+fn transaction_with_link_and_remove() {
+    let mut db = CoreDB::new();
+    db.put("nodes/a", r#"{"_collection":"nodes"}"#).unwrap();
+    db.put("nodes/b", r#"{"_collection":"nodes"}"#).unwrap();
+    db.put("nodes/c", r#"{"_collection":"nodes"}"#).unwrap();
+
+    let mut txn = db.begin();
+    txn.link("nodes/a", "nodes/b", "knows", 1.0);
+    txn.unlink("nodes/a", "nodes/b", "knows"); // cancel the link above
+    txn.remove("nodes/c");
+    txn.commit().unwrap();
+
+    // Link was added then removed in same txn → should not exist
+    assert!(db.one("nodes/a").forward("knows").collect().is_empty());
+    // c was removed
+    assert!(!db.contains("nodes/c"));
+}
+
+// ── #3 btree ORDER BY index scan ──────────────────────────────────────────────
+
+#[test]
+fn btree_order_scan_produces_sorted_results() {
+    let mut db = CoreDB::new();
+    for i in [5u64, 1, 9, 3, 7, 2, 8, 4, 6] {
+        db.put(&format!("n/{i}"), &format!(r#"{{"_collection":"n","v":{i}}}"#)).unwrap();
+    }
+    db.execute("CREATE INDEX ON n USING btree (v)").unwrap();
+
+    // ORDER BY v ASC — index scan path
+    let hits = db.query("SELECT * FROM n ORDER BY v ASC").unwrap().collect();
+    let vals: Vec<i64> = hits.iter().map(|h| h.payload.as_ref().unwrap()["v"].as_i64().unwrap()).collect();
+    assert_eq!(vals, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+}
+
+#[test]
+fn btree_order_scan_desc() {
+    let mut db = CoreDB::new();
+    for i in 1u64..=5 {
+        db.put(&format!("n/{i}"), &format!(r#"{{"_collection":"n","score":{i}}}"#)).unwrap();
+    }
+    db.execute("CREATE INDEX ON n USING btree (score)").unwrap();
+
+    let hits = db.query("SELECT * FROM n ORDER BY score DESC").unwrap().collect();
+    let vals: Vec<i64> = hits.iter().map(|h| h.payload.as_ref().unwrap()["score"].as_i64().unwrap()).collect();
+    assert_eq!(vals, [5, 4, 3, 2, 1]);
+}
+
+#[test]
+fn btree_order_scan_with_limit() {
+    let mut db = CoreDB::new();
+    for i in 1u64..=100 {
+        db.put(&format!("n/{i}"), &format!(r#"{{"_collection":"n","rank":{i}}}"#)).unwrap();
+    }
+    db.execute("CREATE INDEX ON n USING btree (rank)").unwrap();
+
+    // Index scan extracts top-5 cheaply without loading all 100 members
+    let hits = db.query("SELECT * FROM n ORDER BY rank ASC LIMIT 5").unwrap().collect();
+    assert_eq!(hits.len(), 5);
+    let vals: Vec<i64> = hits.iter().map(|h| h.payload.as_ref().unwrap()["rank"].as_i64().unwrap()).collect();
+    assert_eq!(vals, [1, 2, 3, 4, 5]);
+}
+
+// ── #1 SQL mutations ──────────────────────────────────────────────────────────
+
+#[test]
+fn sql_insert_into_creates_node() {
+    let mut db = CoreDB::new();
+    db.execute(
+        "INSERT INTO users (_key, name, age) VALUES ('alice', 'Alice', 30)",
+    ).unwrap();
+
+    assert!(db.contains("users/alice"));
+    let hits = db.query("SELECT * FROM users WHERE name = 'Alice'").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/alice");
+}
+
+#[test]
+fn sql_insert_returns_one() {
+    let mut db = CoreDB::new();
+    let n = db.execute(
+        "INSERT INTO products (_key, price) VALUES ('p1', 99)",
+    ).unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn sql_update_set_field() {
+    let mut db = CoreDB::new();
+    db.put("users/bob", r#"{"_collection":"users","_key":"bob","name":"Bob","score":10}"#).unwrap();
+
+    let n = db.execute("UPDATE users SET score = 99 WHERE _key = 'bob'").unwrap();
+    assert_eq!(n, 1);
+
+    let hits = db.query("SELECT * FROM users WHERE _key = 'bob'").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["score"].as_f64().unwrap(), 99.0);
+}
+
+#[test]
+fn sql_delete_from_removes_node() {
+    let mut db = CoreDB::new();
+    db.put("items/i1", r#"{"_collection":"items","_key":"i1","keep":false}"#).unwrap();
+    db.put("items/i2", r#"{"_collection":"items","_key":"i2","keep":true}"#).unwrap();
+
+    let n = db.execute("DELETE FROM items WHERE keep = false").unwrap();
+    assert_eq!(n, 1);
+    assert!(!db.contains("items/i1"), "i1 must be deleted");
+    assert!(db.contains("items/i2"), "i2 must survive");
+}
+
+#[test]
+fn sql_update_multiple_rows() {
+    let mut db = CoreDB::new();
+    for i in 1..=5 {
+        db.put(
+            &format!("items/i{i}"),
+            &format!(r#"{{"_collection":"items","_key":"i{i}","active":true,"val":{i}}}"#),
+        ).unwrap();
+    }
+    // Mark all active=false
+    let n = db.execute("UPDATE items SET active = false WHERE active = true").unwrap();
+    assert_eq!(n, 5);
+
+    let still_active = db.query("SELECT * FROM items WHERE active = true").unwrap().count();
+    assert_eq!(still_active, 0);
+}
+
+// ── #3 Btree field index ──────────────────────────────────────────────────────
+
+#[test]
+fn btree_index_eq_filter() {
+    let mut db = CoreDB::new();
+    for i in 0..20 {
+        db.put(
+            &format!("users/u{i}"),
+            &format!(r#"{{"_collection":"users","_key":"u{i}","age":{i}}}"#),
+        ).unwrap();
+    }
+    db.execute("CREATE INDEX ON users USING btree (age)").unwrap();
+
+    let hits = db.query("SELECT * FROM users WHERE age = 5").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/u5");
+}
+
+#[test]
+fn btree_index_range_gt() {
+    let mut db = CoreDB::new();
+    for i in 0..10 {
+        db.put(
+            &format!("p/p{i}"),
+            &format!(r#"{{"_collection":"p","_key":"p{i}","score":{i}}}"#),
+        ).unwrap();
+    }
+    db.execute("CREATE INDEX ON p USING btree (score)").unwrap();
+
+    let hits = db.query("SELECT * FROM p WHERE score > 6").unwrap().collect();
+    assert_eq!(hits.len(), 3); // 7, 8, 9
+}
+
+#[test]
+fn btree_index_range_between() {
+    let mut db = CoreDB::new();
+    for i in 0..20 {
+        db.put(
+            &format!("items/i{i}"),
+            &format!(r#"{{"_collection":"items","_key":"i{i}","price":{i}}}"#),
+        ).unwrap();
+    }
+    db.execute("CREATE INDEX ON items USING btree (price)").unwrap();
+
+    let hits = db.query("SELECT * FROM items WHERE price BETWEEN 5 AND 10").unwrap().collect();
+    assert_eq!(hits.len(), 6); // 5, 6, 7, 8, 9, 10
+}
+
+#[test]
+fn btree_index_maintained_on_insert_after_create() {
+    let mut db = CoreDB::new();
+    // Create index first (empty collection)
+    db.execute("CREATE INDEX ON orders USING btree (amount)").unwrap();
+
+    // Insert nodes after the index exists — they should be picked up
+    db.put("orders/o1", r#"{"_collection":"orders","_key":"o1","amount":100}"#).unwrap();
+    db.put("orders/o2", r#"{"_collection":"orders","_key":"o2","amount":200}"#).unwrap();
+    db.put("orders/o3", r#"{"_collection":"orders","_key":"o3","amount":50}"#).unwrap();
+
+    let hits = db.query("SELECT * FROM orders WHERE amount > 75").unwrap().collect();
+    assert_eq!(hits.len(), 2); // 100, 200
+}
+
+#[test]
+fn btree_index_maintained_on_update() {
+    let mut db = CoreDB::new();
+    db.put("items/a", r#"{"_collection":"items","_key":"a","val":1}"#).unwrap();
+    db.put("items/b", r#"{"_collection":"items","_key":"b","val":2}"#).unwrap();
+    db.execute("CREATE INDEX ON items USING btree (val)").unwrap();
+
+    // Update — old index entry for "a" (val=1) should be replaced with val=99
+    db.execute("UPDATE items SET val = 99 WHERE _key = 'a'").unwrap();
+
+    // val = 1 should now match nothing
+    let low = db.query("SELECT * FROM items WHERE val = 1").unwrap().count();
+    assert_eq!(low, 0);
+
+    // val = 99 should match "a"
+    let high = db.query("SELECT * FROM items WHERE val = 99").unwrap().collect();
+    assert_eq!(high.len(), 1);
+    assert_eq!(high[0].slug, "items/a");
+}
+
+#[test]
+fn btree_index_maintained_on_delete() {
+    let mut db = CoreDB::new();
+    db.put("items/a", r#"{"_collection":"items","_key":"a","val":5}"#).unwrap();
+    db.put("items/b", r#"{"_collection":"items","_key":"b","val":10}"#).unwrap();
+    db.execute("CREATE INDEX ON items USING btree (val)").unwrap();
+
+    db.remove("items/a");
+
+    // Only "b" (val=10) should remain
+    let hits = db.query("SELECT * FROM items WHERE val > 0").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "items/b");
+}
+
+#[test]
+fn btree_index_no_false_positives() {
+    // When the index seeds candidates, the subsequent retain() filter must
+    // confirm results — so the count must be exact, not over-inclusive.
+    let mut db = CoreDB::new();
+    for i in 0..50 {
+        db.put(
+            &format!("n/n{i}"),
+            &format!(r#"{{"_collection":"n","_key":"n{i}","x":{i}}}"#),
+        ).unwrap();
+    }
+    db.execute("CREATE INDEX ON n USING btree (x)").unwrap();
+
+    // Strict equality: must return exactly 1 result
+    let hits = db.query("SELECT * FROM n WHERE x = 25").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "n/n25");
+
+    // Range: 10..=14 inclusive → exactly 5
+    let hits = db.query("SELECT * FROM n WHERE x BETWEEN 10 AND 14").unwrap().collect();
+    assert_eq!(hits.len(), 5);
+}
+
+// ── Schema validation tests ───────────────────────────────────────────────────
+
+/// INSERT with correct types passes validation.
+#[test]
+fn schema_validation_valid_insert() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE users (_key TEXT, name TEXT, age INTEGER)"#).unwrap();
+    db.execute(r#"INSERT INTO users (_key, name, age) VALUES ('alice', 'Alice', 30)"#).unwrap();
+    let hits = db.query("SELECT * FROM users").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+}
+
+/// INSERT with wrong type on a declared field returns an error.
+#[test]
+fn schema_validation_rejects_wrong_type() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE products (_key TEXT, price REAL)"#).unwrap();
+    let err = db.execute(r#"INSERT INTO products (_key, price) VALUES ('p1', 'not-a-number')"#);
+    assert!(err.is_err(), "should reject non-number for REAL field");
+}
+
+/// INSERT into collection without a schema always succeeds.
+#[test]
+fn schema_validation_no_schema_is_permissive() {
+    let mut db = CoreDB::new();
+    // No CREATE TABLE — any payload shape is accepted
+    db.execute(r#"INSERT INTO items (_key, weirdfield) VALUES ('x', 'anything')"#).unwrap();
+    assert_eq!(db.query("SELECT * FROM items").unwrap().collect().len(), 1);
+}
+
+/// UPDATE with wrong type on a declared field returns an error.
+#[test]
+fn schema_validation_rejects_wrong_type_on_update() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE events (_key TEXT, score INTEGER)"#).unwrap();
+    db.execute(r#"INSERT INTO events (_key, score) VALUES ('e1', 10)"#).unwrap();
+    let err = db.execute(r#"UPDATE events SET score = 'high' WHERE _key = 'e1'"#);
+    assert!(err.is_err(), "should reject non-number for INTEGER field on UPDATE");
+}
+
+/// UPDATE with correct types passes validation.
+#[test]
+fn schema_validation_valid_update() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE events (_key TEXT, score INTEGER)"#).unwrap();
+    db.execute(r#"INSERT INTO events (_key, score) VALUES ('e1', 5)"#).unwrap();
+    db.execute(r#"UPDATE events SET score = 99 WHERE _key = 'e1'"#).unwrap();
+    let hits = db.query("SELECT * FROM events WHERE _key = 'e1'").unwrap().collect();
+    assert_eq!(hits[0].payload.as_ref().unwrap()["score"].as_f64(), Some(99.0));
+}
+
+/// NULL is accepted for any declared field type.
+#[test]
+fn schema_validation_null_is_always_valid() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE logs (_key TEXT, level INTEGER)"#).unwrap();
+    db.execute(r#"INSERT INTO logs (_key, level) VALUES ('l1', NULL)"#).unwrap();
+    assert_eq!(db.query("SELECT * FROM logs").unwrap().collect().len(), 1);
+}
+
+// ── NOT IN ────────────────────────────────────────────────────────────────────
+
+/// Basic `field NOT IN (v1, v2)` excludes matched values.
+#[test]
+fn not_in_excludes_values() {
+    let mut db = CoreDB::new();
+    for (k, city) in [("u1", "Jakarta"), ("u2", "Bandung"), ("u3", "Surabaya"), ("u4", "Bali")] {
+        db.put(k, &format!(r#"{{"_collection":"users","city":"{city}"}}"#)).unwrap();
+    }
+    let hits = db
+        .query("SELECT * FROM users WHERE city NOT IN ('Jakarta', 'Bali')")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 2);
+    let cities: Vec<_> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["city"].as_str().unwrap().to_string())
+        .collect();
+    assert!(cities.contains(&"Bandung".to_string()));
+    assert!(cities.contains(&"Surabaya".to_string()));
+}
+
+/// `NOT IN` with numbers.
+#[test]
+fn not_in_numeric() {
+    let mut db = CoreDB::new();
+    for i in 1..=5u32 {
+        db.put(&format!("x{i}"), &format!(r#"{{"_collection":"nums","v":{i}}}"#)).unwrap();
+    }
+    // Exclude 2 and 4 — expect 1, 3, 5
+    let hits = db
+        .query("SELECT * FROM nums WHERE v NOT IN (2, 4)")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 3);
+}
+
+/// `NOT field IN (...)` prefix form also works.
+#[test]
+fn not_prefix_in_also_works() {
+    let mut db = CoreDB::new();
+    db.put("a", r#"{"_collection":"t","k":"alpha"}"#).unwrap();
+    db.put("b", r#"{"_collection":"t","k":"beta"}"#).unwrap();
+    db.put("c", r#"{"_collection":"t","k":"gamma"}"#).unwrap();
+    // prefix NOT form
+    let hits = db
+        .query("SELECT * FROM t WHERE NOT k IN ('alpha', 'gamma')")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["k"].as_str(), Some("beta"));
+}
+
+/// Combined AND + NOT IN.
+#[test]
+fn not_in_combined_with_and() {
+    let mut db = CoreDB::new();
+    for (k, city, active) in [
+        ("u1", "Jakarta", true),
+        ("u2", "Jakarta", false),
+        ("u3", "Bandung", true),
+        ("u4", "Bali",    true),
+    ] {
+        db.put(k, &format!(r#"{{"_collection":"users","city":"{city}","active":{active}}}"#))
+            .unwrap();
+    }
+    // active=true AND city NOT IN ('Bali')
+    let hits = db
+        .query("SELECT * FROM users WHERE active = true AND city NOT IN ('Bali')")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 2); // u1 (Jakarta,true) and u3 (Bandung,true)
+}
+
+// ── put_vector via SQL ────────────────────────────────────────────────────────
+
+/// INSERT with a `[f32, ...]` array literal stores the vector and makes it
+/// searchable via `VECTOR_NEAR`.
+#[test]
+fn sql_insert_vector_literal() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE docs (_key TEXT, emb VECTOR)"#).unwrap();
+    db.execute(r#"INSERT INTO docs (_key, emb) VALUES ('d1', [1.0, 0.0, 0.0])"#).unwrap();
+    db.execute(r#"INSERT INTO docs (_key, emb) VALUES ('d2', [0.0, 1.0, 0.0])"#).unwrap();
+    db.execute(r#"INSERT INTO docs (_key, emb) VALUES ('d3', [0.0, 0.0, 1.0])"#).unwrap();
+
+    let hits = db
+        .query("SELECT * FROM docs WHERE VECTOR_NEAR(emb, [1.0, 0.0, 0.0], 1)")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "docs/d1");
+}
+
+/// UPDATE with a `[f32, ...]` literal replaces the stored vector.
+#[test]
+fn sql_update_vector_literal() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE docs (_key TEXT, emb VECTOR)"#).unwrap();
+    // Insert with initial vectors
+    db.execute(r#"INSERT INTO docs (_key, emb) VALUES ('d1', [0.0, 1.0, 0.0])"#).unwrap();
+    db.execute(r#"INSERT INTO docs (_key, emb) VALUES ('d2', [1.0, 0.0, 0.0])"#).unwrap();
+
+    // Before update: query [1,0,0] should return d2 as nearest
+    let before = db
+        .query("SELECT * FROM docs WHERE VECTOR_NEAR(emb, [1.0, 0.0, 0.0], 1)")
+        .unwrap()
+        .collect();
+    assert_eq!(before[0].slug, "docs/d2");
+
+    // Update d1's vector to point toward [1,0,0]
+    db.execute(r#"UPDATE docs SET emb = [1.0, 0.0, 0.0] WHERE _key = 'd1'"#).unwrap();
+
+    // After update: both d1 and d2 are equal distance — top-2 should return both
+    let after = db
+        .query("SELECT * FROM docs WHERE VECTOR_NEAR(emb, [1.0, 0.0, 0.0], 2)")
+        .unwrap()
+        .collect();
+    assert_eq!(after.len(), 2, "both docs should be near after update");
+}
+
+/// SQL-inserted vectors are also queryable via the builder atom API.
+#[test]
+fn sql_insert_vector_queryable_via_atom() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE items (_key TEXT, vec VECTOR)"#).unwrap();
+    db.execute(r#"INSERT INTO items (_key, vec) VALUES ('a', [0.6, 0.8, 0.0])"#).unwrap();
+    db.execute(r#"INSERT INTO items (_key, vec) VALUES ('b', [0.0, 0.0, 1.0])"#).unwrap();
+
+    let results = db
+        .collection("items")
+        .vector_near("vec", vec![0.6, 0.8, 0.0], 1)
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].slug, "items/a");
+}
+
+// ── ORDER BY field <=> [...] (vector similarity sort) ─────────────────────────
+
+/// `ORDER BY emb <=> [...]` returns all results sorted nearest-first.
+#[test]
+fn order_by_vector_similarity() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE docs (_key TEXT, emb VECTOR)"#).unwrap();
+    // Three orthogonal unit vectors
+    db.execute(r#"INSERT INTO docs (_key, emb) VALUES ('d1', [1.0, 0.0, 0.0])"#).unwrap();
+    db.execute(r#"INSERT INTO docs (_key, emb) VALUES ('d2', [0.0, 1.0, 0.0])"#).unwrap();
+    db.execute(r#"INSERT INTO docs (_key, emb) VALUES ('d3', [0.0, 0.0, 1.0])"#).unwrap();
+
+    // Query closest to d1
+    let hits = db
+        .query("SELECT * FROM docs ORDER BY emb <=> [1.0, 0.0, 0.0]")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 3);
+    assert_eq!(hits[0].slug, "docs/d1", "d1 should be nearest to [1,0,0]");
+}
+
+/// `ORDER BY` with `LIMIT` returns only the k nearest.
+#[test]
+fn order_by_vector_with_limit() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE notes (_key TEXT, vec VECTOR)"#).unwrap();
+    for i in 0..10u32 {
+        // Vectors rotating in the XY plane
+        let x = (i as f32) / 10.0;
+        let y = 1.0 - x;
+        db.execute(&format!(r#"INSERT INTO notes (_key, vec) VALUES ('n{i}', [{x}, {y}, 0.0])"#))
+            .unwrap();
+    }
+    // Query close to [0.9, 0.1, 0.0] — n9 has x=0.9,y=0.1
+    let hits = db
+        .query("SELECT * FROM notes ORDER BY vec <=> [0.9, 0.1, 0.0] LIMIT 3")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 3);
+    assert_eq!(hits[0].slug, "notes/n9", "n9 should be nearest to [0.9, 0.1, 0.0]");
+}
+
+/// `WHERE` filter combined with `ORDER BY <=>` — filter first, then rank.
+#[test]
+fn order_by_vector_with_where_filter() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE items (_key TEXT, tag TEXT, vec VECTOR)"#).unwrap();
+    db.execute(r#"INSERT INTO items (_key, tag, vec) VALUES ('a', 'good', [1.0, 0.0])"#).unwrap();
+    db.execute(r#"INSERT INTO items (_key, tag, vec) VALUES ('b', 'good', [0.9, 0.1])"#).unwrap();
+    db.execute(r#"INSERT INTO items (_key, tag, vec) VALUES ('c', 'bad',  [1.0, 0.0])"#).unwrap();
+
+    // Only tag='good', sorted by distance to [1,0]
+    let hits = db
+        .query("SELECT * FROM items WHERE tag = 'good' ORDER BY vec <=> [1.0, 0.0]")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].slug, "items/a", "a has exact match [1,0]");
+}
+
+// ── Cascade edge deletion on node remove ──────────────────────────────────────
+
+/// Deleting a node removes its outgoing edges so the target no longer sees
+/// back-pointers from the deleted node.
+#[test]
+fn delete_node_removes_outgoing_edges() {
+    let mut db = CoreDB::new();
+    db.put("artists/dewa19", r#"{"_collection":"artists","_key":"dewa19"}"#).unwrap();
+    db.put("songs/kangen",   r#"{"_collection":"songs",  "_key":"kangen"}"#).unwrap();
+    db.link("artists/dewa19", "songs/kangen", "has_song", 1.0);
+
+    // Sanity: edge exists
+    assert_eq!(db.edges_from("artists/dewa19").len(), 1);
+
+    db.remove("artists/dewa19");
+
+    // Forward edge is gone
+    assert_eq!(db.edges_from("artists/dewa19").len(), 0);
+    // Back-pointer on the target is also gone — no dangling ref
+    assert_eq!(db.edges_to("songs/kangen").len(), 0,
+        "deleting dewa19 must remove kangen's back-pointer");
+}
+
+/// Deleting a target node removes incoming edges so the source no longer
+/// enumerates a dead forward pointer.
+#[test]
+fn delete_node_removes_incoming_edges() {
+    let mut db = CoreDB::new();
+    db.put("artists/dewa19", r#"{"_collection":"artists","_key":"dewa19"}"#).unwrap();
+    db.put("songs/kangen",   r#"{"_collection":"songs",  "_key":"kangen"}"#).unwrap();
+    db.link("artists/dewa19", "songs/kangen", "has_song", 1.0);
+
+    db.remove("songs/kangen");
+
+    // Back-pointer is gone
+    assert_eq!(db.edges_to("songs/kangen").len(), 0);
+    // Forward pointer from source is also gone — no dangling ref
+    assert_eq!(db.edges_from("artists/dewa19").len(), 0,
+        "deleting kangen must remove dewa19's forward pointer");
+}
+
+/// SQL DELETE also cascades edges.
+#[test]
+fn sql_delete_cascades_edges() {
+    let mut db = CoreDB::new();
+    db.put("a/1", r#"{"_collection":"a","_key":"1"}"#).unwrap();
+    db.put("a/2", r#"{"_collection":"a","_key":"2"}"#).unwrap();
+    db.put("a/3", r#"{"_collection":"a","_key":"3"}"#).unwrap();
+    db.link("a/1", "a/2", "rel", 1.0);
+    db.link("a/2", "a/3", "rel", 1.0);
+
+    // Delete middle node via SQL
+    db.execute("DELETE FROM a WHERE _key = '2'").unwrap();
+
+    assert!(!db.contains("a/2"));
+    assert_eq!(db.edges_from("a/1").len(), 0, "forward edge from a/1 must be gone");
+    assert_eq!(db.edges_to("a/3").len(),  0, "back edge into a/3 must be gone");
+}
+
+// ── Aggregate MATCH tests ─────────────────────────────────
+
+/// Basic aggregate MATCH: one hop, flat (no GROUP BY).
+#[test]
+fn traverse_single_hop_flat() {
+    let mut db = CoreDB::new();
+    db.put("students/budi", r#"{"_collection":"students","_key":"budi","name":"Budi"}"#).unwrap();
+    db.put("answers/a1", r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
+    db.put("answers/a2", r#"{"_collection":"answers","_key":"a2","score":0.6}"#).unwrap();
+    db.link("students/budi", "answers/a1", "answered", 1.0);
+    db.link("students/budi", "answers/a2", "answered", 1.0);
+
+    let hits = db.query(
+        "MATCH ('students/budi')-[:answered]->(a) RETURN a.score AS score"
+    ).unwrap().collect();
+
+    assert_eq!(hits.len(), 2);
+    let scores: Vec<f64> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap().get("score").and_then(|v| v.as_f64()).unwrap())
+        .collect();
+    assert!(scores.contains(&0.8));
+    assert!(scores.contains(&0.6));
+}
+
+/// Two-hop aggregate MATCH with GROUP BY and SUM aggregation — OBE-style weighted score.
+#[test]
+fn traverse_two_hop_group_sum() {
+    let mut db = CoreDB::new();
+    db.put("students/budi",  r#"{"_collection":"students","_key":"budi"}"#).unwrap();
+    db.put("answers/a1",     r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
+    db.put("answers/a2",     r#"{"_collection":"answers","_key":"a2","score":0.6}"#).unwrap();
+    db.put("answers/a3",     r#"{"_collection":"answers","_key":"a3","score":1.0}"#).unwrap();
+    db.put("questions/q1",   r#"{"_collection":"questions","_key":"q1","weight":0.4,"clo":"c1"}"#).unwrap();
+    db.put("questions/q2",   r#"{"_collection":"questions","_key":"q2","weight":0.6,"clo":"c1"}"#).unwrap();
+    db.put("questions/q3",   r#"{"_collection":"questions","_key":"q3","weight":1.0,"clo":"c2"}"#).unwrap();
+
+    // Student answered questions
+    db.link("students/budi", "answers/a1", "answered", 1.0);
+    db.link("students/budi", "answers/a2", "answered", 1.0);
+    db.link("students/budi", "answers/a3", "answered", 1.0);
+    // Answers → questions
+    db.link("answers/a1", "questions/q1", "for", 1.0);
+    db.link("answers/a2", "questions/q2", "for", 1.0);
+    db.link("answers/a3", "questions/q3", "for", 1.0);
+
+    let hits = db.query(
+        "MATCH ('students/budi')-[:answered]->(a)-[:for]->(q)
+         RETURN q.clo AS clo, SUM(a.score * q.weight) AS clo_score
+         GROUP BY q.clo
+         ORDER BY clo_score DESC"
+    ).unwrap().collect();
+
+    assert_eq!(hits.len(), 2, "should have 2 CLO groups");
+
+    // CLO c1: a1.score(0.8) * q1.weight(0.4) + a2.score(0.6) * q2.weight(0.6) = 0.32 + 0.36 = 0.68
+    // CLO c2: a3.score(1.0) * q3.weight(1.0) = 1.0
+    let top = hits[0].payload.as_ref().unwrap();
+    assert_eq!(top.get("clo").and_then(|v| v.as_str()), Some("c2"),
+               "c2 has higher score (1.0) so comes first with DESC ordering");
+    let top_score = top.get("clo_score").and_then(|v| v.as_f64()).unwrap();
+    assert!((top_score - 1.0).abs() < 1e-9, "c2 score should be 1.0");
+
+    let second = hits[1].payload.as_ref().unwrap();
+    let second_score = second.get("clo_score").and_then(|v| v.as_f64()).unwrap();
+    assert!((second_score - 0.68).abs() < 1e-9, "c1 score should be 0.68");
+}
+
+/// Aggregate MATCH COUNT(*) and AVG aggregation.
+#[test]
+fn traverse_count_and_avg() {
+    let mut db = CoreDB::new();
+    db.put("students/budi", r#"{"_collection":"students","_key":"budi"}"#).unwrap();
+    for i in 1..=4 {
+        db.put(
+            &format!("answers/a{i}"),
+            &format!(r#"{{"_collection":"answers","_key":"a{i}","score":{}}}"#, i as f64 * 0.25)
+        ).unwrap();
+        db.link("students/budi", &format!("answers/a{i}"), "answered", 1.0);
+    }
+
+    let hits = db.query(
+        "MATCH ('students/budi')-[:answered]->(a)
+         RETURN COUNT(*) AS cnt, AVG(a.score) AS avg_score"
+    ).unwrap().collect();
+
+    // Without GROUP BY → one row per path (4 answers × 1 student)
+    // COUNT and AVG applied per group of size 1 each
+    assert_eq!(hits.len(), 4);
+    // Each row: count=1, avg_score=the individual score
+    for hit in &hits {
+        let cnt = hit.payload.as_ref().unwrap().get("cnt").and_then(|v| v.as_i64()).unwrap();
+        assert_eq!(cnt, 1);
+    }
+}
+
+/// Aggregate MATCH with LIMIT.
+#[test]
+fn traverse_with_limit() {
+    let mut db = CoreDB::new();
+    db.put("s/root", r#"{"_collection":"s","_key":"root"}"#).unwrap();
+    for i in 1..=10 {
+        db.put(&format!("t/n{i}"), &format!(r#"{{"_collection":"t","_key":"n{i}","val":{i}}}"#)).unwrap();
+        db.link("s/root", &format!("t/n{i}"), "to", 1.0);
+    }
+
+    let hits = db.query(
+        "MATCH ('s/root')-[:to]->(n) RETURN n.val AS val LIMIT 5"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 5);
+}
+
+/// Aggregate MATCH from a collection (all starting nodes in the collection).
+#[test]
+fn traverse_from_collection() {
+    let mut db = CoreDB::new();
+    for s in ["alice", "bob"] {
+        db.put(&format!("students/{s}"), &format!(r#"{{"_collection":"students","_key":"{s}"}}"#)).unwrap();
+        db.put(&format!("answers/{s}_ans"), &format!(r#"{{"_collection":"answers","_key":"{s}_ans","score":0.9}}"#)).unwrap();
+        db.link(&format!("students/{s}"), &format!("answers/{s}_ans"), "answered", 1.0);
+    }
+
+    let hits = db.query(
+        "MATCH (s:students)-[:answered]->(a) RETURN a.score AS score"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 2, "one path per student");
+}
+
+/// Aggregate MATCH with MIN/MAX.
+#[test]
+fn traverse_min_max() {
+    let mut db = CoreDB::new();
+    db.put("root/r", r#"{"_collection":"root","_key":"r"}"#).unwrap();
+    for (k, v) in [("a", 10.0f64), ("b", 5.0), ("c", 8.0)] {
+        db.put(&format!("vals/{k}"), &format!(r#"{{"_collection":"vals","_key":"{k}","v":{v}}}"#)).unwrap();
+        db.link("root/r", &format!("vals/{k}"), "link", 1.0);
+    }
+
+    let hits = db.query(
+        "MATCH ('root/r')-[:link]->(n)
+         RETURN MIN(n.v) AS min_v, MAX(n.v) AS max_v"
+    ).unwrap().collect();
+    // No GROUP BY → 3 flat rows, min/max evaluated over single-element group each
+    assert_eq!(hits.len(), 3);
+
+    // SUM of all MIN values == sum of all individual values (since each group has size 1)
+    let sum_of_mins: f64 = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap().get("min_v").and_then(|v| v.as_f64()).unwrap())
+        .sum();
+    assert!((sum_of_mins - 23.0).abs() < 1e-9);
+}
+
+// ── MATCH + WITH pipeline tests ───────────────────────────────────────────────
+
+/// Basic pipeline: one MATCH, one RETURN with scalar projection.
+#[test]
+fn pipeline_single_match_scalar_return() {
+    let mut db = CoreDB::new();
+    db.put("users/alice", r#"{"_collection":"users","_key":"alice","score":10.0}"#).unwrap();
+    db.put("users/bob",   r#"{"_collection":"users","_key":"bob","score":20.0}"#).unwrap();
+    db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hello"}"#).unwrap();
+    db.put("posts/p2",    r#"{"_collection":"posts","_key":"p2","title":"world"}"#).unwrap();
+    db.link("users/alice", "posts/p1", "wrote", 1.0);
+    db.link("users/alice", "posts/p2", "wrote", 1.0);
+
+    let hits = db.pipeline_query(
+        "MATCH ('users/alice')-[:wrote]->(p) RETURN p._key AS post_key",
+    ).unwrap();
+
+    let mut keys: Vec<String> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap().get("post_key")
+            .and_then(|v| v.as_str()).unwrap().to_string())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["p1", "p2"]);
+}
+
+/// Pipeline with WITH aggregation — OBE-style 1-level CLO calculation.
+#[test]
+fn pipeline_match_with_group_sum() {
+    let mut db = CoreDB::new();
+
+    // Student
+    db.put("students/budi", r#"{"_collection":"students","_key":"budi"}"#).unwrap();
+
+    // Answers (with score)
+    db.put("answers/a1", r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
+    db.put("answers/a2", r#"{"_collection":"answers","_key":"a2","score":0.9}"#).unwrap();
+    db.put("answers/a3", r#"{"_collection":"answers","_key":"a3","score":1.0}"#).unwrap();
+
+    // Questions (with clo and weight)
+    db.put("questions/q1", r#"{"_collection":"questions","_key":"q1","clo":"clo1","weight":0.4}"#).unwrap();
+    db.put("questions/q2", r#"{"_collection":"questions","_key":"q2","clo":"clo1","weight":0.6}"#).unwrap();
+    db.put("questions/q3", r#"{"_collection":"questions","_key":"q3","clo":"clo2","weight":1.0}"#).unwrap();
+
+    // Edges
+    db.link("students/budi", "answers/a1", "answered", 1.0);
+    db.link("students/budi", "answers/a2", "answered", 1.0);
+    db.link("students/budi", "answers/a3", "answered", 1.0);
+    db.link("answers/a1", "questions/q1", "for", 1.0);
+    db.link("answers/a2", "questions/q2", "for", 1.0);
+    db.link("answers/a3", "questions/q3", "for", 1.0);
+
+    let hits = db.pipeline_query(
+        "MATCH ('students/budi')-[:answered]->(a)-[:for]->(q) \
+         WITH q.clo AS clo, SUM(a.score * q.weight) AS clo_score \
+         RETURN clo, clo_score ORDER BY clo_score DESC",
+    ).unwrap();
+
+    assert_eq!(hits.len(), 2, "expected 2 CLO rows");
+
+    // clo2: 1.0 * 1.0 = 1.0 (DESC first)
+    let clo_val = |h: &sekejap::Hit| {
+        h.payload.as_ref().unwrap().get("clo").and_then(|v| v.as_str()).unwrap().to_string()
+    };
+    let score_val = |h: &sekejap::Hit| {
+        h.payload.as_ref().unwrap().get("clo_score").and_then(|v| v.as_f64()).unwrap()
+    };
+
+    assert_eq!(clo_val(&hits[0]), "clo2");
+    assert!((score_val(&hits[0]) - 1.0).abs() < 1e-9, "clo2 score should be 1.0");
+
+    assert_eq!(clo_val(&hits[1]), "clo1");
+    // clo1: 0.8*0.4 + 0.9*0.6 = 0.32 + 0.54 = 0.86
+    assert!((score_val(&hits[1]) - 0.86).abs() < 1e-9, "clo1 score should be 0.86");
+}
+
+/// Full 2-level OBE pipeline: CLO → PLO aggregation.
+#[test]
+fn pipeline_two_level_clo_plo() {
+    let mut db = CoreDB::new();
+
+    // Student, answers, questions (same as above but fewer)
+    db.put("students/budi", r#"{"_collection":"students","_key":"budi"}"#).unwrap();
+    db.put("answers/a1", r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
+    db.put("answers/a2", r#"{"_collection":"answers","_key":"a2","score":1.0}"#).unwrap();
+    db.put("questions/q1", r#"{"_collection":"questions","_key":"q1","clo":"clo1","weight":1.0}"#).unwrap();
+    db.put("questions/q2", r#"{"_collection":"questions","_key":"q2","clo":"clo2","weight":1.0}"#).unwrap();
+    db.link("students/budi", "answers/a1", "answered", 1.0);
+    db.link("students/budi", "answers/a2", "answered", 1.0);
+    db.link("answers/a1", "questions/q1", "for", 1.0);
+    db.link("answers/a2", "questions/q2", "for", 1.0);
+
+    // CLOs (weight for PLO contribution)
+    db.put("clos/clo1", r#"{"_collection":"clos","_key":"clo1","weight":0.5}"#).unwrap();
+    db.put("clos/clo2", r#"{"_collection":"clos","_key":"clo2","weight":0.5}"#).unwrap();
+
+    // PLO
+    db.put("plos/plo1", r#"{"_collection":"plos","_key":"plo1"}"#).unwrap();
+
+    // Edges: CLOs contribute to PLO
+    db.link("clos/clo1", "plos/plo1", "contributes_to", 1.0);
+    db.link("clos/clo2", "plos/plo1", "contributes_to", 1.0);
+
+    let hits = db.pipeline_query(
+        "MATCH ('students/budi')-[:answered]->(a)-[:for]->(q) \
+         WITH q.clo AS clo, SUM(a.score * q.weight) AS clo_score \
+         MATCH (c:clos WHERE _key = clo)-[:contributes_to]->(plo:plos) \
+         RETURN plo._key AS plo, SUM(clo_score * c.weight) AS plo_score \
+         ORDER BY plo_score DESC",
+    ).unwrap();
+
+    assert_eq!(hits.len(), 1, "expected 1 PLO row");
+    let plo = hits[0].payload.as_ref().unwrap().get("plo")
+        .and_then(|v| v.as_str()).unwrap();
+    assert_eq!(plo, "plo1");
+
+    // clo1: 0.8 * 1.0 = 0.8; clo2: 1.0 * 1.0 = 1.0
+    // plo1 = (0.8 * 0.5) + (1.0 * 0.5) = 0.4 + 0.5 = 0.9
+    let plo_score = hits[0].payload.as_ref().unwrap().get("plo_score")
+        .and_then(|v| v.as_f64()).unwrap();
+    assert!((plo_score - 0.9).abs() < 1e-9, "plo_score should be 0.9, got {}", plo_score);
+}
+
+/// Pipeline with LIMIT.
+#[test]
+fn pipeline_with_limit() {
+    let mut db = CoreDB::new();
+    db.put("root", r#"{"_collection":"roots","_key":"root"}"#).unwrap();
+    for i in 1..=5u32 {
+        let slug = format!("items/i{i}");
+        let pay = format!(r#"{{"_collection":"items","_key":"i{i}","val":{i}}}"#);
+        db.put(&slug, &pay).unwrap();
+        db.link("root", &slug, "has", 1.0);
+    }
+
+    let hits = db.pipeline_query(
+        "MATCH ('root')-[:has]->(item) RETURN item.val AS v ORDER BY v ASC LIMIT 3",
+    ).unwrap();
+
+    assert_eq!(hits.len(), 3);
+    let vals: Vec<f64> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap().get("v").and_then(|v| v.as_f64()).unwrap())
+        .collect();
+    assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+}
+
+/// Pipeline COUNT aggregate.
+#[test]
+fn pipeline_count_aggregate() {
+    let mut db = CoreDB::new();
+    db.put("src", r#"{"_collection":"src","_key":"src"}"#).unwrap();
+    for i in 1..=4u32 {
+        let slug = format!("dst/d{i}");
+        db.put(&slug, &format!(r#"{{"_collection":"dst","_key":"d{i}","grp":"g{}"}}"#, if i <= 2 {"1"} else {"2"})).unwrap();
+        db.link("src", &slug, "points_to", 1.0);
+    }
+
+    let hits = db.pipeline_query(
+        "MATCH ('src')-[:points_to]->(d) \
+         WITH d.grp AS grp, COUNT(*) AS cnt \
+         RETURN grp, cnt ORDER BY grp ASC",
+    ).unwrap();
+
+    assert_eq!(hits.len(), 2);
+    let g1_cnt = hits[0].payload.as_ref().unwrap().get("cnt")
+        .and_then(|v| v.as_i64()).unwrap();
+    let g2_cnt = hits[1].payload.as_ref().unwrap().get("cnt")
+        .and_then(|v| v.as_i64()).unwrap();
+    assert_eq!(g1_cnt, 2);
+    assert_eq!(g2_cnt, 2);
+}
+
+/// Multi-MATCH pipeline from a collection start.
+#[test]
+fn pipeline_collection_start() {
+    let mut db = CoreDB::new();
+    db.put("cats/a", r#"{"_collection":"cats","_key":"a"}"#).unwrap();
+    db.put("cats/b", r#"{"_collection":"cats","_key":"b"}"#).unwrap();
+    db.put("items/x", r#"{"_collection":"items","_key":"x","val":5.0}"#).unwrap();
+    db.put("items/y", r#"{"_collection":"items","_key":"y","val":10.0}"#).unwrap();
+    db.link("cats/a", "items/x", "has", 1.0);
+    db.link("cats/b", "items/y", "has", 1.0);
+
+    let hits = db.pipeline_query(
+        "MATCH (c:cats)-[:has]->(item:items) RETURN c._key AS cat, item.val AS val ORDER BY val ASC",
+    ).unwrap();
+
+    assert_eq!(hits.len(), 2);
+    let val_of = |i: usize| hits[i].payload.as_ref().unwrap().get("val")
+        .and_then(|v| v.as_f64()).unwrap();
+    assert_eq!(val_of(0), 5.0);
+    assert_eq!(val_of(1), 10.0);
+}
+
+/// Multi-hop traversal after deleting an intermediate node must not return
+/// the deleted node or traverse dead edges.
+#[test]
+fn traversal_after_delete_skips_deleted_node() {
+    let mut db = CoreDB::new();
+    for k in ["a", "b", "c"] {
+        db.put(&format!("n/{k}"), &format!(r#"{{"_collection":"n","_key":"{k}"}}"#)).unwrap();
+    }
+    db.link("n/a", "n/b", "e", 1.0);
+    db.link("n/b", "n/c", "e", 1.0);
+
+    // 2-hop from a reaches b and c
+    assert_eq!(db.one("n/a").hops_typed("e", 2).count(), 2);
+
+    db.remove("n/b");
+
+    // After deleting b, 2-hop from a reaches nothing
+    assert_eq!(db.one("n/a").hops_typed("e", 2).count(), 0);
+}
+
+// ── Pipeline WHERE comparison operators ───────────────────────────────────────
+
+#[test]
+fn pipeline_where_cmp_operators() {
+    let mut db = CoreDB::new();
+
+    // Students with scores; some pass (>=60), some fail
+    for (key, name, score) in [
+        ("stu/ali", "Ali", 80.0_f64),
+        ("stu/budi", "Budi", 55.0_f64),
+        ("stu/cici", "Cici", 72.0_f64),
+        ("stu/dodi", "Dodi", 45.0_f64),
+    ] {
+        db.put(key, &serde_json::json!({
+            "_collection": "students",
+            "_key": key,
+            "name": name,
+            "score": score,
+        }).to_string()).unwrap();
+    }
+
+    // ── Test >= (pass threshold) ──────────────────────────────────────────────
+    // MATCH (s:students WHERE score >= 60) RETURN s
+    let hits = db.pipeline_query(
+        "MATCH (s:students WHERE score >= 60) RETURN s"
+    ).unwrap();
+    assert_eq!(hits.len(), 2, "Ali and Cici should pass (score >= 60)");
+
+    // ── Test < (failing) ─────────────────────────────────────────────────────
+    let hits = db.pipeline_query(
+        "MATCH (s:students WHERE score < 60) RETURN s"
+    ).unwrap();
+    assert_eq!(hits.len(), 2, "Budi and Dodi should fail (score < 60)");
+
+    // ── Test != ──────────────────────────────────────────────────────────────
+    let hits = db.pipeline_query(
+        "MATCH (s:students WHERE score != 80) RETURN s"
+    ).unwrap();
+    assert_eq!(hits.len(), 3, "Everyone except Ali");
+
+    // ── Test AND with multiple comparison ops ────────────────────────────────
+    // score >= 50 AND score <= 75 → Budi(55) and Cici(72)
+    let hits = db.pipeline_query(
+        "MATCH (s:students WHERE score >= 50 AND score <= 75) RETURN s"
+    ).unwrap();
+    assert_eq!(hits.len(), 2, "Budi(55) and Cici(72) are in 50..=75");
+}
+
+// ── Collection-level edge listing ─────────────────────────────────────────────
+
+#[test]
+fn edges_from_collection_and_between() {
+    let mut db = CoreDB::new();
+
+    // Two classrooms, two lecturers, one department
+    for (key, col) in [
+        ("cls/math", "classrooms"), ("cls/physics", "classrooms"),
+        ("lec/ali", "lecturers"),   ("lec/budi", "lecturers"),
+        ("dept/sci", "departments"),
+    ] {
+        db.put(key, &serde_json::json!({
+            "_collection": col, "_key": key
+        }).to_string()).unwrap();
+    }
+
+    db.link("cls/math",    "lec/ali",  "taught_by", 1.0);
+    db.link("cls/physics", "lec/budi", "taught_by", 1.0);
+    db.link("lec/ali",     "dept/sci", "belongs_to", 1.0);
+
+    // ── edges_from_collection: all edges leaving classrooms ───────────────────
+    let edges = db.edges_from_collection("classrooms");
+    assert_eq!(edges.len(), 2);
+    // edge_type label is now resolved
+    assert!(edges.iter().all(|e| e.edge_type.as_deref() == Some("taught_by")));
+
+    // ── edges_between: classrooms → lecturers only ────────────────────────────
+    let edges = db.edges_between("classrooms", "lecturers");
+    assert_eq!(edges.len(), 2);
+
+    // ── edges_between: lecturers → classrooms = 0 (direction matters) ─────────
+    let edges = db.edges_between("lecturers", "classrooms");
+    assert_eq!(edges.len(), 0);
+
+    // ── edges_between: lecturers → departments ────────────────────────────────
+    let edges = db.edges_between("lecturers", "departments");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].from_slug.as_deref(), Some("lec/ali"));
+    assert_eq!(edges[0].to_slug.as_deref(),   Some("dept/sci"));
+    assert_eq!(edges[0].edge_type.as_deref(), Some("belongs_to"));
+}
+
+#[test]
+fn show_edges_sql() {
+    let mut db = CoreDB::new();
+    for (key, col) in [
+        ("cls/math", "classrooms"), ("cls/physics", "classrooms"),
+        ("lec/ali",  "lecturers"),  ("dept/sci",    "departments"),
+    ] {
+        db.put(key, &serde_json::json!({"_collection": col, "_key": key}).to_string()).unwrap();
+    }
+    db.link("cls/math",    "lec/ali",  "taught_by",  1.0);
+    db.link("cls/physics", "lec/ali",  "taught_by",  1.0);
+    db.link("lec/ali",     "dept/sci", "belongs_to", 1.0);
+
+    // Full schema — 2 distinct triples
+    let hits = db.show("SHOW EDGES").unwrap();
+    assert_eq!(hits.len(), 2);
+    let types: Vec<_> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["type"].as_str().unwrap())
+        .collect();
+    assert!(types.contains(&"taught_by"));
+    assert!(types.contains(&"belongs_to"));
+
+    // FROM classrooms → only taught_by
+    let hits = db.show("SHOW EDGES FROM classrooms").unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["type"].as_str(), Some("taught_by"));
+
+    // FROM classrooms TO lecturers
+    let hits = db.show("SHOW EDGES FROM classrooms TO lecturers").unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["type"].as_str(), Some("taught_by"));
+
+    // FROM classrooms TO departments → 0
+    let hits = db.show("SHOW EDGES FROM classrooms TO departments").unwrap();
+    assert_eq!(hits.len(), 0);
+}

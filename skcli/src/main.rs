@@ -1,368 +1,445 @@
-use clap::Parser;
-use colored::*;
-use comfy_table::Table;
-use rustyline::error::ReadlineError;
+//! sekejap — interactive REPL and one-shot query runner
+//!
+//! # Usage
+//!
+//! ```text
+//! sekejap                            open in-memory REPL
+//! sekejap <path>                     open persistent DB in REPL
+//! sekejap --path <path>              same (explicit flag)
+//! sekejap <path> "<SQL>"             run SQL, print results, exit
+//! sekejap --path <path> "<SQL>"      run SQL, print results, exit
+//! echo "SQL;" | sekejap <path>       pipe SQL script, exit when stdin closes
+//! ```
+
 use rustyline::DefaultEditor;
-use sekejap::SekejapDB;
-use std::path::Path;
-use std::time::Instant;
+use sekejap::CoreDB;
+use std::io::{self, IsTerminal, Read};
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+// ── Arg parsing ───────────────────────────────────────────────────────────────
+
 struct Args {
-    /// Path to the database directory
-    #[arg(default_value = "./sekejap_data")]
-    path: String,
-
-    /// Optional one-shot query or command to execute and exit
-    input: Option<String>,
-
-    /// Initial node capacity
-    #[arg(short, long, default_value_t = 1_000_000)]
-    capacity: usize,
+    path: Option<String>,
+    sql:  Option<String>,
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let db_path = Path::new(&args.path);
+fn parse_args() -> Args {
+    let mut args = std::env::args().skip(1).peekable();
+    let mut path = None;
+    let mut sql  = None;
 
-    println!("{}", "sekejap".bold().green());
-    println!("Opening {}...", args.path);
-
-    let db = match SekejapDB::new(db_path, args.capacity) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("{} Failed to open database: {}", "Error:".red(), e);
-            return Ok(());
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--path" | "-p" => {
+                path = args.next();
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("sekejap {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            other => {
+                if path.is_none() {
+                    path = Some(other.to_string());
+                } else {
+                    sql = Some(other.to_string());
+                }
+            }
         }
-    };
-
-    if let Some(input) = args.input.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        if input.starts_with('\\') || input.starts_with('.') || is_internal_command(input) {
-            handle_command(input, &db);
-        } else {
-            handle_query(input, &db);
-        }
-        return Ok(());
     }
 
-    println!("{}", "Connected!".green());
-    println!("Type '.help' or 'help' for help.");
+    Args { path, sql }
+}
 
-    let mut rl = DefaultEditor::new()?;
-    if rl.load_history("history.txt").is_err() {
-        // No previous history
+fn print_usage() {
+    println!(
+        "sekejap {}
+
+USAGE:
+  sekejap                          open in-memory REPL
+  sekejap <path>                   open persistent DB in REPL
+  sekejap --path <path>            same (explicit flag)
+  sekejap <path> \"<SQL>\"           run SQL and exit
+  sekejap --path <path> \"<SQL>\"    run SQL and exit
+  echo \"SELECT...;\" | sekejap      pipe SQL script
+
+OPTIONS:
+  -p, --path <path>    database directory path
+  -h, --help           show this help
+  -V, --version        show version",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+// ── DB open/create ────────────────────────────────────────────────────────────
+
+fn open_db(path: &Option<String>) -> (CoreDB, String) {
+    match path {
+        Some(p) => match CoreDB::open(p) {
+            Ok(db) => (db, p.clone()),
+            Err(e) => {
+                eprintln!("error: cannot open '{}': {}", p, e);
+                std::process::exit(1);
+            }
+        },
+        None => (CoreDB::new(), String::from(":memory:")),
     }
+}
+
+// ── SQL execution ─────────────────────────────────────────────────────────────
+
+/// Execute one SQL statement, print results.
+fn run_sql(db: &mut CoreDB, sql: &str) -> bool {
+    let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
+    match first.as_str() {
+        "SELECT" => match db.query(sql) {
+            Err(e) => eprintln!("error: {e}"),
+            Ok(set) => print_hits(set.collect()),
+        },
+        "MATCH" => {
+            let is_pipeline = sql.split_whitespace().any(|w| w.to_uppercase() == "WITH");
+            if is_pipeline {
+                match db.pipeline_query(sql) {
+                    Err(e) => eprintln!("error: {e}"),
+                    Ok(hits) => print_hits(hits),
+                }
+            } else {
+                match db.query(sql) {
+                    Err(e) => eprintln!("error: {e}"),
+                    Ok(set) => print_hits(set.collect()),
+                }
+            }
+        }
+        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" => match db.execute(sql) {
+            Err(e) => eprintln!("error: {e}"),
+            Ok(n) => {
+                if n == 0 {
+                    println!("ok");
+                } else if n == 1 {
+                    println!("ok — 1 row affected");
+                } else {
+                    println!("ok — {} rows affected", n);
+                }
+            }
+        },
+        "SHOW" => match db.show(sql) {
+            Err(e) => eprintln!("error: {e}"),
+            Ok(hits) => print_hits(hits),
+        },
+        _ => eprintln!("unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE CREATE"),
+    }
+    true
+}
+
+fn print_hits(hits: Vec<sekejap::Hit>) {
+    let count = hits.len();
+    for hit in &hits {
+        match &hit.payload {
+            Some(v) => println!(
+                "{}",
+                serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+            ),
+            None => println!("{}", hit.slug),
+        }
+    }
+    if count == 1 {
+        println!("── 1 row ──");
+    } else {
+        println!("── {} rows ──", count);
+    }
+}
+
+// ── Dot commands ──────────────────────────────────────────────────────────────
+
+/// Handle a `.command` line. Returns false if the user wants to quit.
+fn run_dot(db: &mut CoreDB, label: &mut String, line: &str) -> bool {
+    let parts: Vec<&str> = line.splitn(2, ' ').collect();
+    match parts[0] {
+        ".quit" | ".q" | ".exit" => return false,
+
+        ".help" => print_repl_help(),
+
+        ".open" => {
+            let p = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            if p.is_empty() {
+                eprintln!("usage: .open <path>");
+            } else {
+                match CoreDB::open(p) {
+                    Ok(new_db) => {
+                        *db = new_db;
+                        *label = p.to_string();
+                        println!("opened: {p}");
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
+
+        ".tables" => {
+            let names = db.collection_names();
+            if names.is_empty() {
+                println!("(no collections)");
+            } else {
+                for name in names {
+                    println!("{name}");
+                }
+            }
+        }
+
+        ".schema" => {
+            let target = parts.get(1).map(|s| s.trim());
+            let names = db.collection_names();
+            let cols: Vec<&str> = match target {
+                Some(t) if !t.is_empty() => vec![t],
+                _ => names.iter().map(String::as_str).collect(),
+            };
+            let mut found_any = false;
+            for col in cols {
+                if let Some(ddl) = db.schema_ddl(col) {
+                    println!("{ddl};");
+                    found_any = true;
+                } else if target.is_some() {
+                    println!("-- no CREATE TABLE for '{col}'");
+                    found_any = true;
+                }
+            }
+            if !found_any {
+                println!("(no schemas declared — use CREATE TABLE to add one)");
+            }
+        }
+
+        ".compact" => match db.compact() {
+            Ok(_) => println!("compacted"),
+            Err(e) => eprintln!("error: {e}"),
+        },
+
+        ".stats" => {
+            let nodes = db.node_count();
+            let edges = db.edge_count();
+            let colls = db.collection_names().len();
+            println!("nodes       : {nodes}");
+            println!("edges       : {edges}");
+            println!("collections : {colls}");
+        }
+
+        ".edges" => {
+            let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            if arg.is_empty() {
+                let schema = db.edge_schema();
+                if schema.is_empty() {
+                    println!("(no edges)");
+                } else {
+                    println!("{:<25} {:<20} {}", "from", "type", "to");
+                    println!("{}", "-".repeat(65));
+                    for (from, kind, to) in &schema {
+                        println!("{:<25} {:<20} {}", from, kind, to);
+                    }
+                }
+            } else {
+                let types = db.edge_types_from_collection(arg);
+                if types.is_empty() {
+                    println!("(no outgoing edges from '{arg}')");
+                } else {
+                    for t in &types {
+                        println!("{t}");
+                    }
+                }
+            }
+        }
+
+        other => eprintln!("unknown command: {other}  (try .help)"),
+    }
+    true
+}
+
+fn print_repl_help() {
+    println!(
+        r#"
+sekejap dot commands
+────────────────────
+.open <path>        open (or create) a persistent DB — replaces current DB
+.tables             list all collections
+.schema [name]      show CREATE TABLE DDL (all collections if name omitted)
+.compact            flush snapshot, truncate WAL
+.stats              show node / edge / collection counts
+.edges              show full graph schema (from_col → type → to_col), distinct
+.edges <col>        show distinct edge types leaving a collection
+.help               show this help
+.quit / .q / .exit  exit  (also Ctrl+D)
+
+SQL (end each statement with ;)
+────────────────────────────────
+SELECT * FROM collection [WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n];
+SELECT * FROM ALL [WHERE ...];
+INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...);
+MATCH ('slug')-[:edge]->(a)-[:edge]->(b)
+  RETURN b.field AS alias, SUM(a.score * b.weight) AS total
+  GROUP BY b.field ORDER BY total DESC LIMIT 10;
+UPDATE collection SET field = val [WHERE ...];
+DELETE FROM collection [WHERE ...];
+CREATE TABLE collection (_key TEXT PRIMARY KEY, field TYPE, ...);
+
+Graph edges
+───────────
+INSERT ('from')-[:KIND {{strength: n}}]->('to');
+DELETE ('from')-[:KIND]->('to');
+MATCH (a:col)-[:rel*1..3]->(b:col) WHERE a._key = 'x' RETURN b;
+
+Filters
+───────
+=  !=  >  <  >=  <=  BETWEEN n AND n
+IN (v1, v2)  NOT IN (v1, v2)
+LIKE 'pat'  ILIKE 'pat'
+IS NULL  IS NOT NULL
+AND  OR  NOT
+
+Spatial
+───────
+ST_DWithin(geometry, POINT(lon lat), km)
+ST_Contains / ST_Within / ST_Intersects
+
+Vector
+──────
+WHERE VECTOR_NEAR(field, [f32, ...], k)
+"#
+    );
+}
+
+// ── Script mode ───────────────────────────────────────────────────────────────
+
+fn run_script(db: &mut CoreDB, script: &str) {
+    let mut label = String::new();
+    let mut buf = String::new();
+    let mut in_str = false;
+    let mut str_char = '\0';
+
+    for line in script.lines() {
+        let trimmed = line.trim();
+
+        if !in_str && buf.trim().is_empty() && trimmed.starts_with('.') {
+            if !run_dot(db, &mut label, trimmed) {
+                return;
+            }
+            continue;
+        }
+
+        if !in_str && (trimmed.is_empty() || trimmed.starts_with("--")) {
+            continue;
+        }
+
+        for ch in trimmed.chars() {
+            match ch {
+                '\'' | '"' if !in_str => { in_str = true; str_char = ch; buf.push(ch); }
+                c if in_str && c == str_char => { in_str = false; buf.push(ch); }
+                ';' if !in_str => {
+                    let stmt = buf.trim().to_string();
+                    buf.clear();
+                    if !stmt.is_empty() {
+                        run_sql(db, &stmt);
+                    }
+                }
+                _ => buf.push(ch),
+            }
+        }
+        if !buf.trim().is_empty() {
+            buf.push(' ');
+        }
+    }
+
+    let stmt = buf.trim().to_string();
+    if !stmt.is_empty() {
+        run_sql(db, &stmt);
+    }
+}
+
+// ── REPL ──────────────────────────────────────────────────────────────────────
+
+fn repl(mut db: CoreDB, mut label: String) {
+    let history_path = std::env::var("HOME").ok()
+        .map(|h| std::path::PathBuf::from(h).join(".sekejap_history"));
+
+    let mut rl = DefaultEditor::new().expect("failed to init readline");
+    if let Some(ref p) = history_path {
+        let _ = rl.load_history(p);
+    }
+
+    println!("sekejap {}  —  {label}", env!("CARGO_PKG_VERSION"));
+    println!("type .help for commands, .quit to exit\n");
+
+    let mut buf = String::new();
 
     loop {
-        let readline = rl.readline("sekejap> ");
-        match readline {
-            Ok(line) => {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let _ = rl.add_history_entry(line);
+        let prompt = if buf.trim().is_empty() {
+            "sekejap> ".to_string()
+        } else {
+            "      ...> ".to_string()
+        };
 
-                if line.starts_with('\\') || line.starts_with('.') || is_internal_command(line) {
-                    handle_command(line, &db);
-                } else {
-                    handle_query(line, &db);
-                }
-            }
-            Err(ReadlineError::Interrupted) => {
-                println!("CTRL-C");
+        let line = match rl.readline(&prompt) {
+            Ok(l) => l,
+            Err(rustyline::error::ReadlineError::Eof)
+            | Err(rustyline::error::ReadlineError::Interrupted) => break,
+            Err(e) => {
+                eprintln!("readline error: {e}");
                 break;
             }
-            Err(ReadlineError::Eof) => {
-                println!("CTRL-D");
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let _ = rl.add_history_entry(trimmed);
+
+        if trimmed.starts_with('.') {
+            buf.clear();
+            if !run_dot(&mut db, &mut label, trimmed) {
                 break;
             }
-            Err(err) => {
-                println!("Error: {:?}", err);
-                break;
+            continue;
+        }
+
+        if !buf.is_empty() {
+            buf.push(' ');
+        }
+        buf.push_str(trimmed);
+
+        if buf.trim_end().ends_with(';') {
+            let sql = buf.trim_end_matches(';').trim().to_string();
+            buf.clear();
+            if !sql.is_empty() {
+                run_sql(&mut db, &sql);
             }
         }
     }
-    rl.save_history("history.txt")?;
-    Ok(())
-}
 
-fn is_internal_command(line: &str) -> bool {
-    let cmd = line.split_whitespace().next().unwrap_or("");
-    let cmd = cmd.trim_start_matches('\\').trim_start_matches('.');
-    matches!(
-        cmd,
-        "help" | "exit" | "quit" | "ls" | "list" | "collections" | "clear" | "cls" | "describe" | "flush"
-    )
-}
-
-fn handle_command(line: &str, db: &SekejapDB) {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    let cmd = parts
-        .first()
-        .copied()
-        .unwrap_or("")
-        .trim_start_matches('\\')
-        .trim_start_matches('.');
-
-    match cmd {
-        "?" | "help" => print_help(),
-        "q" | "exit" | "quit" => std::process::exit(0),
-        "l" | "ls" | "list" | "collections" | "tables" => list_collections(db),
-        "d" | "desc" | "describe" => {
-            if let Some(col) = parts.get(1) {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&db.describe_collection(col))
-                        .unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&db.describe())
-                        .unwrap_or_else(|_| "{}".to_string())
-                );
-            }
-        }
-        "clear" | "cls" => print!("\x1B[2J\x1B[1;1H"),
-        "flush" => {
-            if let Err(e) = db.flush() {
-                println!("{} Failed to flush: {}", "Error:".red(), e);
-            } else {
-                println!("{}", "Database flushed to disk.".green());
-            }
-        }
-        _ => println!("Unknown command: {}", cmd),
+    if let Some(ref p) = history_path {
+        let _ = rl.save_history(p);
     }
 }
 
-fn print_help() {
-    println!("\n{}", "Available Commands:".bold().underline());
-    println!("  .help or help         Show this help");
-    println!("  .quit or exit         Quit the CLI");
-    println!("  .tables or .ls        List all collections");
-    println!("  .describe [name]      Show describe output (global or collection)");
-    println!("  .flush                Flush data to disk");
-    println!("  .clear                Clear the screen");
-    println!("\n{}", "Querying (SQL):".bold().underline());
-    println!("  SELECT * FROM crimes LIMIT 5;");
-    println!("  SELECT id, title FROM crimes WHERE kind = 'robbery' LIMIT 10;");
-    println!("  SELECT id FROM cases TRAVERSE FORWARD caused_by TO causes HOPS 3 WHERE id = 'incident_00001';");
-    println!("  count SELECT id FROM crimes WHERE kind = 'robbery';");
-    println!("  explain SELECT id FROM crimes WHERE kind = 'robbery';");
-    println!("\n{}", "Mutations (SQL):".bold().underline());
-    println!("  CREATE COLLECTION crimes (id TEXT PRIMARY KEY, title TEXT) WITH (hash_index = [id]);");
-    println!("  INSERT INTO crimes (id, title) VALUES ('c1', 'Example');");
-    println!("  UPDATE crimes SET title = 'Updated' WHERE id = 'c1';");
-    println!("  DELETE FROM crimes WHERE id = 'c1';");
-    println!("  RELATE cases/incident_00001 -> caused_by -> causes/wet_road_00001;");
-    println!("  UNRELATE cases/incident_00001 -> caused_by -> causes/wet_road_00001;");
-    println!("\n{}", "Advanced / Legacy Inputs:".bold().underline());
-    println!("  collection \"crimes\" | take 5         Pipe-style SekejapQL");
-    println!("  query {{...}};                        Execute JSON query pipeline");
-    println!("  count {{...}};                        Count results from JSON pipeline");
-    println!("  explain {{...}};                      Show compiled steps from JSON");
-    println!("  mutate {{...}};                       Execute JSON mutation");
-    println!("\n{}", "Examples:".bold().underline());
-    println!("  sekejap ./data \"SELECT * FROM crimes LIMIT 10;\"");
-    println!("  SELECT id, name FROM researchers WHERE VECTOR_NEAR(embedding, [0.1, 0.2, 0.3], 20) LIMIT 20;");
-    println!("  RELATE researchers/a -> collaborates_with -> researchers/b;");
-    println!("  query {{\"pipeline\": [{{\"op\": \"all\"}}, {{\"op\": \"take\", \"n\": 5}}]}};");
-}
+// ── Entry point ───────────────────────────────────────────────────────────────
 
-fn list_collections(db: &SekejapDB) {
-    let mut table = Table::new();
-    table.set_header(vec!["Collection Hash", "Count"]);
+fn main() {
+    let args = parse_args();
+    let (mut db, label) = open_db(&args.path);
 
-    for entry in db.collections.iter() {
-        let hash = entry.key();
-        let count = db
-            .collection_counts
-            .get(hash)
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0);
-        table.add_row(vec![format!("{:x}", hash), count.to_string()]);
-    }
-
-    for entry in db.collection_counts.iter() {
-        if !db.collections.contains_key(entry.key()) {
-            table.add_row(vec![
-                format!("{:x}", entry.key()),
-                entry
-                    .value()
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string(),
-            ]);
-        }
-    }
-
-    println!("{}", table);
-}
-
-fn handle_query(line: &str, db: &SekejapDB) {
-    let line = line.trim().trim_end_matches(';').trim();
-    if line.is_empty() {
+    if let Some(sql) = args.sql {
+        run_script(&mut db, &sql);
         return;
     }
 
-    if line == "describe" || line == ".describe" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&db.describe()).unwrap_or_else(|_| "{}".to_string())
-        );
-        return;
-    }
-    if let Some(rest) = line.strip_prefix("describe ").or_else(|| line.strip_prefix(".describe ")) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&db.describe_collection(rest.trim()))
-                .unwrap_or_else(|_| "{}".to_string())
-        );
+    if !io::stdin().is_terminal() {
+        let mut script = String::new();
+        io::stdin()
+            .read_to_string(&mut script)
+            .expect("failed to read stdin");
+        run_script(&mut db, &script);
         return;
     }
 
-    if let Some(json) = line.strip_prefix("mutate ") {
-        let start = Instant::now();
-        match db.mutate(json.trim()) {
-            Ok(out) => {
-                let _ = db.flush();
-                let duration = start.elapsed();
-                println!(
-                    "{} mutation completed in {:.4}s",
-                    "Success:".green(),
-                    duration.as_secs_f64()
-                );
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
-                );
-            }
-            Err(e) => eprintln!("{} {}", "Mutation Error:".red(), e),
-        }
-        return;
-    }
-
-    if looks_like_sql_mutation(line) {
-        let start = Instant::now();
-        match db.mutate(line) {
-            Ok(out) => {
-                let _ = db.flush();
-                let duration = start.elapsed();
-                println!(
-                    "{} mutation completed in {:.4}s",
-                    "Success:".green(),
-                    duration.as_secs_f64()
-                );
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
-                );
-            }
-            Err(e) => eprintln!("{} {}", "Mutation Error:".red(), e),
-        }
-        return;
-    }
-
-    if let Some(rest) = line.strip_prefix("explain ") {
-        let input = rest.strip_prefix("query ").unwrap_or(rest).trim();
-        match db.explain(input) {
-            Ok(steps) => {
-                println!("{} {} steps compiled", "Plan:".green(), steps.len());
-                for (i, step) in steps.iter().enumerate() {
-                    println!("  {}: {:?}", i + 1, step);
-                }
-            }
-            Err(e) => eprintln!("{} {}", "Explain Error:".red(), e),
-        }
-        return;
-    }
-
-    if let Some(rest) = line.strip_prefix("count ") {
-        let input = rest.strip_prefix("query ").unwrap_or(rest).trim();
-        let start = Instant::now();
-        match db.count(input) {
-            Ok(outcome) => {
-                let duration = start.elapsed();
-                println!(
-                    "{} {} results in {:.4}s",
-                    "Count:".green(),
-                    outcome.data,
-                    duration.as_secs_f64()
-                );
-                print_trace(&outcome.trace);
-            }
-            Err(e) => eprintln!("{} {}", "Count Error:".red(), e),
-        }
-        return;
-    }
-
-    let input = line.strip_prefix("query ").unwrap_or(line).trim();
-    let start = Instant::now();
-    match db.query(input) {
-        Ok(outcome) => {
-            let duration = start.elapsed();
-            let hits = outcome.data;
-
-            println!(
-                "{} {} hits in {:.4}s",
-                "Success:".green(),
-                hits.len(),
-                duration.as_secs_f64()
-            );
-
-            if !hits.is_empty() {
-                let mut table = Table::new();
-                table.set_header(vec!["Idx", "Slug Hash", "Payload (Preview)"]);
-
-                for hit in hits.iter().take(20) {
-                    let payload = hit.payload.as_deref().unwrap_or("{}");
-                    let preview = if payload.len() > 60 {
-                        format!("{}...", &payload[..60])
-                    } else {
-                        payload.to_string()
-                    };
-                    table.add_row(vec![
-                        hit.idx.to_string(),
-                        format!("{:x}", hit.slug_hash),
-                        match hit.score {
-                            Some(score) => format!("{preview} [score={score:.4}]"),
-                            None => preview,
-                        },
-                    ]);
-                }
-                println!("{}", table);
-                if hits.len() > 20 {
-                    println!("... and {} more.", hits.len() - 20);
-                }
-            }
-
-            print_trace(&outcome.trace);
-        }
-        Err(e) => {
-            eprintln!("{} {}", "Query Error:".red(), e);
-        }
-    }
-}
-
-fn looks_like_sql_mutation(line: &str) -> bool {
-    let upper = line.trim_start().to_uppercase();
-    upper.starts_with("CREATE COLLECTION ")
-        || upper.starts_with("INSERT INTO ")
-        || upper.starts_with("RELATE ")
-        || upper.starts_with("UPDATE ")
-        || upper.starts_with("DELETE FROM ")
-        || upper.starts_with("UNRELATE ")
-}
-
-fn print_trace(trace: &sekejap::Trace) {
-    if !trace.steps.is_empty() {
-        println!("\n{}", "Execution Trace:".dimmed());
-        for step in &trace.steps {
-            println!(
-                "  -> {} (in: {}, out: {}, index: {}, time: {}us)",
-                step.atom, step.input_size, step.output_size, step.index_used, step.time_us
-            );
-        }
-    }
+    repl(db, label);
 }

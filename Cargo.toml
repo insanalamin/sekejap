@@ -1,8 +1,8 @@
 [workspace]
-members = [".", "wrappers/python", "wrappers/browser", "skcli", "sekejap-benchmark"]
+members = [".", "wrappers/python", "skcli"]
 
 [workspace.package]
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -10,7 +10,7 @@ homepage = "https://db.sekejap.life"
 description = "A graph-first, embedded multi-model database engine"
 
 [workspace.dependencies]
-sekejap = { path = ".", version = "0.5.3" }
+sekejap = { path = ".", version = "0.6.0" }
 
 [package]
 name = "sekejap"
@@ -25,68 +25,40 @@ keywords = ["database", "graph", "vector", "spatial", "multi-model"]
 categories = ["database", "embedded", "data-structures"]
 
 [dependencies]
-memmap2 = "0.9"
-bytemuck = { version = "1.14.0", features = ["derive"] }
-dashmap = "6.1.0"
-smallvec = "1.13.2"
-crc32fast = "1.4.0"
-seahash = "4.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-roaring = "0.10"
-bincode = "1.3"
-crossbeam-epoch = "0.9"
-ahash = "0.8"
-rstar = "0.12.0"
-parking_lot = "0.12.3"
-geo = "0.28"
-geojson = { version = "0.24", features = ["geo-types"] }
-rand = "0.8"
-rayon = "1.10"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
-uuid = { version = "1", features = ["v4"] }
-tantivy = { version = "0.25", optional = true }
-seekstorm = { version = "2.3", optional = true, default-features = false }
-sqlparser = "0.53"
+serde_json = "1"
+serde      = { version = "1", features = ["derive"] }
+seahash    = "4"
+crc32fast  = "1.4"
+roaring    = "0.10"
+memchr     = "2"
+chrono     = "0.4"
+uuid       = { version = "1", features = ["v4", "v5"] }
 
 [dev-dependencies]
-tempfile = "3.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile  = "3"
+rusqlite  = { version = "0.32", features = ["bundled"] }
 
-[features]
-default = []
+[[bench]]
+name = "sql_vs_atomic"
+harness = false
 
-# ==========================================
-# Full-Text Search Adapters
-# ==========================================
-# Production-ready: Tantivy (mature, portable, no special compiler flags)
-fulltext = ["dep:tantivy"]
-fulltext-tantivy = ["dep:tantivy"]
+[[bench]]
+name = "core_vs_sekejap_vs_sqlite"
+harness = false
 
-# ==========================================
-# SeekStorm (EXPERIMENTAL - Requires CPU Features)
-# ==========================================
-# SeekStorm is 2-3x faster than Tantivy but requires:
-#   RUSTFLAGS="-C target-cpu=native" (or "-C target-feature=+aes,+sse2")
-#
-# Why not default: Breaks portability on older CPUs without AES support
-# When to use: High-performance deployments on modern hardware (2013+)
-#
-# ⚠️  Do NOT enable both tantivy and seekstorm features together!
-#     Pick one adapter per build.
-#
-# Usage:
-#   RUSTFLAGS="-C target-cpu=native" cargo build --features fulltext-seekstorm
-#
-fulltext-seekstorm = ["dep:seekstorm", "seekstorm?/zh"]  # With Chinese language support
-fulltext-seekstorm-fast = ["dep:seekstorm"]              # Minimal features
+[[bench]]
+name = "spatial"
+harness = false
 
-# ==========================================
-# Other Features
-# ==========================================
-# Parallel graph traversal with Rayon
-parallel = []
+[[bench]]
+name = "ilike_bench"
+harness = false
 
-[package.metadata.docs.rs]
-all-features = true
+[[bench]]
+name = "vector_bench"
+harness = false
 
+[[bench]]
+name = "graph_traversal"
+harness = false
