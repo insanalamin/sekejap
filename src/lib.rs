@@ -1101,17 +1101,27 @@ impl CoreDB {
         Ok(pipeline::execute_pipeline(self, pipe))
     }
 
-    /// Execute a `SHOW EDGES` introspection statement.
+    /// Execute a `SHOW` introspection statement.
     ///
     /// Syntax:
     /// ```text
-    /// SHOW EDGES                         -- all (from, type, to) triples distinct
-    /// SHOW EDGES FROM classrooms         -- distinct edge types from that collection
-    /// SHOW EDGES FROM classrooms TO lecturers  -- types between two collections
-    /// ```
+    /// SHOW TABLES
+    ///     → [{name, count}, ...]  — all collections with row counts
     ///
-    /// Returns `Vec<Hit>` where each hit's payload is a JSON object with the
-    /// relevant fields (`from`, `type`, `to` for full schema; `type` for filtered).
+    /// SHOW EDGES
+    ///     → [{from, type, to, count}, ...]  — full graph schema with edge counts
+    ///
+    /// SHOW EDGES FROM collection
+    ///     → [{from, type, count}, ...]  — edge types leaving that collection + counts
+    ///
+    /// SHOW EDGES FROM col1 TO col2
+    ///     → [{from, type, to, count}, ...]  — edge types between two collections + counts
+    ///
+    /// SHOW collection
+    ///     → [{field, type, primary_key?, source}, ...]
+    ///       Uses declared schema if CREATE TABLE was issued; otherwise infers
+    ///       types from actual node data. source = "declared" | "inferred".
+    /// ```
     pub fn show(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError> {
         let stmt = sql::parse_show(sql)?;
 
@@ -1121,55 +1131,197 @@ impl CoreDB {
             payload: Some(payload),
         };
 
-        let hits = match (stmt.from_col, stmt.to_col) {
-            (None, _) => {
-                // Full graph schema
-                self.edge_schema()
-                    .into_iter()
-                    .map(|(from, kind, to)| make_hit(serde_json::json!({
-                        "from": from, "type": kind, "to": to
-                    })))
-                    .collect()
+        match stmt {
+            // ── SHOW TABLES ───────────────────────────────────────────────────
+            sql::ShowStmt::Tables => {
+                let mut counts: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                for node in self.nodes.values() {
+                    if let Some(col) = node.payload.get("_collection").and_then(|v| v.as_str()) {
+                        *counts.entry(col.to_string()).or_insert(0) += 1;
+                    }
+                }
+                Ok(counts.into_iter()
+                    .map(|(name, count)| make_hit(serde_json::json!({ "name": name, "count": count })))
+                    .collect())
             }
-            (Some(from_col), None) => {
-                // Distinct types from one collection
-                self.edge_types_from_collection(&from_col)
-                    .into_iter()
-                    .map(|kind| make_hit(serde_json::json!({ "from": from_col, "type": kind })))
-                    .collect()
+
+            // ── SHOW EDGES ────────────────────────────────────────────────────
+            sql::ShowStmt::Edges(e) => {
+                match (e.from_col, e.to_col) {
+                    (None, _) => {
+                        // Full schema — count all edges per (from, type, to) triple
+                        let mut counts: std::collections::HashMap<(String, String, String), usize> =
+                            std::collections::HashMap::new();
+                        for (&from_h, node) in &self.nodes {
+                            let from_col = match node.payload.get("_collection").and_then(|v| v.as_str()) {
+                                Some(c) => c.to_string(),
+                                None => continue,
+                            };
+                            if let Some(edges) = self.adj_fwd.get(&from_h) {
+                                for edge in edges {
+                                    let label = match self.edge_type_names.get(&edge.edge_type) {
+                                        Some(l) => l.clone(),
+                                        None => continue,
+                                    };
+                                    let to_col = match self.nodes.get(&edge.other)
+                                        .and_then(|n| n.payload.get("_collection"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        Some(c) => c.to_string(),
+                                        None => continue,
+                                    };
+                                    *counts.entry((from_col.clone(), label, to_col)).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                        let mut hits: Vec<_> = counts.into_iter()
+                            .map(|((from, kind, to), count)| make_hit(serde_json::json!({
+                                "from": from, "type": kind, "to": to, "count": count
+                            })))
+                            .collect();
+                        hits.sort_by(|a, b| {
+                            let ka = a.payload.as_ref().and_then(|p| p["from"].as_str()).unwrap_or("");
+                            let kb = b.payload.as_ref().and_then(|p| p["from"].as_str()).unwrap_or("");
+                            ka.cmp(kb)
+                        });
+                        Ok(hits)
+                    }
+                    (Some(from_col), None) => {
+                        // Types leaving one collection + counts
+                        let col_h = sk_hash(&from_col);
+                        let mut counts: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
+                        for (&node_h, node) in &self.nodes {
+                            if node.payload.get("_collection").and_then(|v| v.as_str())
+                                .map(|c| sk_hash(c) == col_h).unwrap_or(false)
+                            {
+                                if let Some(edges) = self.adj_fwd.get(&node_h) {
+                                    for edge in edges {
+                                        if let Some(label) = self.edge_type_names.get(&edge.edge_type) {
+                                            *counts.entry(label.clone()).or_insert(0) += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let mut hits: Vec<_> = counts.into_iter()
+                            .map(|(kind, count)| make_hit(serde_json::json!({
+                                "from": from_col, "type": kind, "count": count
+                            })))
+                            .collect();
+                        hits.sort_by(|a, b| {
+                            let ka = a.payload.as_ref().and_then(|p| p["type"].as_str()).unwrap_or("");
+                            let kb = b.payload.as_ref().and_then(|p| p["type"].as_str()).unwrap_or("");
+                            ka.cmp(kb)
+                        });
+                        Ok(hits)
+                    }
+                    (Some(from_col), Some(to_col)) => {
+                        // Types between two collections + counts
+                        let from_h = sk_hash(&from_col);
+                        let to_col_h = sk_hash(&to_col);
+                        let mut counts: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
+                        for (&node_h, node) in &self.nodes {
+                            if node.payload.get("_collection").and_then(|v| v.as_str())
+                                .map(|c| sk_hash(c) == from_h).unwrap_or(false)
+                            {
+                                if let Some(edges) = self.adj_fwd.get(&node_h) {
+                                    for edge in edges {
+                                        let in_to = self.nodes.get(&edge.other)
+                                            .and_then(|n| n.payload.get("_collection"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|c| sk_hash(c) == to_col_h)
+                                            .unwrap_or(false);
+                                        if in_to {
+                                            if let Some(label) = self.edge_type_names.get(&edge.edge_type) {
+                                                *counts.entry(label.clone()).or_insert(0) += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let mut hits: Vec<_> = counts.into_iter()
+                            .map(|(kind, count)| make_hit(serde_json::json!({
+                                "from": from_col, "type": kind, "to": to_col, "count": count
+                            })))
+                            .collect();
+                        hits.sort_by(|a, b| {
+                            let ka = a.payload.as_ref().and_then(|p| p["type"].as_str()).unwrap_or("");
+                            let kb = b.payload.as_ref().and_then(|p| p["type"].as_str()).unwrap_or("");
+                            ka.cmp(kb)
+                        });
+                        Ok(hits)
+                    }
+                }
             }
-            (Some(from_col), Some(to_col)) => {
-                // Distinct types between two collections
-                let to_col_h = sk_hash(&to_col);
-                let mut seen = std::collections::HashSet::new();
-                let mut hits = Vec::new();
-                for e in self.edges_from_collection(&from_col) {
-                    let in_to = e.to_slug.as_deref()
-                        .and_then(|s| self.slug_map.get(s))
-                        .and_then(|h| self.nodes.get(h))
-                        .and_then(|n| n.payload.get("_collection"))
-                        .and_then(|v| v.as_str())
-                        .map(|c| sk_hash(c) == to_col_h)
-                        .unwrap_or(false);
-                    if in_to {
-                        if let Some(kind) = e.edge_type {
-                            if seen.insert(kind.clone()) {
-                                hits.push(make_hit(serde_json::json!({
-                                    "from": from_col, "type": kind, "to": to_col
-                                })));
+
+            // ── SHOW <collection> ─────────────────────────────────────────────
+            sql::ShowStmt::Collection(collection) => {
+                // Declared schema takes priority
+                if let Some(schema) = self.schemas.get(&collection) {
+                    let hits = schema.fields.iter().map(|f| {
+                        let ty = match f.ty {
+                            sql::FieldType::Text        => "TEXT",
+                            sql::FieldType::Integer     => "INTEGER",
+                            sql::FieldType::Real        => "REAL",
+                            sql::FieldType::Timestamptz => "TIMESTAMPTZ",
+                            sql::FieldType::Geo         => "GEO",
+                            sql::FieldType::Vector      => "VECTOR",
+                            sql::FieldType::Json        => "JSON",
+                        };
+                        make_hit(serde_json::json!({
+                            "field": f.name,
+                            "type": ty,
+                            "primary_key": f.is_primary_key,
+                            "source": "declared",
+                        }))
+                    }).collect();
+                    return Ok(hits);
+                }
+
+                // Inferred from data — scan nodes in collection
+                let col_h = sk_hash(&collection);
+                const SKIP: &[&str] = &["_collection", "_id", "_created_unix", "_updated_unix"];
+                let mut field_types: std::collections::BTreeMap<String, &'static str> =
+                    std::collections::BTreeMap::new();
+
+                for node in self.nodes.values() {
+                    if node.payload.get("_collection").and_then(|v| v.as_str())
+                        .map(|c| sk_hash(c) == col_h).unwrap_or(false)
+                    {
+                        if let serde_json::Value::Object(map) = &node.payload {
+                            for (k, v) in map {
+                                if SKIP.contains(&k.as_str()) { continue; }
+                                let inferred = match v {
+                                    serde_json::Value::String(_) => "TEXT",
+                                    serde_json::Value::Number(n)
+                                        if n.is_i64() || n.is_u64() => "INTEGER",
+                                    serde_json::Value::Number(_) => "REAL",
+                                    serde_json::Value::Bool(_) => "BOOLEAN",
+                                    serde_json::Value::Array(a)
+                                        if a.iter().all(|x| x.is_number()) => "VECTOR",
+                                    serde_json::Value::Array(_)
+                                    | serde_json::Value::Object(_) => "JSON",
+                                    serde_json::Value::Null => continue,
+                                };
+                                field_types.entry(k.clone()).or_insert(inferred);
                             }
                         }
                     }
                 }
-                hits.sort_by(|a, b| {
-                    let ka = a.payload.as_ref().and_then(|p| p["type"].as_str()).unwrap_or("");
-                    let kb = b.payload.as_ref().and_then(|p| p["type"].as_str()).unwrap_or("");
-                    ka.cmp(kb)
-                });
-                hits
+
+                Ok(field_types.into_iter()
+                    .map(|(field, ty)| make_hit(serde_json::json!({
+                        "field": field,
+                        "type": ty,
+                        "source": "inferred",
+                    })))
+                    .collect())
             }
-        };
-        Ok(hits)
+        }
     }
 
     /// Execute a mutation SQL statement.

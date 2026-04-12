@@ -148,7 +148,17 @@ impl PyDB {
             .into_iter().map(to_pyhit).collect())
     }
 
-    /// Execute a SHOW statement (e.g. ``SHOW EDGES``, ``SHOW EDGES FROM col``).
+    /// Execute a ``SHOW`` introspection statement.
+    ///
+    /// Supported forms::
+    ///
+    ///     db.show("SHOW TABLES")                      # [{name, count}, ...]
+    ///     db.show("SHOW EDGES")                       # [{from, type, to, count}, ...]
+    ///     db.show("SHOW EDGES FROM collection")       # [{from, type, count}, ...]
+    ///     db.show("SHOW EDGES FROM col1 TO col2")     # [{from, type, to, count}, ...]
+    ///     db.show("SHOW collection")                  # [{field, type, source, ...}, ...]
+    ///
+    /// Each hit's ``payload`` is a JSON string — use ``json.loads(hit.payload)``.
     fn show(&self, sql: &str) -> PyResult<Vec<PyHit>> {
         Ok(self.db()?.show(sql).map_err(db_err)?
             .into_iter().map(to_pyhit).collect())

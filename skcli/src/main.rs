@@ -128,7 +128,7 @@ fn run_sql(db: &mut CoreDB, sql: &str) -> bool {
             Err(e) => eprintln!("error: {e}"),
             Ok(hits) => print_hits(hits),
         },
-        _ => eprintln!("unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE CREATE"),
+        _ => eprintln!("unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE CREATE DROP"),
     }
     true
 }
@@ -178,12 +178,20 @@ fn run_dot(db: &mut CoreDB, label: &mut String, line: &str) -> bool {
         }
 
         ".tables" => {
-            let names = db.collection_names();
-            if names.is_empty() {
-                println!("(no collections)");
-            } else {
-                for name in names {
-                    println!("{name}");
+            match db.show("SHOW TABLES") {
+                Err(e) => eprintln!("error: {e}"),
+                Ok(hits) => {
+                    if hits.is_empty() {
+                        println!("(no collections)");
+                    } else {
+                        println!("{:<30} {}", "name", "count");
+                        println!("{}", "-".repeat(38));
+                        for h in &hits {
+                            let name  = h.payload.as_ref().and_then(|p| p["name"].as_str()).unwrap_or("");
+                            let count = h.payload.as_ref().and_then(|p| p["count"].as_u64()).unwrap_or(0);
+                            println!("{:<30} {}", name, count);
+                        }
+                    }
                 }
             }
         }
@@ -226,24 +234,36 @@ fn run_dot(db: &mut CoreDB, label: &mut String, line: &str) -> bool {
 
         ".edges" => {
             let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
-            if arg.is_empty() {
-                let schema = db.edge_schema();
-                if schema.is_empty() {
-                    println!("(no edges)");
-                } else {
-                    println!("{:<25} {:<20} {}", "from", "type", "to");
-                    println!("{}", "-".repeat(65));
-                    for (from, kind, to) in &schema {
-                        println!("{:<25} {:<20} {}", from, kind, to);
-                    }
-                }
+            let sql = if arg.is_empty() {
+                "SHOW EDGES".to_string()
             } else {
-                let types = db.edge_types_from_collection(arg);
-                if types.is_empty() {
-                    println!("(no outgoing edges from '{arg}')");
-                } else {
-                    for t in &types {
-                        println!("{t}");
+                format!("SHOW EDGES FROM {arg}")
+            };
+            match db.show(&sql) {
+                Err(e) => eprintln!("error: {e}"),
+                Ok(hits) => {
+                    if hits.is_empty() {
+                        println!("(no edges)");
+                    } else if arg.is_empty() {
+                        println!("{:<25} {:<20} {:<25} {}", "from", "type", "to", "count");
+                        println!("{}", "-".repeat(78));
+                        for h in &hits {
+                            let p     = h.payload.as_ref();
+                            let from  = p.and_then(|p| p["from"].as_str()).unwrap_or("");
+                            let kind  = p.and_then(|p| p["type"].as_str()).unwrap_or("");
+                            let to    = p.and_then(|p| p["to"].as_str()).unwrap_or("");
+                            let count = p.and_then(|p| p["count"].as_u64()).unwrap_or(0);
+                            println!("{:<25} {:<20} {:<25} {}", from, kind, to, count);
+                        }
+                    } else {
+                        println!("{:<20} {}", "type", "count");
+                        println!("{}", "-".repeat(28));
+                        for h in &hits {
+                            let p     = h.payload.as_ref();
+                            let kind  = p.and_then(|p| p["type"].as_str()).unwrap_or("");
+                            let count = p.and_then(|p| p["count"].as_u64()).unwrap_or(0);
+                            println!("{:<20} {}", kind, count);
+                        }
                     }
                 }
             }
@@ -280,6 +300,14 @@ MATCH ('slug')-[:edge]->(a)-[:edge]->(b)
 UPDATE collection SET field = val [WHERE ...];
 DELETE FROM collection [WHERE ...];
 CREATE TABLE collection (_key TEXT PRIMARY KEY, field TYPE, ...);
+
+Introspection
+─────────────
+SHOW TABLES;
+SHOW EDGES;
+SHOW EDGES FROM collection;
+SHOW EDGES FROM col1 TO col2;
+SHOW <collection>;
 
 Graph edges
 ───────────

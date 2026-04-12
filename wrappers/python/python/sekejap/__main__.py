@@ -93,6 +93,14 @@ DELETE FROM collection [WHERE ...];
 CREATE TABLE collection (_key TEXT PRIMARY KEY, field TYPE);
 MATCH (a:col)-[:rel]->(b:col) WHERE a._key = 'x' RETURN b;
 
+Introspection
+─────────────
+SHOW TABLES;
+SHOW EDGES;
+SHOW EDGES FROM collection;
+SHOW EDGES FROM col1 TO col2;
+SHOW <collection>;
+
 Filters: =  !=  >  <  >=  <=  BETWEEN n AND n  IN (...)  LIKE  IS NULL
 Spatial: ST_DWithin  ST_Contains  ST_Within  ST_Intersects
 Vector:  WHERE VECTOR_NEAR(field, [f32, ...], k)
@@ -113,10 +121,15 @@ Vector:  WHERE VECTOR_NEAR(field, [f32, ...], k)
                 print(f"error: {e}", file=sys.stderr)
 
     elif cmd == ".tables":
-        names = db.collection_names()
-        if names:
-            for n in names:
-                print(n)
+        hits = db.show("SHOW TABLES")
+        if hits:
+            print(f"{'name':<30} {'count'}")
+            print("-" * 38)
+            for h in hits:
+                if h.payload:
+                    import json as _json
+                    d = _json.loads(h.payload)
+                    print(f"{d.get('name', ''):<30} {d.get('count', 0)}")
         else:
             print("(no collections)")
 
@@ -125,15 +138,24 @@ Vector:  WHERE VECTOR_NEAR(field, [f32, ...], k)
         names = [target] if target else db.collection_names()
         found = False
         for name in names:
-            ddl = db.schema_ddl(name)
-            if ddl:
-                print(f"{ddl};")
+            hits = db.show(f"SHOW {name}")
+            if hits:
+                import json as _json
+                print(f"-- {name}")
+                print(f"{'field':<25} {'type':<15} {'source'}")
+                print("-" * 50)
+                for h in hits:
+                    if h.payload:
+                        d = _json.loads(h.payload)
+                        pk = " (PK)" if d.get("primary_key") else ""
+                        print(f"{d.get('field',''):<25} {d.get('type',''):<15} {d.get('source','')}{pk}")
+                print()
                 found = True
             elif target:
-                print(f"-- no CREATE TABLE for '{name}'")
+                print(f"-- no data found for '{name}'")
                 found = True
         if not found:
-            print("(no schemas declared — use CREATE TABLE to add one)")
+            print("(no collections found)")
 
     elif cmd == ".compact":
         try:
@@ -148,23 +170,26 @@ Vector:  WHERE VECTOR_NEAR(field, [f32, ...], k)
         print(f"collections : {len(db.collection_names())}")
 
     elif cmd == ".edges":
+        import json as _json
         arg = parts[1].strip() if len(parts) > 1 else ""
-        if arg:
-            types = db.edge_types_from_collection(arg)
-            if types:
-                for t in types:
-                    print(t)
-            else:
-                print(f"(no outgoing edges from '{arg}')")
+        sql = f"SHOW EDGES FROM {arg}" if arg else "SHOW EDGES"
+        hits = db.show(sql)
+        if not hits:
+            print("(no edges)")
+        elif arg:
+            print(f"{'type':<20} {'count'}")
+            print("-" * 28)
+            for h in hits:
+                if h.payload:
+                    d = _json.loads(h.payload)
+                    print(f"{d.get('type',''):<20} {d.get('count', 0)}")
         else:
-            schema = db.edge_schema()
-            if schema:
-                print(f"{'from':<25} {'type':<20} {'to'}")
-                print("-" * 65)
-                for from_col, kind, to_col in schema:
-                    print(f"{from_col:<25} {kind:<20} {to_col}")
-            else:
-                print("(no edges)")
+            print(f"{'from':<25} {'type':<20} {'to':<25} {'count'}")
+            print("-" * 78)
+            for h in hits:
+                if h.payload:
+                    d = _json.loads(h.payload)
+                    print(f"{d.get('from',''):<25} {d.get('type',''):<20} {d.get('to',''):<25} {d.get('count',0)}")
 
     else:
         print(f"unknown command: {cmd}  (try .help)", file=sys.stderr)

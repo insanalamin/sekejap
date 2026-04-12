@@ -24,6 +24,10 @@
 //!     [field TIMESTAMPTZ DEFAULT NOW(), ...]
 //! WITH (hash: ['_key'], range: ['age'], fulltext: ['name'], bm25: ['bio'], spatial: ['location'])
 //!
+//! SHOW TABLES
+//! SHOW EDGES [FROM collection] [TO collection]
+//! SHOW collection
+//!
 //! OP    ::= = | != | <> | > | < | >= | <=
 //!         | BETWEEN n AND n
 //!         | IN (val, ...)
@@ -4944,9 +4948,9 @@ mod debug_tests {
     }
 }
 
-// ── SHOW EDGES ────────────────────────────────────────────────────────────────
+// ── SHOW ──────────────────────────────────────────────────────────────────────
 
-/// Parsed form of a `SHOW EDGES` statement.
+/// Parsed form of a `SHOW EDGES` clause.
 pub struct ShowEdgesStmt {
     /// `SHOW EDGES FROM <collection>` — filter source collection.
     pub from_col: Option<String>,
@@ -4954,43 +4958,68 @@ pub struct ShowEdgesStmt {
     pub to_col: Option<String>,
 }
 
-/// Parse `SHOW EDGES [FROM collection] [TO collection]`.
+/// Parsed form of any `SHOW …` statement.
+pub enum ShowStmt {
+    /// `SHOW TABLES` — all collections with row counts.
+    Tables,
+    /// `SHOW EDGES [FROM col] [TO col]` — graph schema with edge counts.
+    Edges(ShowEdgesStmt),
+    /// `SHOW <collection>` — field structure for one collection.
+    Collection(String),
+}
+
+/// Parse any `SHOW` statement:
 ///
-/// Returns distinct relationship information:
-/// - No args → all `(from_collection, type, to_collection)` triples.
-/// - `FROM col` → distinct edge type names leaving that collection.
-/// - `FROM col TO col` → distinct edge type names between those two collections.
-pub fn parse_show(sql: &str) -> Result<ShowEdgesStmt, SqlError> {
+/// ```text
+/// SHOW TABLES
+/// SHOW EDGES [FROM collection] [TO collection]
+/// SHOW <collection_name>
+/// ```
+pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError> {
     let tokens = tokenize(sql)?;
     let mut p = Parser::new(tokens);
 
     p.expect_kw(Kw::Show, "SHOW")?;
 
-    // EDGES is not a reserved keyword — read as ident
     match p.peek().clone() {
-        Tok::Ident(s) if s.to_ascii_uppercase() == "EDGES" => { p.advance(); }
-        other => return Err(SqlError::UnexpectedToken {
-            expected: "EDGES",
+        // SHOW TABLES (TABLE also accepted)
+        Tok::Ident(s) if s.to_ascii_uppercase() == "TABLES" => {
+            p.advance();
+            Ok(ShowStmt::Tables)
+        }
+        Tok::Kw(Kw::Table) => {
+            p.advance();
+            Ok(ShowStmt::Tables)
+        }
+        // SHOW EDGES [FROM col] [TO col]
+        Tok::Ident(s) if s.to_ascii_uppercase() == "EDGES" => {
+            p.advance();
+
+            let from_col = if matches!(p.peek(), Tok::Kw(Kw::From)) {
+                p.advance();
+                Some(p.expect_ident()?)
+            } else {
+                None
+            };
+
+            let to_col = match p.peek().clone() {
+                Tok::Ident(s) if s.to_ascii_uppercase() == "TO" => {
+                    p.advance();
+                    Some(p.expect_ident()?)
+                }
+                _ => None,
+            };
+
+            Ok(ShowStmt::Edges(ShowEdgesStmt { from_col, to_col }))
+        }
+        // SHOW <collection> — field structure
+        Tok::Ident(_) => {
+            let name = p.expect_ident()?;
+            Ok(ShowStmt::Collection(name))
+        }
+        other => Err(SqlError::UnexpectedToken {
+            expected: "TABLES, EDGES, or a collection name",
             got: format!("{other:?}"),
         }),
     }
-
-    // optional FROM <collection>
-    let from_col = if matches!(p.peek(), Tok::Kw(Kw::From)) {
-        p.advance();
-        Some(p.expect_ident()?)
-    } else {
-        None
-    };
-
-    // optional TO <collection>  (TO is not a keyword — parse as ident check)
-    let to_col = match p.peek().clone() {
-        Tok::Ident(s) if s.to_ascii_uppercase() == "TO" => {
-            p.advance();
-            Some(p.expect_ident()?)
-        }
-        _ => None,
-    };
-
-    Ok(ShowEdgesStmt { from_col, to_col })
 }

@@ -11,12 +11,21 @@ class DB(_NativeDB):
     Example::
 
         from sekejap import DB
+        import json
 
         db = DB()                   # in-memory
         db = DB("./data")           # persistent (WAL-backed)
 
         db.put("items/1", '{\"_collection\":\"items\",\"_key\":\"1\",\"name\":\"foo\"}')
         hits = db.query("SELECT * FROM items")
+
+        # Introspection
+        hits = db.show("SHOW TABLES")                  # [{name, count}, ...]
+        hits = db.show("SHOW EDGES")                   # [{from, type, to, count}, ...]
+        hits = db.show("SHOW EDGES FROM items")        # [{from, type, count}, ...]
+        hits = db.show("SHOW items")                   # [{field, type, source}, ...]
+        for h in hits:
+            print(json.loads(h.payload))
 
         # pandas / dataframe integration
         df = db.df.query("SELECT * FROM items")

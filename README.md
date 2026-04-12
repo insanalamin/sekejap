@@ -226,6 +226,13 @@ WHERE crew IN ('straw-hat', 'red-hair')
 WHERE name ILIKE '%luffy%'
 WHERE description IS NOT NULL
 AND / OR / NOT
+
+-- Introspection
+SHOW TABLES                                  -- all collections with row counts
+SHOW EDGES                                   -- full graph schema with edge counts
+SHOW EDGES FROM characters                   -- edge types leaving a collection + counts
+SHOW EDGES FROM characters TO islands        -- edge types between two collections + counts
+SHOW characters                              -- field structure (declared schema or inferred)
 ```
 
 ### Atomic (Rust fluent builder)
@@ -503,10 +510,22 @@ pip install sekejap
 sekejap                              # in-memory REPL
 sekejap ./data                       # persistent REPL
 sekejap ./data "SELECT * FROM r;"    # one-shot
+echo "SELECT...;" | sekejap ./data   # pipe script
 
 sekejap> CREATE TABLE islands (_key TEXT, name TEXT, geometry GEO);
+sekejap> INSERT INTO islands (_key, name, sea) VALUES ('wano', 'Wano Kuni', 'grand-line');
 sekejap> SELECT * FROM islands WHERE ST_DWithin(geometry, POINT(0.0 0.0), 500.0);
+
+-- Introspection (SQL)
+sekejap> SHOW TABLES;
+sekejap> SHOW EDGES;
+sekejap> SHOW EDGES FROM characters;
+sekejap> SHOW characters;
+
+-- Introspection (dot commands — same results, tabular output)
 sekejap> .tables
+sekejap> .edges
+sekejap> .edges characters
 sekejap> .schema islands
 sekejap> .stats
 sekejap> .help
