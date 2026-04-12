@@ -62,7 +62,7 @@ fn db_err(e: impl std::fmt::Display) -> PyErr {
 ///     hits = db.query("SELECT * FROM students")
 ///     for h in hits:
 ///         print(h.slug, h.payload)   # payload is a JSON string
-#[pyclass(name = "DB")]
+#[pyclass(name = "DB", subclass)]
 pub struct PyDB {
     inner: Option<CoreDB>,
 }

@@ -10,7 +10,7 @@ homepage = "https://db.sekejap.life"
 description = "A graph-first, embedded multi-model database engine"
 
 [workspace.dependencies]
-sekejap = { path = ".", version = "0.6.0" }
+sekejap = { path = ".", version = "0.6.1" }
 
 [package]
 name = "sekejap"
