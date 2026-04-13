@@ -51,6 +51,19 @@ use storage::wal::{WalEntry, WalReader, WalWriter};
 use text_index::gin::GINIndex;
 use text_index::gist::GiSTIndex;
 
+// ── Storage format version constants ─────────────────────────────────────────
+
+/// Bump when the snapshot schema changes in a backwards-incompatible way.
+/// Old binaries that encounter a higher version return an error on open().
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// Bump each constant when the corresponding index algorithm changes in a way
+/// that makes indexes built by the previous version produce wrong results.
+const GIN_INDEX_VERSION:     u32 = 2; // slot-map fix 2026-04-13
+const BM25_INDEX_VERSION:    u32 = 1;
+const BTREE_INDEX_VERSION:   u32 = 1;
+const HNSW_INDEX_VERSION:    u32 = 1;
+
 // ── Field index key ───────────────────────────────────────────────────────────
 
 /// Totally-ordered wrapper for f64 (NaN sorts last, uses `total_cmp`).
@@ -172,6 +185,9 @@ pub struct CoreDB {
     /// Built via `CREATE INDEX ON collection(field) USING btree`.
     /// Maintained incrementally on every put()/remove().
     field_indexes: HashMap<(u64, String), BTreeMap<FieldKey, Vec<u64>>>,
+    /// Build params for each HNSW index: field → (m, ef_construction).
+    /// Populated by build_hnsw_index(); used to auto-rebuild on version mismatch.
+    hnsw_params: HashMap<String, (usize, usize)>,
 }
 
 impl Default for CoreDB {
@@ -202,6 +218,7 @@ impl CoreDB {
             vectors: HashMap::new(),
             hnsw_indexes: HashMap::new(),
             field_indexes: HashMap::new(),
+            hnsw_params: HashMap::new(),
         }
     }
 
@@ -231,6 +248,15 @@ impl CoreDB {
             let data = std::fs::read(&snap_path)?;
             let snap: Snapshot = serde_json::from_slice(&data)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if snap.version > SNAPSHOT_FORMAT_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "snapshot version {} requires a newer sekejap (max supported: {})",
+                        snap.version, SNAPSHOT_FORMAT_VERSION
+                    ),
+                ));
+            }
             db.load_snapshot(snap);
         }
 
@@ -255,6 +281,11 @@ impl CoreDB {
 
         // 4. Build spatial index from loaded data
         db.rebuild_spatial_grid();
+
+        // 5. Rebuild GIN and HNSW from all loaded data so that indexes declared
+        //    before data was written (a common pattern) are always up-to-date.
+        db.rebuild_declared_gin_indexes();
+        db.rebuild_declared_hnsw_indexes();
 
         Ok(db)
     }
@@ -415,6 +446,421 @@ impl CoreDB {
         }
     }
 
+    /// Drop an entire collection: removes all its nodes (cascading all edges),
+    /// clears the declared schema, and removes the collection-level btree index
+    /// entries. Returns the number of nodes deleted.
+    fn drop_table_raw(&mut self, collection: &str) -> usize {
+        let col_hash = sk_hash(collection);
+
+        // Build a set of node hashes belonging to this collection
+        let member_hashes: std::collections::HashSet<u64> = self.collections
+            .get(&col_hash)
+            .into_iter()
+            .flat_map(|v| v.iter().copied())
+            .collect();
+
+        // Collect slugs (cannot hold borrow while mutating)
+        let slugs: Vec<String> = self.slug_map
+            .iter()
+            .filter(|(_, h)| member_hashes.contains(h))
+            .map(|(s, _)| s.clone())
+            .collect();
+
+        let count = slugs.len();
+
+        for slug in slugs {
+            self.remove_raw(&slug); // cascades edges, cleans per-node indexes
+        }
+
+        // Remove the now-empty collection btree index entries
+        self.field_indexes.retain(|(c, _), _| *c != col_hash);
+
+        // Remove declared schema (if any)
+        self.schemas.remove(collection);
+
+        count
+    }
+
+    /// Apply an ALTER TABLE operation in-memory (no WAL write).
+    /// Used by both execute() (which writes WAL after) and replay().
+    fn alter_table_raw(&mut self, collection: &str, op: sql::AlterTableOp) -> Result<usize, sql::SqlError> {
+        use sql::AlterTableOp;
+        match op {
+            // ── ADD COLUMN ────────────────────────────────────────────────────
+            AlterTableOp::AddColumn { def } => {
+                let schema = self.schemas.get_mut(collection).ok_or_else(|| {
+                    sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                })?;
+                if schema.fields.iter().any(|f| f.name == def.name) {
+                    return Err(sql::SqlError::InvalidValue(format!(
+                        "column '{}' already exists in '{collection}'",
+                        def.name
+                    )));
+                }
+                schema.fields.push(def);
+                Ok(0) // schema-only; no rows touched
+            }
+
+            // ── DROP COLUMN ───────────────────────────────────────────────────
+            AlterTableOp::DropColumn { name, if_exists } => {
+                let (had_fulltext, had_bm25, had_hnsw) = {
+                    let schema = self.schemas.get_mut(collection).ok_or_else(|| {
+                        sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                    })?;
+                    let idx = schema.fields.iter().position(|f| f.name == name);
+                    match idx {
+                        None if if_exists => return Ok(0),
+                        None => return Err(sql::SqlError::InvalidValue(format!(
+                            "column '{name}' does not exist in '{collection}'"
+                        ))),
+                        Some(i) => { schema.fields.remove(i); }
+                    }
+                    // Remove field from every index hint list so WAL replay
+                    // doesn't try to rebuild an index for a dropped column.
+                    let ix = &mut schema.indexes;
+                    ix.range.retain(|f| f != &name);
+                    ix.hash.retain(|f| f != &name);
+                    let had_fulltext = ix.fulltext.iter().any(|f| f == &name);
+                    ix.fulltext.retain(|f| f != &name);
+                    let had_bm25 = ix.bm25.iter().any(|f| f == &name);
+                    ix.bm25.retain(|f| f != &name);
+                    ix.spatial.retain(|f| f != &name);
+                    let had_hnsw = ix.vector.iter().any(|f| f == &name);
+                    ix.vector.retain(|f| f != &name);
+                    (had_fulltext, had_bm25, had_hnsw)
+                }; // release schema borrow — returns tuple of global-index flags
+
+                // Drop the btree index data for this field (no longer valid).
+                let col_hash = sk_hash(collection);
+                self.field_indexes.remove(&(col_hash, name.clone()));
+
+                // Remove field from all nodes in the collection.
+                // This must happen BEFORE rebuilding global indexes so the rebuild
+                // naturally sees the field absent from this collection's nodes.
+                let node_hashes: Vec<u64> =
+                    self.collections.get(&col_hash).cloned().unwrap_or_default();
+                let mut count = 0usize;
+                for h in node_hashes {
+                    if let Some(node) = self.nodes.get_mut(&h) {
+                        if node.payload.as_object_mut()
+                            .map(|o| o.remove(&name).is_some())
+                            .unwrap_or(false)
+                        {
+                            count += 1;
+                        }
+                    }
+                }
+
+                // Rebuild global indexes from remaining data (nodes for the dropped
+                // collection no longer carry the field, so the rebuild is naturally clean).
+                // Only rebuild if the in-memory structure actually exists.
+                if had_fulltext && self.gin_indexes.contains_key(&name)  { self.rebuild_gin_for_remaining(&name); }
+                if had_bm25    && self.bm25_indexes.contains_key(&name)  { self.rebuild_bm25_for_remaining(&name); }
+                if had_hnsw    && self.hnsw_indexes.contains_key(&name)  { self.rebuild_hnsw_for_remaining(&name); }
+
+                Ok(count)
+            }
+
+            // ── RENAME COLUMN ─────────────────────────────────────────────────
+            AlterTableOp::RenameColumn { old_name, new_name } => {
+                {
+                    let schema = self.schemas.get_mut(collection).ok_or_else(|| {
+                        sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                    })?;
+                    let idx = schema.fields.iter().position(|f| f.name == old_name)
+                        .ok_or_else(|| sql::SqlError::InvalidValue(format!(
+                            "column '{old_name}' does not exist in '{collection}'"
+                        )))?;
+                    if schema.fields.iter().any(|f| f.name == new_name) {
+                        return Err(sql::SqlError::InvalidValue(format!(
+                            "column '{new_name}' already exists in '{collection}'"
+                        )));
+                    }
+                    schema.fields[idx].name = new_name.clone();
+                } // release schema borrow
+
+                // Rename the field key in every node of the collection
+                let col_hash = sk_hash(collection);
+                let node_hashes: Vec<u64> =
+                    self.collections.get(&col_hash).cloned().unwrap_or_default();
+                let mut count = 0usize;
+                for h in node_hashes {
+                    if let Some(node) = self.nodes.get_mut(&h) {
+                        if let Some(obj) = node.payload.as_object_mut() {
+                            if let Some(val) = obj.remove(&old_name) {
+                                obj.insert(new_name.clone(), val);
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Move the btree index data from old field name to new field name
+                if let Some(btree) = self.field_indexes.remove(&(col_hash, old_name.clone())) {
+                    self.field_indexes.insert((col_hash, new_name.clone()), btree);
+                }
+
+                // Update field name inside every index hint list so WAL replay
+                // rebuilds the index under the new name.
+                if let Some(schema) = self.schemas.get_mut(collection) {
+                    for list in [
+                        &mut schema.indexes.range,
+                        &mut schema.indexes.hash,
+                        &mut schema.indexes.fulltext,
+                        &mut schema.indexes.bm25,
+                        &mut schema.indexes.spatial,
+                        &mut schema.indexes.vector,
+                    ] {
+                        for entry in list.iter_mut() {
+                            if *entry == old_name {
+                                *entry = new_name.clone();
+                            }
+                        }
+                    }
+                }
+
+                Ok(count)
+            }
+
+            // ── RENAME TABLE ──────────────────────────────────────────────────
+            // Note: existing slugs (e.g. "old_col/key") remain unchanged.
+            // Only the logical _collection metadata and index buckets are moved.
+            AlterTableOp::RenameTable { new_name } => {
+                if self.schemas.contains_key(&new_name) {
+                    return Err(sql::SqlError::InvalidValue(format!(
+                        "table '{new_name}' already exists"
+                    )));
+                }
+                let mut schema = self.schemas.remove(collection).ok_or_else(|| {
+                    sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                })?;
+                schema.collection = new_name.clone();
+                self.schemas.insert(new_name.clone(), schema);
+
+                // Move collection bucket to new hash
+                let old_hash = sk_hash(collection);
+                let new_hash = sk_hash(&new_name);
+                let node_hashes: Vec<u64> =
+                    self.collections.remove(&old_hash).unwrap_or_default();
+                let count = node_hashes.len();
+                self.collections.insert(new_hash, node_hashes.clone());
+
+                // Update _collection field in every node
+                for h in &node_hashes {
+                    if let Some(node) = self.nodes.get_mut(h) {
+                        if let Some(obj) = node.payload.as_object_mut() {
+                            obj.insert("_collection".to_string(), serde_json::json!(new_name));
+                        }
+                    }
+                }
+
+                // Move field_indexes from old collection hash to new
+                let old_keys: Vec<(u64, String)> = self.field_indexes.keys()
+                    .filter(|(c, _)| *c == old_hash)
+                    .cloned()
+                    .collect();
+                for (_, field) in old_keys {
+                    if let Some(btree) = self.field_indexes.remove(&(old_hash, field.clone())) {
+                        self.field_indexes.insert((new_hash, field), btree);
+                    }
+                }
+
+                Ok(count)
+            }
+
+            // ── ALTER COLUMN TYPE ─────────────────────────────────────────────
+            // Schema annotation updated; existing data is not coerced.
+            // If a btree index exists for this field it is rebuilt from scratch
+            // so FieldKey variants match the new type (mirrors PostgreSQL REINDEX).
+            AlterTableOp::AlterColumnType { name, ty } => {
+                let has_btree = {
+                    let schema = self.schemas.get_mut(collection).ok_or_else(|| {
+                        sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                    })?;
+                    let field = schema.fields.iter_mut().find(|f| f.name == name)
+                        .ok_or_else(|| sql::SqlError::InvalidValue(format!(
+                            "column '{name}' does not exist in '{collection}'"
+                        )))?;
+                    field.ty = ty;
+                    schema.indexes.range.contains(&name)
+                };
+
+                if has_btree {
+                    // Drop stale btree entries, then rebuild from current node data.
+                    let col_hash = sk_hash(collection);
+                    self.field_indexes.remove(&(col_hash, name.clone()));
+                    self.build_field_index(collection, &name);
+                }
+
+                Ok(0)
+            }
+        }
+    }
+
+    /// Remove one index from a collection, then rebuild any global structure
+    /// (GIN / BM25 / HNSW) from only the collections that still hold that index.
+    ///
+    /// Returns `true` when the index existed and was removed, `false` otherwise.
+    fn drop_index_raw(&mut self, collection: &str, method: &sql::IndexMethod, field: &str) -> bool {
+        use sql::IndexMethod;
+
+        // Remove the hint from this collection's schema.
+        let removed = if let Some(schema) = self.schemas.get_mut(collection) {
+            let list = match method {
+                IndexMethod::Btree                  => &mut schema.indexes.range,
+                IndexMethod::Hash                   => &mut schema.indexes.hash,
+                IndexMethod::Gin | IndexMethod::Gist => &mut schema.indexes.fulltext,
+                IndexMethod::Bm25                   => &mut schema.indexes.bm25,
+                IndexMethod::Spatial                => &mut schema.indexes.spatial,
+                IndexMethod::Hnsw                   => &mut schema.indexes.vector,
+            };
+            let before = list.len();
+            list.retain(|f| f != field);
+            list.len() < before
+        } else {
+            false
+        };
+
+        if !removed {
+            return false;
+        }
+
+        let col_hash = sk_hash(collection);
+
+        match method {
+            // ── Per-collection indexes: drop directly ─────────────────────────
+            IndexMethod::Btree => {
+                self.field_indexes.remove(&(col_hash, field.to_string()));
+            }
+            IndexMethod::Hash => {
+                // Hint-only — nothing to drop.
+            }
+
+            // ── Global indexes: rebuild from remaining indexed collections ─────
+            // After removing this collection's hint, re-scan only the collections
+            // whose schema still lists this field in the relevant hint.
+            // Only rebuild if the in-memory index actually exists — if CREATE INDEX
+            // was called before any data was inserted, there is no structure to
+            // clean up, and creating one here would produce stale truncated IDs.
+            IndexMethod::Gin | IndexMethod::Gist => {
+                if self.gin_indexes.contains_key(field) {
+                    self.rebuild_gin_for_remaining(field);
+                }
+            }
+            IndexMethod::Bm25 => {
+                if self.bm25_indexes.contains_key(field) {
+                    self.rebuild_bm25_for_remaining(field);
+                }
+            }
+            IndexMethod::Hnsw => {
+                if self.hnsw_indexes.contains_key(field) {
+                    self.rebuild_hnsw_for_remaining(field);
+                }
+            }
+            IndexMethod::Spatial => {
+                // Spatial grid covers all GEO nodes regardless of collection;
+                // removing the hint is sufficient — no rebuild needed.
+            }
+        }
+
+        true
+    }
+
+    /// Rebuild `gin_indexes[field]` from only the collections whose schema
+    /// still declares a `fulltext` index on this field.
+    fn rebuild_gin_for_remaining(&mut self, field: &str) {
+        let col_hashes: Vec<u64> = self.schemas.values()
+            .filter(|s| s.indexes.fulltext.contains(&field.to_string()))
+            .map(|s| sk_hash(&s.collection))
+            .collect();
+
+        if col_hashes.is_empty() {
+            self.gin_indexes.remove(field);
+            return;
+        }
+
+        let values: Vec<(u64, String)> = col_hashes.iter()
+            .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
+            .filter_map(|hash| {
+                let node = self.nodes.get(&hash)?;
+                node.payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
+            })
+            .collect();
+
+        if values.is_empty() {
+            self.gin_indexes.remove(field);
+        } else {
+            let refs: Vec<(u64, &str)> = values.iter().map(|(h, s)| (*h, s.as_str())).collect();
+            let index = text_index::gin::GINIndex::build(refs.into_iter(), field);
+            self.gin_indexes.insert(field.to_string(), index);
+        }
+    }
+
+    /// Rebuild `bm25_indexes[field]` from only the collections whose schema
+    /// still declares a `bm25` index on this field.
+    fn rebuild_bm25_for_remaining(&mut self, field: &str) {
+        let col_hashes: Vec<u64> = self.schemas.values()
+            .filter(|s| s.indexes.bm25.contains(&field.to_string()))
+            .map(|s| sk_hash(&s.collection))
+            .collect();
+
+        if col_hashes.is_empty() {
+            self.bm25_indexes.remove(field);
+            return;
+        }
+
+        let values: Vec<(u64, String)> = col_hashes.iter()
+            .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
+            .filter_map(|hash| {
+                let node = self.nodes.get(&hash)?;
+                node.payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
+            })
+            .collect();
+
+        if values.is_empty() {
+            self.bm25_indexes.remove(field);
+        } else {
+            let refs: Vec<(u64, &str)> = values.iter().map(|(h, s)| (*h, s.as_str())).collect();
+            let index = bm25::Bm25Index::build(field, refs.into_iter());
+            self.bm25_indexes.insert(field.to_string(), index);
+        }
+    }
+
+    /// Rebuild `hnsw_indexes[field]` from only the collections whose schema
+    /// still declares a `vector` index on this field.
+    fn rebuild_hnsw_for_remaining(&mut self, field: &str) {
+        let col_hashes: Vec<u64> = self.schemas.values()
+            .filter(|s| s.indexes.vector.contains(&field.to_string()))
+            .map(|s| sk_hash(&s.collection))
+            .collect();
+
+        if col_hashes.is_empty() {
+            self.hnsw_indexes.remove(field);
+            return;
+        }
+
+        let member_hashes: std::collections::HashSet<u64> = col_hashes.iter()
+            .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
+            .collect();
+
+        if let Some(field_vecs) = self.vectors.get(field) {
+            let filtered: HashMap<u64, Vec<f32>> = field_vecs.iter()
+                .filter(|(h, _)| member_hashes.contains(*h))
+                .map(|(h, v)| (*h, v.clone()))
+                .collect();
+
+            if filtered.is_empty() {
+                self.hnsw_indexes.remove(field);
+            } else {
+                use vector::CosineDistance;
+                let graph = vector::HnswGraph::build::<CosineDistance>(&filtered, 16, 200);
+                self.hnsw_indexes.insert(field.to_string(), graph);
+            }
+        } else {
+            self.hnsw_indexes.remove(field);
+        }
+    }
+
     fn link_raw(&mut self, from: &str, to: &str, edge_type: &str, strength: f32) {
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
@@ -537,8 +983,32 @@ impl CoreDB {
                     "hnsw"    => IndexMethod::Hnsw,
                     _ => return,
                 };
-                self.apply_index(&collection, &m, &fields);
+                // WAL replay is fault-tolerant — ignore build failures.
+                let _ = self.apply_index(&collection, &m, &fields);
             }
+            WalEntry::DropTable { collection } => {
+                self.drop_table_raw(&collection);
+            }
+            WalEntry::DropIndex { collection, method, field } => {
+                use sql::IndexMethod;
+                let m = match method.as_str() {
+                    "btree"   => IndexMethod::Btree,
+                    "hash"    => IndexMethod::Hash,
+                    "gin"     => IndexMethod::Gin,
+                    "gist"    => IndexMethod::Gist,
+                    "bm25"    => IndexMethod::Bm25,
+                    "spatial" => IndexMethod::Spatial,
+                    "hnsw"    => IndexMethod::Hnsw,
+                    _ => return,
+                };
+                self.drop_index_raw(&collection, &m, &field);
+            }
+            WalEntry::AlterTable { collection, op_json } => {
+                if let Ok(op) = serde_json::from_str::<sql::AlterTableOp>(&op_json) {
+                    let _ = self.alter_table_raw(&collection, op);
+                }
+            }
+            WalEntry::Unknown => { /* forward-compat: skip entries from newer binaries */ }
         }
     }
 
@@ -549,7 +1019,43 @@ impl CoreDB {
     ///
     /// Returns the slug hash on success.
     pub fn put(&mut self, slug: &str, payload_json: &str) -> Result<u64, serde_json::Error> {
+        // Check before put_raw so we know whether this is a new node or an update.
+        let node_hash = sk_hash(slug);
+        let is_update = self.nodes.contains_key(&node_hash);
+
         let hash = self.put_raw(slug, payload_json)?;
+
+        // Auto-maintain GIN indexes for any field declared fulltext in this collection.
+        if let Ok(payload) = serde_json::from_str::<Value>(payload_json) {
+            if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
+                let coll_hash = sk_hash(coll);
+                // Collect declared GIN fields and their text values (releases borrow).
+                let gin_updates: Vec<(String, Option<String>)> = self.schemas.values()
+                    .filter(|s| sk_hash(&s.collection) == coll_hash)
+                    .flat_map(|s| s.indexes.fulltext.iter().map(|f| {
+                        let text = payload.get(f.as_str())
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        (f.clone(), text)
+                    }))
+                    .collect();
+                for (gin_field, text_opt) in gin_updates {
+                    if is_update {
+                        // Update: full rebuild to remove old trigrams for this doc.
+                        self.build_gin_index(&gin_field);
+                    } else if let Some(text) = text_opt {
+                        // New node: incremental O(trigrams) insert.
+                        if let Some(gin_idx) = self.gin_indexes.get_mut(gin_field.as_str()) {
+                            gin_idx.insert_doc(hash, &text);
+                        } else {
+                            // GIN not yet built (e.g. first doc after CREATE INDEX on empty).
+                            self.build_gin_index(&gin_field);
+                        }
+                    }
+                }
+            }
+        }
+
         self.wal_write(WalEntry::Put {
             slug: slug.to_string(),
             payload: payload_json.to_string(),
@@ -723,11 +1229,20 @@ impl CoreDB {
         let snap_hnsw: Vec<SnapHnsw> = self
             .hnsw_indexes
             .iter()
-            .map(|(field, graph)| SnapHnsw { field: field.clone(), graph: graph.clone() })
+            .map(|(field, graph)| {
+                let (m, ef) = self.hnsw_params.get(field).copied().unwrap_or((16, 200));
+                SnapHnsw {
+                    field: field.clone(),
+                    version: HNSW_INDEX_VERSION,
+                    m,
+                    ef_construction: ef,
+                    graph: graph.clone(),
+                }
+            })
             .collect();
 
         Snapshot {
-            version: 1,
+            version: SNAPSHOT_FORMAT_VERSION,
             nodes,
             edges,
             schemas: Some(self.schemas.values().cloned().collect()),
@@ -761,22 +1276,58 @@ impl CoreDB {
                 self.vectors.entry(sv.field).or_default().insert(hash, sv.data);
             }
         }
-        // Restore HNSW graphs — avoids expensive rebuild on every startup.
+        // Restore HNSW graphs — rebuild if the stored version doesn't match.
         if let Some(hnsw_list) = snap.hnsw_indexes {
             for sh in hnsw_list {
-                self.hnsw_indexes.insert(sh.field, sh.graph);
+                if sh.version == HNSW_INDEX_VERSION {
+                    self.hnsw_params.insert(sh.field.clone(), (sh.m, sh.ef_construction));
+                    self.hnsw_indexes.insert(sh.field, sh.graph);
+                } else {
+                    // Version mismatch — rebuild from stored vectors.
+                    let _ = self.build_hnsw_index(&sh.field, sh.m, sh.ef_construction);
+                }
             }
         }
-        // Rebuild btree field indexes from persisted schema hints.
-        // Nodes are already loaded at this point so build_field_index can scan them.
-        let to_rebuild: Vec<(String, String)> = self
+        // Rebuild btree field indexes — only when stored version mismatches.
+        let btree_rebuild: Vec<(String, String)> = self
             .schemas
             .values()
-            .flat_map(|s| s.indexes.range.iter().map(|f| (s.collection.clone(), f.clone())))
+            .flat_map(|s| s.indexes.range.iter().map(|f| {
+                let v = s.indexes.build_versions.get(&format!("btree:{f}")).copied().unwrap_or(0);
+                (s.collection.clone(), f.clone(), v)
+            }))
+            .filter(|(.., v)| *v != BTREE_INDEX_VERSION)
+            .map(|(c, f, _)| (c, f))
             .collect();
-        for (coll, field) in to_rebuild {
+        for (coll, field) in btree_rebuild {
             self.build_field_index(&coll, &field);
         }
+
+        // Rebuild BM25 indexes — only when stored version mismatches.
+        let bm25_rebuild: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            self.schemas.values()
+                .flat_map(|s| s.indexes.bm25.iter().filter(|f| {
+                    s.indexes.build_versions.get(&format!("bm25:{f}")).copied().unwrap_or(0)
+                        != BM25_INDEX_VERSION
+                }).cloned())
+                .filter(|f| seen.insert(f.clone()))
+                .collect()
+        };
+        for field in bm25_rebuild { self.build_bm25_index(&field); }
+
+        // Rebuild GIN indexes — only when stored version mismatches.
+        let gin_rebuild: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            self.schemas.values()
+                .flat_map(|s| s.indexes.fulltext.iter().filter(|f| {
+                    s.indexes.build_versions.get(&format!("gin:{f}")).copied().unwrap_or(0)
+                        != GIN_INDEX_VERSION
+                }).cloned())
+                .filter(|f| seen.insert(f.clone()))
+                .collect()
+        };
+        for field in gin_rebuild { self.build_gin_index(&field); }
     }
 
     // ── Reads ─────────────────────────────────────────────────────────────────
@@ -1077,7 +1628,9 @@ impl CoreDB {
                 let hits = query::execute_match_agg(self, stmt);
                 Ok(Set::from_hits(self, hits))
             }
-            sql::MatchOrAgg::Steps(steps) => Ok(Set::from_steps(self, steps)),
+            sql::MatchOrAgg::Steps(steps) => {
+                Ok(Set::from_steps(self, steps))
+            }
         }
     }
 
@@ -1106,7 +1659,7 @@ impl CoreDB {
     /// Syntax:
     /// ```text
     /// SHOW TABLES
-    ///     → [{name, count}, ...]  — all collections with row counts
+    ///     → [{name, count}, ...]  — all collections with row counts (includes declared-empty tables)
     ///
     /// SHOW EDGES
     ///     → [{from, type, to, count}, ...]  — full graph schema with edge counts
@@ -1116,6 +1669,9 @@ impl CoreDB {
     ///
     /// SHOW EDGES FROM col1 TO col2
     ///     → [{from, type, to, count}, ...]  — edge types between two collections + counts
+    ///
+    /// SHOW CREATE TABLE collection
+    ///     → [{ddl: "CREATE TABLE ..."}]  — DDL that recreates the declared schema
     ///
     /// SHOW collection
     ///     → [{field, type, primary_key?, source}, ...]
@@ -1134,8 +1690,12 @@ impl CoreDB {
         match stmt {
             // ── SHOW TABLES ───────────────────────────────────────────────────
             sql::ShowStmt::Tables => {
+                // Seed with declared schemas so empty tables appear with count 0
                 let mut counts: std::collections::BTreeMap<String, usize> =
                     std::collections::BTreeMap::new();
+                for name in self.schemas.keys() {
+                    counts.entry(name.clone()).or_insert(0);
+                }
                 for node in self.nodes.values() {
                     if let Some(col) = node.payload.get("_collection").and_then(|v| v.as_str()) {
                         *counts.entry(col.to_string()).or_insert(0) += 1;
@@ -1256,6 +1816,14 @@ impl CoreDB {
                         Ok(hits)
                     }
                 }
+            }
+
+            // ── SHOW CREATE TABLE <collection> ───────────────────────────────
+            sql::ShowStmt::CreateTable(collection) => {
+                let ddl = self.schema_ddl(&collection).unwrap_or_else(|| {
+                    format!("-- no CREATE TABLE declared for '{collection}'")
+                });
+                Ok(vec![make_hit(serde_json::json!({ "ddl": ddl }))])
             }
 
             // ── SHOW <collection> ─────────────────────────────────────────────
@@ -1457,13 +2025,62 @@ impl CoreDB {
                 Ok(1)
             }
             sql::CompiledMutation::CreateIndex { name: _, collection, method, fields } => {
-                self.apply_index(&collection, &method, &fields);
+                self.apply_index(&collection, &method, &fields)?;
                 self.wal_write(WalEntry::CreateIndex {
                     collection,
                     method: method.to_string(),
                     fields,
                 });
                 Ok(1)
+            }
+            sql::CompiledMutation::Reindex { collection, method, fields } => {
+                // Rebuild — no WAL entry; schema already records the declaration.
+                self.apply_index(&collection, &method, &fields)?;
+                Ok(1)
+            }
+            sql::CompiledMutation::DropTable { collection, if_exists } => {
+                let has_schema = self.schemas.contains_key(&collection);
+                let has_nodes  = self.collections
+                    .get(&sk_hash(&collection))
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+
+                if !has_schema && !has_nodes {
+                    if if_exists {
+                        return Ok(0);
+                    } else {
+                        return Err(sql::SqlError::InvalidValue(
+                            format!("table '{collection}' does not exist")
+                        ));
+                    }
+                }
+
+                let count = self.drop_table_raw(&collection);
+                self.wal_write(WalEntry::DropTable { collection });
+                Ok(count)
+            }
+            sql::CompiledMutation::DropIndex { collection, method, field, if_exists } => {
+                let removed = self.drop_index_raw(&collection, &method, &field);
+                if !removed && !if_exists {
+                    return Err(sql::SqlError::InvalidValue(format!(
+                        "index on '{field}' does not exist for table '{collection}'"
+                    )));
+                }
+                if removed {
+                    self.wal_write(WalEntry::DropIndex {
+                        collection,
+                        method: method.to_string(),
+                        field,
+                    });
+                }
+                Ok(if removed { 1 } else { 0 })
+            }
+            sql::CompiledMutation::AlterTable { collection, op } => {
+                let op_json = serde_json::to_string(&op)
+                    .map_err(|e| sql::SqlError::InvalidValue(e.to_string()))?;
+                let count = self.alter_table_raw(&collection, op)?;
+                self.wal_write(WalEntry::AlterTable { collection, op_json });
+                Ok(count)
             }
         }
     }
@@ -1683,6 +2300,7 @@ impl CoreDB {
             let index = GINIndex::build(values.into_iter(), field);
             self.gin_indexes.insert(field.to_string(), index);
         }
+        self.record_index_version("gin", field, GIN_INDEX_VERSION);
     }
 
     /// Execute ILIKE using GIN index (exact — no verification needed).
@@ -1742,6 +2360,7 @@ impl CoreDB {
             let index = bm25::Bm25Index::build(field, values.into_iter());
             self.bm25_indexes.insert(field.to_string(), index);
         }
+        self.record_index_version("bm25", field, BM25_INDEX_VERSION);
     }
 
     /// Search using BM25 index and return ranked results.
@@ -1791,6 +2410,14 @@ impl CoreDB {
             .entry(field.to_string())
             .or_default()
             .insert(hash, data.to_vec());
+        // Auto-rebuild HNSW if this field has a declared index.
+        // Uses stored params when available, falls back to sensible defaults.
+        let hnsw_declared = self.schemas.values()
+            .any(|s| s.indexes.vector.contains(&field.to_string()));
+        if hnsw_declared {
+            let (m, ef) = self.hnsw_params.get(field).copied().unwrap_or((16, 200));
+            let _ = self.build_hnsw_index(field, m, ef);
+        }
         self.wal_write(WalEntry::PutVector {
             slug: slug.to_string(),
             field: field.to_string(),
@@ -1840,6 +2467,25 @@ impl CoreDB {
             }
         }
         self.field_indexes.insert((coll_hash, field.to_string()), btree);
+        self.record_index_version("btree", field, BTREE_INDEX_VERSION);
+    }
+
+    /// Record the build version for an index in every schema that declares it.
+    ///
+    /// Key format: `"method:field"` (e.g. `"gin:name"`, `"btree:price"`).
+    fn record_index_version(&mut self, method: &str, field: &str, version: u32) {
+        for schema in self.schemas.values_mut() {
+            let declares = match method {
+                "gin"   => schema.indexes.fulltext.contains(&field.to_string()),
+                "bm25"  => schema.indexes.bm25.contains(&field.to_string()),
+                "btree" => schema.indexes.range.contains(&field.to_string()),
+                _       => false,
+            };
+            if declares {
+                schema.indexes.build_versions
+                    .insert(format!("{}:{}", method, field), version);
+            }
+        }
     }
 
     /// Try to seed the candidate list for a `Collection` step from a btree index.
@@ -1992,6 +2638,7 @@ impl CoreDB {
 
         // Atomic replace: old index (if any) is dropped here.
         self.hnsw_indexes.insert(field.to_string(), graph);
+        self.hnsw_params.insert(field.to_string(), (m, ef_construction));
         Ok(())
     }
 
@@ -1999,7 +2646,12 @@ impl CoreDB {
 
     /// Build the in-memory index for a `CREATE INDEX` statement and update
     /// the collection schema's index hints.
-    fn apply_index(&mut self, collection: &str, method: &sql::IndexMethod, fields: &[String]) {
+    fn apply_index(
+        &mut self,
+        collection: &str,
+        method: &sql::IndexMethod,
+        fields: &[String],
+    ) -> Result<(), sql::SqlError> {
         use sql::IndexMethod;
 
         // Update schema index hints so introspection always reflects reality.
@@ -2044,8 +2696,9 @@ impl CoreDB {
             }
             IndexMethod::Hnsw => {
                 for field in fields {
-                    // Silently skip if no vectors exist yet — the user can call
-                    // build_hnsw_index() explicitly after loading vectors.
+                    // Silently skip when no vectors exist yet — the index
+                    // will be (re)built automatically when vectors are inserted
+                    // via put_vector(), or explicitly via REINDEX.
                     let _ = self.build_hnsw_index(field, 16, 200);
                 }
             }
@@ -2056,6 +2709,46 @@ impl CoreDB {
             }
             // Hash — hint stored; no in-memory structure needed
             IndexMethod::Hash => {}
+        }
+
+        Ok(())
+    }
+
+    /// Rebuild all declared GIN indexes from all currently loaded nodes.
+    ///
+    /// Called after WAL replay in `open()` to ensure GIN is fresh regardless
+    /// of the order in which WAL entries were written (e.g. CreateIndex before Put).
+    fn rebuild_declared_gin_indexes(&mut self) {
+        let fields: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            self.schemas.values()
+                .flat_map(|s| s.indexes.fulltext.iter().cloned())
+                .filter(|f| seen.insert(f.clone()))
+                .collect()
+        };
+        for field in fields {
+            self.build_gin_index(&field);
+        }
+    }
+
+    /// Rebuild all declared HNSW indexes from all currently loaded vectors.
+    ///
+    /// Called after WAL replay in `open()` so that vectors written after the
+    /// original `CREATE INDEX` are incorporated.
+    fn rebuild_declared_hnsw_indexes(&mut self) {
+        let params: Vec<(String, usize, usize)> = {
+            let mut seen = std::collections::HashSet::new();
+            self.schemas.values()
+                .flat_map(|s| s.indexes.vector.iter().cloned())
+                .filter(|f| seen.insert(f.clone()))
+                .map(|f| {
+                    let (m, ef) = self.hnsw_params.get(&f).copied().unwrap_or((16, 200));
+                    (f, m, ef)
+                })
+                .collect()
+        };
+        for (field, m, ef) in params {
+            let _ = self.build_hnsw_index(&field, m, ef);
         }
     }
 }
@@ -2407,8 +3100,16 @@ struct Snapshot {
 #[derive(Serialize, Deserialize)]
 struct SnapHnsw {
     field: String,
+    #[serde(default)]
+    version: u32,
+    #[serde(default = "default_hnsw_m")]
+    m: usize,
+    #[serde(default = "default_hnsw_ef")]
+    ef_construction: usize,
     graph: vector::HnswGraph,
 }
+fn default_hnsw_m()  -> usize { 16 }
+fn default_hnsw_ef() -> usize { 200 }
 
 #[derive(Serialize, Deserialize)]
 struct SnapNode {
@@ -2710,7 +3411,8 @@ mod hybrid_query_tests {
         )
         .unwrap();
 
-        // CREATE INDEX registers the vector hint (PostgreSQL style)
+        // CREATE INDEX on an empty table must always succeed — schema hint is recorded
+        // and the index will be built automatically when vectors are inserted.
         db.execute("CREATE INDEX ON articles USING hnsw (embedding)").unwrap();
 
         let schema = db.schemas.get("articles").expect("schema must exist");
@@ -2719,14 +3421,14 @@ mod hybrid_query_tests {
             "embedding must be in indexes.vector after CREATE INDEX"
         );
 
-        // INSERT with vector
+        // INSERT with vector — HNSW is rebuilt automatically.
         db.execute(
             "INSERT INTO articles (_key, title, embedding) \
              VALUES ('a1', 'Rust', [1.0, 0.0, 0.0, 0.0])",
         )
         .unwrap();
 
-        // Query
+        // Query works without an explicit REINDEX.
         let results = db
             .query("SELECT * FROM articles WHERE VECTOR_NEAR(embedding, [1.0, 0.0, 0.0, 0.0], 5)")
             .unwrap()

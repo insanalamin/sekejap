@@ -44,11 +44,12 @@ db.execute("""
     )
 """)
 
-db.execute("CREATE INDEX ON characters(crew)      USING hash")
-db.execute("CREATE INDEX ON characters(bounty)    USING btree")
-db.execute("CREATE INDEX ON characters(location)  USING spatial")
-db.execute("CREATE INDEX ON characters(embedding) USING hnsw")
-db.execute("CREATE INDEX ON islands(geometry)     USING spatial")
+db.execute("CREATE INDEX ON characters USING hash    (crew)")
+db.execute("CREATE INDEX ON characters USING btree   (bounty)")
+db.execute("CREATE INDEX ON characters USING gin     (name)")
+db.execute("CREATE INDEX ON characters USING spatial (location)")
+db.execute("CREATE INDEX ON characters USING hnsw    (embedding)")
+db.execute("CREATE INDEX ON islands    USING spatial (geometry)")
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
@@ -146,6 +147,7 @@ hits = db.query("""
 |---|---|---|
 | Hash | `hash` | `field = 'val'`, `IN (...)`, equality lookups |
 | B-tree | `btree` | `>`, `<`, `BETWEEN`, `ORDER BY field` |
+| GIN | `gin` | `ILIKE '%pattern%'` (exact trigram postings, no verification step) |
 | Spatial | `spatial` | `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects` |
 | HNSW | `hnsw` | `VECTOR_NEAR(field, [...], k)`, `ORDER BY field <=> [...]` |
 | BM25 | `bm25` | `BM25(field, 'query') > score`, `ORDER BY BM25(...) DESC` |
@@ -153,11 +155,12 @@ hits = db.query("""
 All indexes are built via `CREATE INDEX`:
 
 ```sql
-CREATE INDEX ON characters(crew)      USING hash
-CREATE INDEX ON characters(bounty)    USING btree
-CREATE INDEX ON characters(location)  USING spatial
-CREATE INDEX ON characters(embedding) USING hnsw
-CREATE INDEX ON characters(bio)       USING bm25
+CREATE INDEX ON characters USING hash    (crew)
+CREATE INDEX ON characters USING btree   (bounty)
+CREATE INDEX ON characters USING gin     (name)
+CREATE INDEX ON characters USING spatial (location)
+CREATE INDEX ON characters USING hnsw    (embedding)
+CREATE INDEX ON characters USING bm25    (bio)
 ```
 
 Or declared inline in `CREATE TABLE WITH (...)`:
@@ -170,8 +173,16 @@ CREATE TABLE characters (
     location  GEO,
     embedding VECTOR,
     bio       TEXT
-) WITH (hash: ['_key'], range: ['bounty'], spatial: ['location'], vector: ['embedding'], bm25: ['bio'])
+) WITH (hash: ['_key'], range: ['bounty'], fulltext: ['name'], spatial: ['location'], vector: ['embedding'], bm25: ['bio'])
 ```
+
+**GIN** stores exact trigram→document postings (no lossy signatures), so `ILIKE` queries require no verification pass. GIN is maintained automatically on every insert — declaring the index before loading data is the standard workflow.
+
+**HNSW** is rebuilt automatically after each `put_vector` call when an index is declared. For large bulk loads, call `REINDEX` once after all data is in to rebuild the graph in one pass.
+
+**BM25** is batch-built at `CREATE INDEX` time. Run `REINDEX` after inserting new documents.
+
+All index types survive a cold restart. Hash, B-tree, GIN, and BM25 indexes are rebuilt from persisted schema hints on open. HNSW and Spatial indexes are stored directly in the snapshot.
 
 ---
 
@@ -186,12 +197,33 @@ Standard SQL for schema, mutations, and queries. Use this most of the time.
 ```sql
 -- Schema
 CREATE TABLE islands (_key TEXT PRIMARY KEY, name TEXT, sea TEXT, geometry GEO)
-CREATE INDEX ON islands(geometry) USING spatial
+CREATE INDEX ON islands USING spatial (geometry)
 
 -- Mutations
 INSERT INTO islands (_key, name, sea) VALUES ('wano', 'Wano Kuni', 'grand-line')
 UPDATE islands SET sea = 'new-world' WHERE _key = 'wano'
 DELETE FROM islands WHERE sea = 'east-blue'
+
+-- Schema lifecycle
+DROP TABLE islands
+DROP TABLE IF EXISTS islands
+
+-- DROP INDEX
+DROP INDEX ON islands USING spatial (geometry)
+DROP INDEX IF EXISTS ON islands USING btree (elevation)
+
+-- REINDEX (force rebuild — useful after large bulk loads)
+REINDEX ON researchers USING hnsw    (embedding)
+REINDEX ON papers      USING bm25    (abstract)
+REINDEX ON characters  USING gin     (name)
+
+-- ALTER TABLE (PostgreSQL-style)
+ALTER TABLE islands ADD COLUMN elevation INTEGER
+ALTER TABLE islands DROP COLUMN elevation
+ALTER TABLE islands DROP COLUMN IF EXISTS elevation
+ALTER TABLE islands RENAME COLUMN sea TO ocean
+ALTER TABLE islands RENAME TO atolls
+ALTER TABLE islands ALTER COLUMN elevation TYPE REAL
 
 -- Edges
 INSERT ('islands/marineford')-[:route_to {days: 3}]->('islands/fishman-island')
@@ -216,7 +248,10 @@ SELECT * FROM zones   WHERE ST_Contains(geometry, POINT(144.9671 -37.8183))
 -- Vector
 SELECT * FROM characters WHERE VECTOR_NEAR(embedding, [0.9, 0.1, 0.0], 5)
 
--- Full-text
+-- Full-text (GIN — fast exact ILIKE, no score)
+SELECT * FROM characters WHERE name ILIKE '%shanks%'
+
+-- Full-text (BM25 — relevance-ranked)
 SELECT * FROM papers WHERE BM25(abstract, 'neural network') > 0.3
 ORDER BY BM25(abstract, 'neural network') DESC
 
@@ -328,9 +363,9 @@ db.df.create_collection(
 
 ---
 
-## Full Data Science Example — Research Network (Melbourne)
+## Full Data Science Example — Grand Line Intelligence
 
-A researcher discovery system combining all four data models.
+A pirate intelligence system combining all four data models.
 
 ### Schema and data loading
 
@@ -340,152 +375,153 @@ import pandas as pd
 import numpy as np
 import json
 
-db = DB("./research_db")
+db = DB("./grandline_db")
 
 db.execute("""
-    CREATE TABLE researchers (
+    CREATE TABLE characters (
+        _key       TEXT PRIMARY KEY,
+        name       TEXT,
+        crew       TEXT,
+        role       TEXT,
+        bounty     INTEGER,
+        location   GEO,
+        embedding  VECTOR
+    )
+""")
+db.execute("""
+    CREATE TABLE bounty_posters (
         _key        TEXT PRIMARY KEY,
-        name        TEXT,
-        institution TEXT,
-        field       TEXT,
-        h_index     INTEGER,
-        location    GEO,
-        embedding   VECTOR
-    )
-""")
-db.execute("""
-    CREATE TABLE papers (
-        _key      TEXT PRIMARY KEY,
-        title     TEXT,
-        abstract  TEXT,
-        year      INTEGER,
-        citations INTEGER
+        subject     TEXT,
+        description TEXT,
+        bounty      INTEGER,
+        year        INTEGER
     )
 """)
 
-db.execute("CREATE INDEX ON researchers(institution) USING hash")
-db.execute("CREATE INDEX ON researchers(h_index)     USING btree")
-db.execute("CREATE INDEX ON researchers(location)    USING spatial")
-db.execute("CREATE INDEX ON researchers(embedding)   USING hnsw")
-db.execute("CREATE INDEX ON papers(abstract)         USING bm25")
+db.execute("CREATE INDEX ON characters     USING hash    (crew)")
+db.execute("CREATE INDEX ON characters     USING btree   (bounty)")
+db.execute("CREATE INDEX ON characters     USING gin     (name)")
+db.execute("CREATE INDEX ON characters     USING spatial (location)")
+db.execute("CREATE INDEX ON characters     USING hnsw    (embedding)")
+db.execute("CREATE INDEX ON bounty_posters USING bm25    (description)")
 
 # Load from CSV + numpy embeddings
-df = pd.read_csv("researchers.csv")
+df = pd.read_csv("characters.csv")
 embeddings = np.load("embeddings.npy")   # shape (n, 384)
 df["location"] = df.apply(
     lambda r: json.dumps({"type": "Point", "coordinates": [r.lon, r.lat]}), axis=1
 )
 df["embedding"] = [e.tolist() for e in embeddings]
 
-db.df.load_nodes(df, "researchers", id_col="researcher_id",
-                 mapping={"researcher_id": "_key"})
+db.df.load_nodes(df, "characters", id_col="character_id",
+                 mapping={"character_id": "_key"})
 
 db.df.load_edges(
-    pd.read_csv("collaborations.csv"),
-    source_col="researcher_id",
-    target_col="collaborator_id",
-    edge_type="collaborated_with",
-    source_collection="researchers",
-    target_collection="researchers",
-    weight_col="num_papers",
+    pd.read_csv("rivalries.csv"),
+    source_col="from_id",
+    target_col="to_id",
+    edge_type="rival",
+    source_collection="characters",
+    target_collection="characters",
+    weight_col="intensity",
 )
 ```
 
-### Spatial — who's at which university near Flinders Street?
+### Spatial — powerful pirates in the New World
 
 ```python
 df = db.df.query("""
-    SELECT * FROM researchers
-    WHERE ST_DWithin(location, POINT(144.9671 -37.8183), 5.0)
-      AND field = 'machine_learning'
-      AND h_index >= 10
-    ORDER BY h_index DESC
+    SELECT * FROM characters
+    WHERE ST_DWithin(location, POINT(0.0 0.0), 500.0)
+      AND crew != 'marine'
+      AND bounty >= 1000000000
+    ORDER BY bounty DESC
     LIMIT 20
 """)
 ```
 
-### Vector — semantically similar researchers
+### Vector — characters with similar fighting style
 
 ```python
 from sentence_transformers import SentenceTransformer
 
 model = SentenceTransformer("all-MiniLM-L6-v2")
-vec = model.encode("deep learning for climate science").tolist()
+vec = model.encode("swordsman close-range power haki").tolist()
 
 df = db.df.query(f"""
-    SELECT * FROM researchers
+    SELECT * FROM characters
     WHERE VECTOR_NEAR(embedding, {vec}, 10)
-      AND ST_DWithin(location, POINT(144.9671 -37.8183), 20.0)
+      AND bounty >= 500000000
 """)
 ```
 
-### Graph — collaboration network
+### Graph — rival and alliance networks
 
 ```python
-# 2-hop collaboration network
+# 2-hop rival network from Luffy
 hits = db.query("""
-    MATCH (a:researchers)-[:collaborated_with*1..2]->(b:researchers)
-    WHERE a._key = 'ali-hakim'
+    MATCH (a:characters)-[:rival*1..2]->(b:characters)
+    WHERE a._key = 'luffy'
     RETURN b
 """)
 
-# Who are the most connected researchers?
+# Most feared pirates by rival count
 hits = db.query("""
-    MATCH (a:researchers)-[r:collaborated_with]->(b:researchers)
-    RETURN b._key AS researcher, COUNT(a) AS allies, SUM(r.weight) AS joint_papers
+    MATCH (a:characters)-[r:rival]->(b:characters)
+    RETURN b._key AS pirate, COUNT(a) AS rivals, SUM(r.intensity) AS total_threat
     GROUP BY b._key
-    ORDER BY joint_papers DESC
+    ORDER BY total_threat DESC
     LIMIT 10
 """)
 
-# Cross-field collaboration
+# Cross-crew rivalries
 hits = db.query("""
-    MATCH (a:researchers)-[r:collaborated_with]->(b:researchers)
-    RETURN a.field AS from_field, b.field AS to_field, COUNT(r) AS links
-    GROUP BY a.field, b.field
-    ORDER BY links DESC
+    MATCH (a:characters)-[r:rival]->(b:characters)
+    RETURN a.crew AS from_crew, b.crew AS to_crew, COUNT(r) AS clashes
+    GROUP BY a.crew, b.crew
+    ORDER BY clashes DESC
 """)
 ```
 
-### BM25 — relevant papers
+### BM25 — search bounty posters
 
 ```python
 df = db.df.query("""
-    SELECT * FROM papers
-    WHERE BM25(abstract, 'urban heat island Victoria') > 0.2
-      AND year >= 2020
-      AND citations >= 50
-    ORDER BY BM25(abstract, 'urban heat island Victoria') DESC
+    SELECT * FROM bounty_posters
+    WHERE BM25(description, 'swordsman dangerous haki') > 0.2
+      AND bounty >= 100000000
+    ORDER BY BM25(description, 'swordsman dangerous haki') DESC
 """)
 ```
 
 ### Multi-modal — spatial + graph + vector in one workflow
 
 ```python
-# "ML researchers near Melbourne CBD who collaborated with authors
-#  of highly-cited papers published after 2021"
+# "Pirates near Marineford who are in Shanks' rival network
+#  and have a similar fighting style to Whitebeard"
 
-papers = db.df.query("SELECT * FROM papers WHERE year >= 2021 AND citations >= 50")
+whitebeard_vec = model.encode("massive power conqueror close-range").tolist()
 
-author_rows = []
-for _, paper in papers.iterrows():
-    hits = db.query(f"""
-        MATCH (p:papers)<-[:authored]-(r:researchers)
-        WHERE p._key = '{paper["_key"]}'
-        RETURN r
-    """)
-    author_rows += [json.loads(h.payload) for h in hits if h.payload]
+# Step 1: find pirates near Marineford (0°, 0°)
+nearby = db.df.query("SELECT * FROM characters WHERE ST_DWithin(location, POINT(0.0 0.0), 300.0)")
 
-prolific = pd.DataFrame(author_rows).drop_duplicates("_key")
+# Step 2: walk Shanks' rival graph
+rivals = db.query("""
+    MATCH (a:characters)-[:rival*1..3]->(b:characters)
+    WHERE a._key = 'shanks'
+    RETURN b
+""")
+rival_keys = {h.slug.split("/")[1] for h in rivals}
 
-keys = prolific["_key"].tolist()
-in_clause = ", ".join(f"'{k}'" for k in keys)
+# Step 3: filter nearby pirates who appear in the rival graph
+candidates = nearby[nearby["_key"].isin(rival_keys)]
+keys_clause = ", ".join(f"'{k}'" for k in candidates["_key"])
 
+# Step 4: rank by vector similarity to Whitebeard
 result = db.df.query(f"""
-    SELECT * FROM researchers
-    WHERE _key IN ({in_clause})
-      AND ST_DWithin(location, POINT(144.9671 -37.8183), 10.0)
-      AND field = 'machine_learning'
+    SELECT * FROM characters
+    WHERE _key IN ({keys_clause})
+      AND VECTOR_NEAR(embedding, {whitebeard_vec}, 5)
 """)
 ```
 

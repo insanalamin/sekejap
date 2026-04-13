@@ -65,6 +65,23 @@ pub(crate) enum WalEntry {
         method: String,
         fields: Vec<String>,
     },
+    DropTable {
+        collection: String,
+    },
+    DropIndex {
+        collection: String,
+        method: String,
+        field: String,
+    },
+    AlterTable {
+        collection: String,
+        /// JSON-serialised `AlterTableOp` — keeps the WAL self-contained.
+        op_json: String,
+    },
+    /// Forward-compatibility catch-all: entries written by a newer binary
+    /// with an unknown `op` value are silently skipped on replay.
+    #[serde(other)]
+    Unknown,
 }
 
 // ── CRC helper ────────────────────────────────────────────────────────────────
@@ -181,7 +198,8 @@ impl WalReader {
             }
 
             match serde_json::from_slice::<WalEntry>(&payload) {
-                Ok(entry) => entries.push(entry),
+                Ok(WalEntry::Unknown) => { /* forward-compat: skip silently */ }
+                Ok(entry)             => entries.push(entry),
                 Err(_) => {
                     corrupted = true;
                     break;
@@ -294,6 +312,18 @@ mod tests {
         let (entries, corrupted) = WalReader::open(&path).unwrap().read_all();
         assert!(corrupted);
         assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn unknown_wal_entry_is_skipped() {
+        // A JSON object with an unknown `op` must deserialise to `WalEntry::Unknown`,
+        // not cause a parse error — validates `#[serde(other)]` behaviour.
+        let raw = br#"{"op":"future_feature","x":1}"#;
+        let entry: WalEntry = serde_json::from_slice(raw).expect("should deserialise");
+        assert!(
+            matches!(entry, WalEntry::Unknown),
+            "unknown op must yield WalEntry::Unknown"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "skcli"]
 
 [workspace.package]
-version = "0.6.6"
+version = "0.6.7"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -61,4 +61,8 @@ harness = false
 
 [[bench]]
 name = "graph_traversal"
+harness = false
+
+[[bench]]
+name = "hybrid_query"
 harness = false

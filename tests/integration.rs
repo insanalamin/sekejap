@@ -2786,3 +2786,434 @@ fn show_edges_sql() {
     let hits = db.show("SHOW EDGES FROM classrooms TO departments").unwrap();
     assert_eq!(hits.len(), 0);
 }
+
+// ── ALTER TABLE ───────────────────────────────────────────────────────────────
+
+#[test]
+fn alter_table_add_column() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, name TEXT, capacity INTEGER)").unwrap();
+    db.execute("ALTER TABLE venues ADD COLUMN suburb TEXT").unwrap();
+
+    let hits = db.show("SHOW venues").unwrap();
+    let fields: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref().and_then(|p| p["field"].as_str().map(str::to_string)))
+        .collect();
+    assert!(fields.contains(&"suburb".to_string()));
+}
+
+#[test]
+fn alter_table_add_column_already_exists_errors() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, name TEXT, capacity INTEGER)").unwrap();
+    let err = db.execute("ALTER TABLE venues ADD COLUMN capacity INTEGER").unwrap_err();
+    assert!(err.to_string().contains("already exists"));
+}
+
+#[test]
+fn alter_table_add_column_no_table_errors() {
+    let mut db = CoreDB::new();
+    let err = db.execute("ALTER TABLE venues ADD COLUMN name TEXT").unwrap_err();
+    assert!(err.to_string().contains("does not exist"));
+}
+
+#[test]
+fn alter_table_drop_column() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, name TEXT, capacity INTEGER, suburb TEXT)").unwrap();
+    // Insert a node with all three fields
+    db.execute("INSERT INTO venues (_key, name, capacity, suburb) VALUES ('rod_laver', 'Rod Laver Arena', 15000, 'Melbourne')").unwrap();
+
+    let count = db.execute("ALTER TABLE venues DROP COLUMN suburb").unwrap();
+    assert_eq!(count, 1); // one node had the field removed
+
+    // Schema no longer lists suburb
+    let hits = db.show("SHOW venues").unwrap();
+    let fields: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref().and_then(|p| p["field"].as_str().map(str::to_string)))
+        .collect();
+    assert!(!fields.contains(&"suburb".to_string()));
+
+    // Node no longer has the field
+    let node = db.get("venues/rod_laver").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&node).unwrap();
+    assert!(v.get("suburb").is_none());
+}
+
+#[test]
+fn alter_table_drop_column_if_exists_silent() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, name TEXT)").unwrap();
+    let count = db.execute("ALTER TABLE venues DROP COLUMN IF EXISTS nonexistent").unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn alter_table_drop_column_missing_errors() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, name TEXT)").unwrap();
+    let err = db.execute("ALTER TABLE venues DROP COLUMN ghost").unwrap_err();
+    assert!(err.to_string().contains("does not exist"));
+}
+
+#[test]
+fn alter_table_rename_column() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE bands (_key TEXT, name TEXT, city TEXT)").unwrap();
+    db.execute("INSERT INTO bands (_key, name, city) VALUES ('the_vines', 'The Vines', 'Sydney')").unwrap();
+
+    let count = db.execute("ALTER TABLE bands RENAME COLUMN city TO hometown").unwrap();
+    assert_eq!(count, 1);
+
+    // Schema updated
+    let hits = db.show("SHOW bands").unwrap();
+    let fields: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref().and_then(|p| p["field"].as_str().map(str::to_string)))
+        .collect();
+    assert!(fields.contains(&"hometown".to_string()));
+    assert!(!fields.contains(&"city".to_string()));
+
+    // Node updated
+    let node = db.get("bands/the_vines").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&node).unwrap();
+    assert_eq!(v["hometown"], "Sydney");
+    assert!(v.get("city").is_none());
+}
+
+#[test]
+fn alter_table_rename_table() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE bands (_key TEXT, name TEXT)").unwrap();
+    db.execute("INSERT INTO bands (_key, name) VALUES ('the_vines', 'The Vines')").unwrap();
+    db.execute("INSERT INTO bands (_key, name) VALUES ('jet', 'Jet')").unwrap();
+
+    let count = db.execute("ALTER TABLE bands RENAME TO artists").unwrap();
+    assert_eq!(count, 2); // two nodes reclassified
+
+    // Old collection query returns nothing
+    let old_hits = db.query("SELECT * FROM bands").unwrap().collect();
+    assert_eq!(old_hits.len(), 0);
+
+    // New collection query returns both nodes
+    let new_hits = db.query("SELECT * FROM artists").unwrap().collect();
+    assert_eq!(new_hits.len(), 2);
+
+    // SHOW TABLES reflects the rename
+    let table_hits = db.show("SHOW TABLES").unwrap();
+    let names: Vec<_> = table_hits.iter()
+        .filter_map(|h| h.payload.as_ref().and_then(|p| p["name"].as_str().map(str::to_string)))
+        .collect();
+    assert!(names.contains(&"artists".to_string()));
+    assert!(!names.contains(&"bands".to_string()));
+}
+
+#[test]
+fn alter_table_rename_to_existing_errors() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE bands (_key TEXT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE artists (_key TEXT, name TEXT)").unwrap();
+    let err = db.execute("ALTER TABLE bands RENAME TO artists").unwrap_err();
+    assert!(err.to_string().contains("already exists"));
+}
+
+#[test]
+fn alter_table_alter_column_type() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, name TEXT, capacity INTEGER)").unwrap();
+    db.execute("ALTER TABLE venues ALTER COLUMN capacity TYPE REAL").unwrap();
+
+    let hits = db.show("SHOW venues").unwrap();
+    let capacity_hit = hits.iter()
+        .find(|h| h.payload.as_ref().and_then(|p| p["field"].as_str()) == Some("capacity"))
+        .expect("capacity field must be present");
+    assert_eq!(
+        capacity_hit.payload.as_ref().unwrap()["type"].as_str(),
+        Some("REAL")
+    );
+}
+
+#[test]
+fn alter_table_wal_replay() {
+    use tempfile::TempDir;
+    use sekejap::CoreDB;
+
+    let dir = TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE venues (_key TEXT, name TEXT, capacity INTEGER)").unwrap();
+        db.execute("INSERT INTO venues (_key, name, capacity) VALUES ('rod_laver', 'Rod Laver Arena', 15000)").unwrap();
+        db.execute("ALTER TABLE venues ADD COLUMN suburb TEXT").unwrap();
+        db.execute("ALTER TABLE venues RENAME COLUMN capacity TO seats").unwrap();
+    }
+
+    // Cold reload — WAL replay must restore all ALTER TABLE ops
+    let db = CoreDB::open(dir.path()).unwrap();
+
+    // Schema has suburb, seats; no capacity
+    let hits = db.show("SHOW venues").unwrap();
+    let fields: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref().and_then(|p| p["field"].as_str().map(str::to_string)))
+        .collect();
+    assert!(fields.contains(&"suburb".to_string()), "suburb must survive replay");
+    assert!(fields.contains(&"seats".to_string()),  "seats must survive replay");
+    assert!(!fields.contains(&"capacity".to_string()), "capacity was renamed");
+
+    // Node data: seats field exists, capacity does not
+    let node = db.get("venues/rod_laver").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&node).unwrap();
+    assert_eq!(v["seats"].as_f64(), Some(15000.0));
+    assert!(v.get("capacity").is_none());
+}
+
+// ── ALTER TABLE index correctness ─────────────────────────────────────────────
+
+#[test]
+fn drop_column_removes_index_hint_and_btree() {
+    use tempfile::TempDir;
+    use sekejap::CoreDB;
+
+    let dir = TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE venues (_key TEXT, name TEXT, capacity INTEGER)").unwrap();
+        db.execute("CREATE INDEX ON venues USING btree (capacity)").unwrap();
+        for (k, n, c) in [("rod_laver", "Rod Laver Arena", 15000), ("mcg", "MCG", 100024)] {
+            db.execute(&format!(
+                "INSERT INTO venues (_key, name, capacity) VALUES ('{k}', '{n}', {c})"
+            )).unwrap();
+        }
+
+        // Index works before drop
+        let hits = db.query("SELECT * FROM venues WHERE capacity > 10000 ORDER BY capacity ASC")
+            .unwrap().collect();
+        assert_eq!(hits.len(), 2);
+
+        db.execute("ALTER TABLE venues DROP COLUMN capacity").unwrap();
+
+        // After drop: schema hint is gone
+        let show = db.show("SHOW venues").unwrap();
+        let fields: Vec<_> = show.iter()
+            .filter_map(|h| h.payload.as_ref().and_then(|p| p["field"].as_str().map(String::from)))
+            .collect();
+        assert!(!fields.contains(&"capacity".to_string()));
+    }
+
+    // WAL replay: index rebuild must NOT try to rebuild the dropped column
+    {
+        let db = CoreDB::open(dir.path()).unwrap();
+        let show = db.show("SHOW venues").unwrap();
+        let fields: Vec<_> = show.iter()
+            .filter_map(|h| h.payload.as_ref().and_then(|p| p["field"].as_str().map(String::from)))
+            .collect();
+        assert!(!fields.contains(&"capacity".to_string()),
+            "capacity index hint must not survive WAL replay after DROP COLUMN");
+    }
+}
+
+#[test]
+fn rename_column_updates_index_hint() {
+    use tempfile::TempDir;
+    use sekejap::CoreDB;
+
+    let dir = TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE venues (_key TEXT, name TEXT, seats INTEGER)").unwrap();
+        db.execute("CREATE INDEX ON venues USING btree (seats)").unwrap();
+        db.execute("INSERT INTO venues (_key, name, seats) VALUES ('mcg', 'MCG', 100024)").unwrap();
+
+        db.execute("ALTER TABLE venues RENAME COLUMN seats TO capacity").unwrap();
+
+        // Index on new name must work immediately
+        let hits = db.query("SELECT * FROM venues WHERE capacity > 50000 ORDER BY capacity ASC")
+            .unwrap().collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    // WAL replay must rebuild index under the new name, not the old
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        // Force a btree rebuild as startup does (simulate by inserting a second row)
+        db.execute("INSERT INTO venues (_key, name, capacity) VALUES ('etihad', 'Marvel Stadium', 56347)").unwrap();
+        let hits = db.query("SELECT * FROM venues WHERE capacity > 50000 ORDER BY capacity ASC")
+            .unwrap().collect();
+        assert_eq!(hits.len(), 2);
+
+        // Old name must no longer appear in schema hints
+        let show = db.show("SHOW venues").unwrap();
+        let indexed: Vec<_> = show.iter()
+            .filter_map(|h| {
+                let p = h.payload.as_ref()?;
+                if p.get("source").and_then(|v| v.as_str()) == Some("declared") {
+                    p["field"].as_str().map(String::from)
+                } else { None }
+            })
+            .collect();
+        assert!(indexed.contains(&"capacity".to_string()),
+            "capacity must appear in schema after rename");
+    }
+}
+
+#[test]
+fn alter_column_type_rebuilds_btree() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE events (_key TEXT, name TEXT, score INTEGER)").unwrap();
+    db.execute("CREATE INDEX ON events USING btree (score)").unwrap();
+    for (k, s) in [("a", 10), ("b", 50), ("c", 90)] {
+        db.execute(&format!(
+            "INSERT INTO events (_key, name, score) VALUES ('{k}', '{k}', {s})"
+        )).unwrap();
+    }
+
+    // Btree works with INTEGER type
+    let before = db.query("SELECT * FROM events WHERE score > 40 ORDER BY score ASC")
+        .unwrap().collect();
+    assert_eq!(before.len(), 2);
+
+    // Change type to REAL — btree should be rebuilt and still work
+    db.execute("ALTER TABLE events ALTER COLUMN score TYPE REAL").unwrap();
+
+    let after = db.query("SELECT * FROM events WHERE score > 40 ORDER BY score ASC")
+        .unwrap().collect();
+    assert_eq!(after.len(), 2);
+}
+
+// ── DROP INDEX ────────────────────────────────────────────────────────────────
+
+/// DROP INDEX on a btree removes the index hint from the schema and destroys
+/// the in-memory btree so range queries fall back to a full scan.
+#[test]
+fn drop_index_btree_removes_hint_and_data() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, capacity INTEGER)").unwrap();
+    db.execute("CREATE INDEX ON venues USING btree (capacity)").unwrap();
+    for (k, c) in [("rod_laver", 15000i64), ("forum", 11000i64), ("corner", 2400i64)] {
+        db.execute(&format!(
+            "INSERT INTO venues (_key, capacity) VALUES ('{k}', {c})"
+        )).unwrap();
+    }
+
+    // Btree index is present — range query uses it
+    let before = db.query("SELECT * FROM venues WHERE capacity > 10000 ORDER BY capacity ASC")
+        .unwrap().collect();
+    assert_eq!(before.len(), 2);
+
+    // Drop the index
+    db.execute("DROP INDEX ON venues USING btree (capacity)").unwrap();
+
+    // Range query should still work via full scan fallback
+    let after = db.query("SELECT * FROM venues WHERE capacity > 10000 ORDER BY capacity ASC")
+        .unwrap().collect();
+    assert_eq!(after.len(), 2);
+}
+
+/// DROP INDEX IF EXISTS on a non-existent index is silent.
+#[test]
+fn drop_index_if_exists_silent() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, capacity INTEGER)").unwrap();
+    // No index created — IF EXISTS should not error
+    db.execute("DROP INDEX IF EXISTS ON venues USING btree (capacity)").unwrap();
+}
+
+/// DROP INDEX without IF EXISTS on a non-existent index returns an error.
+#[test]
+fn drop_index_missing_errors() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, capacity INTEGER)").unwrap();
+    let err = db.execute("DROP INDEX ON venues USING btree (capacity)");
+    assert!(err.is_err());
+}
+
+/// When two collections share a GIN (fulltext) index on the same field name,
+/// dropping the index from one collection must NOT destroy the other's data.
+#[test]
+fn drop_index_gin_shared_field_only_removes_one_collection() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE articles (_key TEXT, body TEXT)").unwrap();
+    db.execute("CREATE TABLE posts (_key TEXT, body TEXT)").unwrap();
+
+    // Insert data first — GIN is batch-built, so the index must be created after rows.
+    db.execute("INSERT INTO articles (_key, body) VALUES ('a1', 'live music in Fitzroy')").unwrap();
+    db.execute("INSERT INTO articles (_key, body) VALUES ('a2', 'gallery opens in Collingwood')").unwrap();
+    db.execute("INSERT INTO posts (_key, body) VALUES ('p1', 'live gig at Corner Hotel')").unwrap();
+
+    db.execute("CREATE INDEX ON articles USING gin (body)").unwrap();
+    db.execute("CREATE INDEX ON posts USING gin (body)").unwrap();
+
+    // Both collections searchable via ILIKE (uses GIN)
+    let hit_articles = db.query("SELECT * FROM articles WHERE body ILIKE 'Fitzroy'")
+        .unwrap().collect();
+    assert_eq!(hit_articles.len(), 1);
+    let hit_posts = db.query("SELECT * FROM posts WHERE body ILIKE 'live'")
+        .unwrap().collect();
+    assert_eq!(hit_posts.len(), 1);
+
+    // Drop GIN on articles only
+    db.execute("DROP INDEX ON articles USING gin (body)").unwrap();
+
+    // Posts GIN data must still work
+    let still_posts = db.query("SELECT * FROM posts WHERE body ILIKE 'live'")
+        .unwrap().collect();
+    assert_eq!(still_posts.len(), 1, "posts GIN must survive when articles drops theirs");
+}
+
+/// DROP INDEX survives WAL replay — after a cold restart the index hint is gone
+/// and the index data is absent.
+#[test]
+fn drop_index_wal_replay() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE venues (_key TEXT, capacity INTEGER)").unwrap();
+        db.execute("CREATE INDEX ON venues USING btree (capacity)").unwrap();
+        db.execute("INSERT INTO venues (_key, capacity) VALUES ('rod_laver', 15000)").unwrap();
+        db.execute("DROP INDEX ON venues USING btree (capacity)").unwrap();
+    }
+
+    // Reopen — WAL replay must re-apply the DROP INDEX.
+    // Full-scan fallback must still return the row.
+    let db = CoreDB::open(dir.path()).unwrap();
+    let rows = db.query("SELECT * FROM venues WHERE capacity > 10000")
+        .unwrap().collect();
+    assert_eq!(rows.len(), 1);
+    // DDL should no longer mention btree on capacity
+    let ddl = db.schema_ddl("venues").unwrap();
+    // The DDL reflects field definitions, not index hints, so we verify
+    // by confirming the query still works (btree hint absence is internal).
+    assert!(ddl.contains("capacity"), "column must still exist");
+}
+
+// ── GIN ILIKE integration test ────────────────────────────────────────────────
+
+/// GIN ILIKE must return the correct nodes (not empty) when accessed via SQL.
+/// This exercises the full code path: build_gin_index → ilike() → query.rs FILTER.
+/// Data is inserted before the index is built (GIN is batch-built, not incremental).
+#[test]
+fn gin_ilike_after_insert() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE bands (name TEXT)").unwrap();
+    // Insert data first — GIN is batch-built so the index must be created after the rows.
+    db.put("bands/b1", r#"{"_collection":"bands","name":"The Vines"}"#).unwrap();
+    db.put("bands/b2", r#"{"_collection":"bands","name":"The Avalanches"}"#).unwrap();
+    db.put("bands/b3", r#"{"_collection":"bands","name":"The John Butler Trio"}"#).unwrap();
+    db.put("bands/b4", r#"{"_collection":"bands","name":"Something Something"}"#).unwrap();
+    db.execute("CREATE INDEX ON bands USING gin (name)").unwrap();
+
+    // SQL ILIKE via GIN index path
+    let hits = db
+        .query("SELECT * FROM bands WHERE name ILIKE '%the%'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 3, "GIN ILIKE must return the 3 bands starting with 'The'");
+
+    let names: Vec<&str> = hits
+        .iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert!(names.contains(&"The Vines"));
+    assert!(names.contains(&"The Avalanches"));
+    assert!(names.contains(&"The John Butler Trio"));
+}

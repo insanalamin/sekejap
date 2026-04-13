@@ -23,9 +23,18 @@
 //!     [_key TEXT PRIMARY KEY, ...]
 //!     [field TIMESTAMPTZ DEFAULT NOW(), ...]
 //! WITH (hash: ['_key'], range: ['age'], fulltext: ['name'], bm25: ['bio'], spatial: ['location'])
+//! DROP TABLE [IF EXISTS] collection
+//! DROP INDEX [IF EXISTS] ON collection USING method (field)
+//!
+//! ALTER TABLE collection ADD [COLUMN] name type [PRIMARY KEY] [NOT NULL]
+//! ALTER TABLE collection DROP [COLUMN] [IF EXISTS] name
+//! ALTER TABLE collection RENAME COLUMN old TO new
+//! ALTER TABLE collection RENAME TO new_name
+//! ALTER TABLE collection ALTER [COLUMN] name TYPE new_type
 //!
 //! SHOW TABLES
 //! SHOW EDGES [FROM collection] [TO collection]
+//! SHOW CREATE TABLE collection
 //! SHOW collection
 //!
 //! OP    ::= = | != | <> | > | < | >= | <=
@@ -52,6 +61,21 @@ pub enum SqlError {
     MissingField { field: &'static str },
     FieldValueCountMismatch { fields: usize, values: usize },
     InvalidValue(String),
+    /// The in-memory GIN index was declared in the schema but not built.
+    /// Returned by `query()` when a step that needs the index would silently
+    /// produce wrong or degraded results (e.g. ILIKE on a field with no gin_index entry).
+    IndexNotBuilt {
+        collection: String,
+        method: String,
+        field: String,
+    },
+    /// An explicit index build failed (e.g. HNSW with no stored vectors).
+    IndexBuildFailed {
+        collection: String,
+        method: String,
+        field: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for SqlError {
@@ -70,6 +94,14 @@ impl fmt::Display for SqlError {
                 "field count ({fields}) does not match value count ({values})"
             ),
             SqlError::InvalidValue(s) => write!(f, "invalid value: {s}"),
+            SqlError::IndexNotBuilt { collection, method, field } => write!(
+                f,
+                "{method} index on {collection}.{field} is declared but not built.\n  Hint: REINDEX ON {collection} USING {method} ({field})"
+            ),
+            SqlError::IndexBuildFailed { collection, method, field, reason } => write!(
+                f,
+                "cannot build {method} index on {collection}.{field}: {reason}.\n  Hint: once data is ready, run: REINDEX ON {collection} USING {method} ({field})"
+            ),
         }
     }
 }
@@ -167,6 +199,18 @@ enum Kw {
     Having,
     // Schema introspection
     Show,
+    // DDL lifecycle
+    Drop,
+    If,
+    Exists,
+    // ALTER TABLE
+    Alter,
+    Column,
+    Rename,
+    To,
+    Add,
+    // Index rebuild
+    Reindex,
 }
 
 fn kw_to_str(kw: &Kw) -> &'static str {
@@ -220,6 +264,15 @@ fn kw_to_str(kw: &Kw) -> &'static str {
         Kw::Group => "group",
         Kw::Having => "having",
         Kw::Show => "show",
+        Kw::Drop => "drop",
+        Kw::If => "if",
+        Kw::Exists => "exists",
+        Kw::Alter => "alter",
+        Kw::Column => "column",
+        Kw::Rename => "rename",
+        Kw::To => "to",
+        Kw::Add => "add",
+        Kw::Reindex => "reindex",
     }
 }
 
@@ -274,6 +327,15 @@ fn keyword(s: &str) -> Option<Kw> {
         "GROUP" => Some(Kw::Group),
         "HAVING" => Some(Kw::Having),
         "SHOW" => Some(Kw::Show),
+        "DROP" => Some(Kw::Drop),
+        "IF" => Some(Kw::If),
+        "EXISTS" => Some(Kw::Exists),
+        "ALTER" => Some(Kw::Alter),
+        "COLUMN" => Some(Kw::Column),
+        "RENAME" => Some(Kw::Rename),
+        "TO" => Some(Kw::To),
+        "ADD" => Some(Kw::Add),
+        "REINDEX" => Some(Kw::Reindex),
         _ => None,
     }
 }
@@ -667,6 +729,47 @@ pub enum CompiledMutation {
         method: IndexMethod,
         fields: Vec<String>,
     },
+    /// DROP TABLE [IF EXISTS]: delete schema + all nodes + cascade edges.
+    DropTable {
+        collection: String,
+        /// If true, silently succeed when the collection does not exist.
+        if_exists: bool,
+    },
+    /// DROP INDEX [IF EXISTS] ON collection USING method (field): remove a specific index.
+    DropIndex {
+        collection: String,
+        method: IndexMethod,
+        field: String,
+        if_exists: bool,
+    },
+    /// ALTER TABLE: modify an existing schema (add/drop/rename columns, rename table).
+    AlterTable {
+        collection: String,
+        op: AlterTableOp,
+    },
+    /// REINDEX: rebuild an existing index on a collection field.
+    /// Does not write a WAL entry — it is a rebuild, not a schema mutation.
+    Reindex {
+        collection: String,
+        method: IndexMethod,
+        fields: Vec<String>,
+    },
+}
+
+/// The specific alteration to apply in an `ALTER TABLE` statement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AlterTableOp {
+    /// `ALTER TABLE t ADD COLUMN name type`
+    AddColumn { def: FieldDef },
+    /// `ALTER TABLE t DROP COLUMN [IF EXISTS] name`
+    DropColumn { name: String, if_exists: bool },
+    /// `ALTER TABLE t RENAME COLUMN old TO new`
+    RenameColumn { old_name: String, new_name: String },
+    /// `ALTER TABLE t RENAME TO new_name`
+    RenameTable { new_name: String },
+    /// `ALTER TABLE t ALTER COLUMN name TYPE new_type` (schema-only; no data coercion)
+    AlterColumnType { name: String, ty: FieldType },
 }
 
 // ── MATCH AST ─────────────────────────────────────────────────────────────────
@@ -779,6 +882,11 @@ pub struct IndexHint {
     /// or explicitly via WITH (vector: ['field']). Reserved for Phase 2 HNSW.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vector: Vec<String>,
+    /// Version at which each index was last built.
+    /// Key: `"method:field"` — e.g. `"gin:name"`, `"btree:price"`.
+    /// Absent key (or stored 0) means built before versioning was introduced → rebuild.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub build_versions: std::collections::HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -797,6 +905,7 @@ impl Default for IndexHint {
             bm25: Vec::new(),
             spatial: Vec::new(),
             vector: Vec::new(),
+            build_versions: std::collections::HashMap::new(),
         }
     }
 }
@@ -2238,6 +2347,138 @@ impl Parser {
         });
 
         Ok(schema)
+    }
+
+    /// Parse: ALTER TABLE collection <op>
+    /// Called after ALTER has already been consumed by parse_mutation.
+    ///
+    /// Supported forms:
+    /// - `ADD [COLUMN] name type [PRIMARY KEY] [NOT NULL]`
+    /// - `DROP [COLUMN] [IF EXISTS] name`
+    /// - `RENAME COLUMN old TO new`
+    /// - `RENAME TO new_name`
+    /// - `ALTER [COLUMN] name TYPE new_type`
+    fn parse_alter_table(&mut self) -> Result<CompiledMutation, SqlError> {
+        self.expect_kw(Kw::Table, "TABLE")?;
+        let collection = self.expect_ident()?;
+
+        match self.peek().clone() {
+            // ADD [COLUMN] name type [PRIMARY KEY] [NOT NULL]
+            Tok::Kw(Kw::Add) => {
+                self.advance(); // consume ADD
+                if matches!(self.peek(), Tok::Kw(Kw::Column)) {
+                    self.advance(); // optional COLUMN
+                }
+                let col_name = self.expect_ident()?;
+                let ty = self.parse_type()?;
+                let mut is_primary_key = false;
+                loop {
+                    match self.peek().clone() {
+                        Tok::Kw(Kw::Primary) => {
+                            self.advance();
+                            self.expect_kw(Kw::Key, "KEY")?;
+                            is_primary_key = true;
+                        }
+                        Tok::Kw(Kw::Not) => {
+                            self.advance();
+                            // consume NULL — NOT NULL is noted but we don't track nullability yet
+                            if matches!(self.peek(), Tok::Kw(Kw::Null)) {
+                                self.advance();
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let is_timestamptz = col_name.ends_with("_at") || col_name.ends_with("_time");
+                let def = FieldDef {
+                    name: col_name,
+                    ty,
+                    is_primary_key,
+                    is_timestamptz,
+                    default_now: is_timestamptz,
+                };
+                Ok(CompiledMutation::AlterTable {
+                    collection,
+                    op: AlterTableOp::AddColumn { def },
+                })
+            }
+
+            // DROP [COLUMN] [IF EXISTS] name
+            Tok::Kw(Kw::Drop) => {
+                self.advance(); // consume DROP
+                if matches!(self.peek(), Tok::Kw(Kw::Column)) {
+                    self.advance(); // optional COLUMN
+                }
+                let if_exists = if matches!(self.peek(), Tok::Kw(Kw::If)) {
+                    self.advance();
+                    self.expect_kw(Kw::Exists, "EXISTS")?;
+                    true
+                } else {
+                    false
+                };
+                let name = self.expect_ident()?;
+                Ok(CompiledMutation::AlterTable {
+                    collection,
+                    op: AlterTableOp::DropColumn { name, if_exists },
+                })
+            }
+
+            // RENAME COLUMN old TO new  |  RENAME TO new_name
+            Tok::Kw(Kw::Rename) => {
+                self.advance(); // consume RENAME
+                match self.peek().clone() {
+                    Tok::Kw(Kw::Column) => {
+                        self.advance(); // consume COLUMN
+                        let old_name = self.expect_ident()?;
+                        self.expect_kw(Kw::To, "TO")?;
+                        let new_name = self.expect_ident()?;
+                        Ok(CompiledMutation::AlterTable {
+                            collection,
+                            op: AlterTableOp::RenameColumn { old_name, new_name },
+                        })
+                    }
+                    Tok::Kw(Kw::To) => {
+                        self.advance(); // consume TO
+                        let new_name = self.expect_ident()?;
+                        Ok(CompiledMutation::AlterTable {
+                            collection,
+                            op: AlterTableOp::RenameTable { new_name },
+                        })
+                    }
+                    other => Err(SqlError::UnexpectedToken {
+                        expected: "COLUMN or TO",
+                        got: format!("{other:?}"),
+                    }),
+                }
+            }
+
+            // ALTER [COLUMN] name TYPE new_type
+            Tok::Kw(Kw::Alter) => {
+                self.advance(); // consume ALTER
+                if matches!(self.peek(), Tok::Kw(Kw::Column)) {
+                    self.advance(); // optional COLUMN
+                }
+                let col_name = self.expect_ident()?;
+                // TYPE is not a registered keyword — consumed as ident
+                let type_kw = self.expect_ident()?;
+                if type_kw.to_ascii_uppercase() != "TYPE" {
+                    return Err(SqlError::UnexpectedToken {
+                        expected: "TYPE",
+                        got: type_kw,
+                    });
+                }
+                let ty = self.parse_type()?;
+                Ok(CompiledMutation::AlterTable {
+                    collection,
+                    op: AlterTableOp::AlterColumnType { name: col_name, ty },
+                })
+            }
+
+            other => Err(SqlError::UnexpectedToken {
+                expected: "ADD, DROP, RENAME, or ALTER",
+                got: format!("{other:?}"),
+            }),
+        }
     }
 
     /// Parse: CREATE INDEX [name] ON collection USING method (field [, ...])
@@ -4182,11 +4423,103 @@ pub fn parse_mutation(sql: &str) -> Result<CompiledMutation, SqlError> {
                 }
             }
         }
+        Tok::Kw(Kw::Drop) => {
+            parser.advance(); // consume DROP
+            match parser.peek().clone() {
+                // DROP TABLE [IF EXISTS] collection
+                Tok::Kw(Kw::Table) => {
+                    parser.advance(); // consume TABLE
+                    let if_exists = if matches!(parser.peek(), Tok::Kw(Kw::If)) {
+                        parser.advance();
+                        match parser.peek().clone() {
+                            Tok::Kw(Kw::Exists) => { parser.advance(); true }
+                            other => return Err(SqlError::UnexpectedToken {
+                                expected: "EXISTS",
+                                got: format!("{other:?}"),
+                            }),
+                        }
+                    } else { false };
+                    let collection = parser.expect_ident()?;
+                    Ok(CompiledMutation::DropTable { collection, if_exists })
+                }
+                // DROP INDEX [IF EXISTS] ON collection USING method (field)
+                Tok::Kw(Kw::Index) => {
+                    parser.advance(); // consume INDEX
+                    let if_exists = if matches!(parser.peek(), Tok::Kw(Kw::If)) {
+                        parser.advance();
+                        match parser.peek().clone() {
+                            Tok::Kw(Kw::Exists) => { parser.advance(); true }
+                            other => return Err(SqlError::UnexpectedToken {
+                                expected: "EXISTS",
+                                got: format!("{other:?}"),
+                            }),
+                        }
+                    } else { false };
+                    parser.expect_kw(Kw::On, "ON")?;
+                    let collection = parser.expect_ident()?;
+                    parser.expect_kw(Kw::Using, "USING")?;
+                    let method_str = parser.expect_ident()?;
+                    let method = match method_str.to_ascii_uppercase().as_str() {
+                        "BTREE"   => IndexMethod::Btree,
+                        "HASH"    => IndexMethod::Hash,
+                        "GIN"     => IndexMethod::Gin,
+                        "GIST"    => IndexMethod::Gist,
+                        "BM25"    => IndexMethod::Bm25,
+                        "SPATIAL" => IndexMethod::Spatial,
+                        "HNSW"    => IndexMethod::Hnsw,
+                        other => return Err(SqlError::UnexpectedToken {
+                            expected: "BTREE, HASH, GIN, GIST, BM25, SPATIAL, or HNSW",
+                            got: other.to_string(),
+                        }),
+                    };
+                    parser.expect_lparen()?;
+                    let field = parser.expect_ident()?;
+                    parser.expect_rparen()?;
+                    Ok(CompiledMutation::DropIndex { collection, method, field, if_exists })
+                }
+                other => Err(SqlError::UnexpectedToken {
+                    expected: "TABLE or INDEX",
+                    got: format!("{other:?}"),
+                }),
+            }
+        }
+        Tok::Kw(Kw::Alter) => {
+            parser.advance(); // consume ALTER
+            parser.parse_alter_table()
+        }
+        Tok::Kw(Kw::Reindex) => {
+            parser.advance(); // consume REINDEX
+            parser.expect_kw(Kw::On, "ON")?;
+            let collection = parser.expect_ident()?;
+            parser.expect_kw(Kw::Using, "USING")?;
+            let method_str = parser.expect_ident()?;
+            let method = match method_str.to_lowercase().as_str() {
+                "btree"   => IndexMethod::Btree,
+                "hash"    => IndexMethod::Hash,
+                "gin"     => IndexMethod::Gin,
+                "gist"    => IndexMethod::Gist,
+                "bm25"    => IndexMethod::Bm25,
+                "spatial" => IndexMethod::Spatial,
+                "hnsw"    => IndexMethod::Hnsw,
+                other => return Err(SqlError::UnexpectedToken {
+                    expected: "btree, hash, gin, gist, bm25, spatial, or hnsw",
+                    got: other.to_string(),
+                }),
+            };
+            parser.expect_lparen()?;
+            let mut fields = vec![parser.expect_ident()?];
+            while matches!(parser.peek(), Tok::Comma) {
+                parser.advance();
+                fields.push(parser.expect_ident()?);
+            }
+            parser.expect_rparen()?;
+            Ok(CompiledMutation::Reindex { collection, method, fields })
+        }
         Tok::Eof => Err(SqlError::UnexpectedEnd {
-            expected: "INSERT, UPDATE, DELETE, or CREATE",
+            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, or REINDEX",
         }),
         other => Err(SqlError::UnexpectedToken {
-            expected: "INSERT, UPDATE, DELETE, or CREATE",
+            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, or REINDEX",
             got: format!("{other:?}"),
         }),
     }
@@ -4966,6 +5299,8 @@ pub enum ShowStmt {
     Edges(ShowEdgesStmt),
     /// `SHOW <collection>` — field structure for one collection.
     Collection(String),
+    /// `SHOW CREATE TABLE <collection>` — DDL that would recreate this collection.
+    CreateTable(String),
 }
 
 /// Parse any `SHOW` statement:
@@ -4973,6 +5308,7 @@ pub enum ShowStmt {
 /// ```text
 /// SHOW TABLES
 /// SHOW EDGES [FROM collection] [TO collection]
+/// SHOW CREATE TABLE <collection>
 /// SHOW <collection_name>
 /// ```
 pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError> {
@@ -4982,14 +5318,38 @@ pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError> {
     p.expect_kw(Kw::Show, "SHOW")?;
 
     match p.peek().clone() {
-        // SHOW TABLES (TABLE also accepted)
+        // SHOW TABLES (TABLE alone = list of tables)
         Tok::Ident(s) if s.to_ascii_uppercase() == "TABLES" => {
             p.advance();
             Ok(ShowStmt::Tables)
         }
+        // SHOW CREATE TABLE <collection>  — TABLE keyword triggers the branch
         Tok::Kw(Kw::Table) => {
             p.advance();
-            Ok(ShowStmt::Tables)
+            // If next token is a collection name it's a bare SHOW TABLE (= SHOW TABLES)
+            // If preceded by CREATE it's SHOW CREATE TABLE — but CREATE is consumed before
+            // we get here, so we check: is the next token an ident?
+            match p.peek().clone() {
+                Tok::Ident(_) => {
+                    let name = p.expect_ident()?;
+                    Ok(ShowStmt::CreateTable(name))
+                }
+                _ => Ok(ShowStmt::Tables),
+            }
+        }
+        // SHOW CREATE TABLE <collection>
+        Tok::Kw(Kw::Create) => {
+            p.advance();
+            // expect TABLE
+            match p.peek().clone() {
+                Tok::Kw(Kw::Table) => { p.advance(); }
+                other => return Err(SqlError::UnexpectedToken {
+                    expected: "TABLE",
+                    got: format!("{other:?}"),
+                }),
+            }
+            let name = p.expect_ident()?;
+            Ok(ShowStmt::CreateTable(name))
         }
         // SHOW EDGES [FROM col] [TO col]
         Tok::Ident(s) if s.to_ascii_uppercase() == "EDGES" => {
@@ -5003,7 +5363,7 @@ pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError> {
             };
 
             let to_col = match p.peek().clone() {
-                Tok::Ident(s) if s.to_ascii_uppercase() == "TO" => {
+                Tok::Kw(Kw::To) => {
                     p.advance();
                     Some(p.expect_ident()?)
                 }
@@ -5018,7 +5378,7 @@ pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError> {
             Ok(ShowStmt::Collection(name))
         }
         other => Err(SqlError::UnexpectedToken {
-            expected: "TABLES, EDGES, or a collection name",
+            expected: "TABLES, CREATE TABLE, EDGES, or a collection name",
             got: format!("{other:?}"),
         }),
     }

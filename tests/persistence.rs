@@ -367,3 +367,164 @@ fn btree_index_survives_wal_replay() {
         assert_eq!(hits[0].slug, "p/p7");
     }
 }
+
+// ── #4 BM25 / GIN index persistence ──────────────────────────────────────────
+
+/// BM25 index must survive WAL-only cold reload and return ranked results.
+#[test]
+fn bm25_survives_wal_replay() {
+    let dir = tmpdir();
+
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE articles (title TEXT)").unwrap();
+        // Insert data before creating index — BM25 is batch-built.
+        db.put("articles/a1", r#"{"_collection":"articles","title":"Flooding in Maribyrnong River"}"#).unwrap();
+        db.put("articles/a2", r#"{"_collection":"articles","title":"Melbourne Cup Fitzroy Gardens"}"#).unwrap();
+        db.put("articles/a3", r#"{"_collection":"articles","title":"The Vines at Rod Laver Arena"}"#).unwrap();
+        db.execute("CREATE INDEX ON articles USING bm25 (title)").unwrap();
+        // No compact — data lives in WAL only
+    }
+
+    {
+        let db = CoreDB::open(dir.path()).unwrap();
+        let results = db.bm25_search("title", "maribyrnong flooding", 5);
+        assert!(!results.is_empty(), "BM25 must return results after WAL-only reload");
+        // Cross-check: the node itself must still be present
+        assert!(db.contains("articles/a1"));
+    }
+}
+
+/// GIN index must survive WAL-only cold reload and ILIKE queries must work.
+#[test]
+fn gin_survives_wal_replay() {
+    let dir = tmpdir();
+
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE venues (name TEXT)").unwrap();
+        // Insert data before creating index — GIN is batch-built.
+        db.put("venues/v1", r#"{"_collection":"venues","name":"Rod Laver Arena"}"#).unwrap();
+        db.put("venues/v2", r#"{"_collection":"venues","name":"Melbourne Park"}"#).unwrap();
+        db.put("venues/v3", r#"{"_collection":"venues","name":"Fitzroy Pool"}"#).unwrap();
+        db.execute("CREATE INDEX ON venues USING gin (name)").unwrap();
+        // No compact — data lives in WAL only
+    }
+
+    {
+        let db = CoreDB::open(dir.path()).unwrap();
+        let ids = db.gin_ilike("name", "%laver%", None);
+        assert_eq!(ids.len(), 1, "GIN must find Rod Laver Arena after WAL-only reload");
+        // Verify it's the right node by cross-checking with SQL full-scan
+        let hits = db.query("SELECT * FROM venues WHERE name ILIKE '%laver%'").unwrap().collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "venues/v1");
+    }
+}
+
+// ── Storage format stability contract ─────────────────────────────────────────
+
+/// A snapshot with `version` higher than the binary supports must be rejected.
+#[test]
+fn snapshot_version_too_new_rejected() {
+    let dir = tmpdir();
+
+    // Write a snapshot with a far-future version number.
+    let snap_json = r#"{"version":9999,"nodes":[],"edges":[]}"#;
+    std::fs::write(dir.path().join("snapshot.json"), snap_json).unwrap();
+
+    match CoreDB::open(dir.path()) {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("version"),
+                "error message must mention 'version', got: {msg}"
+            );
+        }
+        Ok(_) => panic!("must reject snapshot version > supported max"),
+    }
+}
+
+/// GIN index version mismatch (stored 0, compiled-in > 0) must trigger rebuild.
+#[test]
+fn gin_version_mismatch_triggers_rebuild() {
+    let dir = tmpdir();
+
+    // Step 1: Create DB, insert nodes, build GIN index, compact.
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE venues (name TEXT)").unwrap();
+        db.put("venues/v1", r#"{"_collection":"venues","name":"Rod Laver Arena"}"#).unwrap();
+        db.put("venues/v2", r#"{"_collection":"venues","name":"Melbourne Park"}"#).unwrap();
+        db.execute("CREATE INDEX ON venues USING gin (name)").unwrap();
+        db.compact().unwrap();
+    }
+
+    // Step 2: Patch snapshot — set gin:name build_version to 0 so it looks stale.
+    let snap_path = dir.path().join("snapshot.json");
+    let raw = std::fs::read_to_string(&snap_path).unwrap();
+    let mut snap: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    if let Some(schemas) = snap["schemas"].as_array_mut() {
+        for schema in schemas.iter_mut() {
+            if schema["collection"].as_str() == Some("venues") {
+                schema["indexes"]["build_versions"]["gin:name"] =
+                    serde_json::json!(0u32);
+            }
+        }
+    }
+    std::fs::write(&snap_path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+    // Step 3: Reopen — version mismatch must trigger auto-rebuild.
+    {
+        let db = CoreDB::open(dir.path()).unwrap();
+        let ids = db.gin_ilike("name", "%laver%", None);
+        assert_eq!(
+            ids.len(), 1,
+            "GIN must return correct results after auto-rebuild on version mismatch"
+        );
+    }
+}
+
+/// HNSW version mismatch (stored 0) must trigger rebuild from stored vectors.
+#[test]
+fn hnsw_version_mismatch_triggers_rebuild() {
+    let dir = tmpdir();
+
+    // Step 1: Create DB with vectors + HNSW index, compact.
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.put("docs/d1", r#"{"_collection":"docs"}"#).unwrap();
+        db.put("docs/d2", r#"{"_collection":"docs"}"#).unwrap();
+        db.put("docs/d3", r#"{"_collection":"docs"}"#).unwrap();
+        db.put_vector("docs/d1", "emb", &[1.0_f32, 0.0, 0.0]).unwrap();
+        db.put_vector("docs/d2", "emb", &[0.0_f32, 1.0, 0.0]).unwrap();
+        db.put_vector("docs/d3", "emb", &[0.0_f32, 0.0, 1.0]).unwrap();
+        db.build_hnsw_index("emb", 8, 50).unwrap();
+        db.compact().unwrap();
+    }
+
+    // Step 2: Patch snapshot — set hnsw_indexes[0].version to 0.
+    let snap_path = dir.path().join("snapshot.json");
+    let raw = std::fs::read_to_string(&snap_path).unwrap();
+    let mut snap: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    if let Some(hnsw_list) = snap["hnsw_indexes"].as_array_mut() {
+        for entry in hnsw_list.iter_mut() {
+            entry["version"] = serde_json::json!(0u32);
+        }
+    }
+    std::fs::write(&snap_path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+    // Step 3: Reopen — version mismatch must trigger rebuild from stored vectors.
+    {
+        let db = CoreDB::open(dir.path()).unwrap();
+        let results = db
+            .collection("docs")
+            .vector_near("emb", vec![1.0, 0.0, 0.0], 1)
+            .collect();
+        assert_eq!(
+            results.len(), 1,
+            "vector_near must return correct result after HNSW auto-rebuild"
+        );
+        assert_eq!(results[0].slug, "docs/d1");
+    }
+}

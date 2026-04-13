@@ -54,8 +54,11 @@ use std::collections::HashMap;
 /// Each trigram maps to a RoaringBitmap of document IDs that contain it.
 /// Querying intersects the bitmaps to find documents with ALL required trigrams.
 pub struct GINIndex {
-    /// Inverted index: trigram_hash -> RoaringBitmap of doc IDs
+    /// Inverted index: trigram_hash -> RoaringBitmap of slot indices
     postings: HashMap<u32, roaring::RoaringBitmap>,
+    /// Slot index → original u64 node hash.
+    /// Needed because RoaringBitmap only stores u32; node hashes are u64.
+    id_map: Vec<u64>,
     /// Total documents indexed
     doc_count: usize,
     /// Field name being indexed
@@ -73,17 +76,24 @@ impl GINIndex {
     /// * `Self` - The built index
     pub fn build<'a>(docs: impl Iterator<Item = (u64, &'a str)>, field: &str) -> Self {
         let mut postings: HashMap<u32, roaring::RoaringBitmap> = HashMap::new();
+        let mut id_map: Vec<u64> = Vec::new();
+        let mut slot_map: HashMap<u64, u32> = HashMap::new();
         let mut doc_count = 0;
 
         for (doc_id, text) in docs {
             let trigrams = extract_trigrams(text);
             if !trigrams.is_empty() {
+                let slot = *slot_map.entry(doc_id).or_insert_with(|| {
+                    let s = id_map.len() as u32;
+                    id_map.push(doc_id);
+                    s
+                });
                 for trigram in &trigrams {
                     let h = hash_trigram(trigram);
                     postings
                         .entry(h)
                         .or_insert_with(roaring::RoaringBitmap::new)
-                        .insert(doc_id as u32);
+                        .insert(slot);
                 }
                 doc_count += 1;
             }
@@ -91,6 +101,7 @@ impl GINIndex {
 
         Self {
             postings,
+            id_map,
             doc_count,
             field: field.to_string(),
         }
@@ -117,7 +128,7 @@ impl GINIndex {
                 .next()
                 .map(|bm| {
                     bm.iter()
-                        .map(|id| id as u64)
+                        .filter_map(|slot| self.id_map.get(slot as usize).copied())
                         .take(limit.unwrap_or(usize::MAX))
                         .collect()
                 })
@@ -147,12 +158,33 @@ impl GINIndex {
             }
         }
 
-        // Apply limit
+        // Apply limit — map slot indices back to original u64 node hashes
         result
             .iter()
-            .map(|id| id as u64)
+            .filter_map(|slot| self.id_map.get(slot as usize).copied())
             .take(limit.unwrap_or(usize::MAX))
             .collect()
+    }
+
+    /// Incrementally add a single document to the index.
+    ///
+    /// O(trigrams_in_text) — safe to call per-insert for new documents.
+    /// For updates (doc already indexed), remove the old entry first by
+    /// calling `build_gin_index()` for a full rebuild.
+    pub fn insert_doc(&mut self, doc_id: u64, text: &str) {
+        let trigrams = extract_trigrams(text);
+        if !trigrams.is_empty() {
+            let slot = self.id_map.len() as u32;
+            self.id_map.push(doc_id);
+            for trigram in &trigrams {
+                let h = hash_trigram(trigram);
+                self.postings
+                    .entry(h)
+                    .or_insert_with(roaring::RoaringBitmap::new)
+                    .insert(slot);
+            }
+            self.doc_count += 1;
+        }
     }
 
     /// Get the number of unique trigrams indexed.
@@ -209,5 +241,34 @@ mod tests {
         // Test AND of trigrams
         let results = index.ilike("%Alpha Beta%", None);
         assert!(results.contains(&3));
+    }
+
+    /// GIN must return the original u64 hash unmodified even when it exceeds u32::MAX.
+    /// Previously, hashes were truncated to u32 during build and zero-extended on
+    /// query, producing wrong IDs and empty results.
+    #[test]
+    fn test_gin_large_hashes() {
+        // Hashes above u32::MAX — would be silently truncated by the old `doc_id as u32`.
+        let big_id_a: u64 = u64::from(u32::MAX) + 1;   // 4_294_967_296
+        let big_id_b: u64 = u64::from(u32::MAX) + 999;  // 4_294_968_294
+
+        let docs = vec![
+            (big_id_a, "Melbourne Fitzroy"),
+            (big_id_b, "Maribyrnong flooding event"),
+            (1u64, "something else entirely"),
+        ];
+        let index = GINIndex::build(docs.into_iter(), "name");
+
+        // Query for "Fitzroy" — must return big_id_a, not 0 (the truncated form).
+        let results = index.ilike("%fitzroy%", None);
+        assert_eq!(results, vec![big_id_a], "large hash must not be truncated");
+
+        // Query for "Maribyrnong" — must return big_id_b.
+        let results = index.ilike("%maribyrnong%", None);
+        assert_eq!(results, vec![big_id_b], "second large hash must round-trip correctly");
+
+        // Ensure the small-ID doc is still reachable.
+        let results = index.ilike("%something%", None);
+        assert_eq!(results, vec![1u64]);
     }
 }
