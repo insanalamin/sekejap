@@ -25,8 +25,10 @@
 //! UPDATE collection SET field = val [, ...] [WHERE ...]
 //! DELETE FROM collection | ALL [WHERE ...]
 //! DELETE ('from')-[:KIND]->('to')
-//! MATCH (node)-[edge]->(node) [WHERE ...] RETURN vars [LIMIT n]
-//! MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'from' AND b._key = 'to'
+//! MATCH (node)-[edge]->(node) [WHERE ...] RETURN vars [LIMIT n]   -- simple traversal
+//! SELECT expr AS alias [, ...] FROM MATCH (a)-[r]->(b) [WHERE ...] [GROUP BY] [ORDER BY] [LIMIT]
+//! SELECT expr AS alias [, ...] FROM MATCH SHORTEST (a)-[r*]->(b) WHERE a._key='x' AND b._key='y'
+//! SELECT expr FROM MATCH (a)-[:e]->(b), collection AS alias   -- multi-FROM cross-join
 //!
 //! CREATE TABLE collection (field type, ...)
 //!     [_key TEXT PRIMARY KEY, ...]
@@ -46,7 +48,7 @@
 //! SHOW CREATE TABLE collection
 //! SHOW collection
 //!
-//! -- Return expressions (MATCH … RETURN / SELECT … FROM MATCH)
+//! -- SELECT list expressions (SELECT … FROM MATCH)
 //! expr ::= var.field
 //!        | COUNT(*) | SUM(math) | AVG(math) | MIN(math) | MAX(math)
 //!        | PATH_AVG(var.field) | PATH_SUM(var.field) | PATH_MIN(var.field)
@@ -241,6 +243,10 @@ enum Kw {
     Then,
     Else,
     End,
+    // Path predicate quantifiers (ANY/ALL already: All, add Any/None_/Single)
+    Any,
+    None_,
+    Single,
 }
 
 fn kw_to_str(kw: &Kw) -> &'static str {
@@ -308,6 +314,9 @@ fn kw_to_str(kw: &Kw) -> &'static str {
         Kw::Then => "then",
         Kw::Else => "else",
         Kw::End => "end",
+        Kw::Any => "any",
+        Kw::None_ => "none",
+        Kw::Single => "single",
     }
 }
 
@@ -376,6 +385,9 @@ fn keyword(s: &str) -> Option<Kw> {
         "THEN" => Some(Kw::Then),
         "ELSE" => Some(Kw::Else),
         "END" => Some(Kw::End),
+        "ANY" => Some(Kw::Any),
+        "NONE" => Some(Kw::None_),
+        "SINGLE" => Some(Kw::Single),
         _ => None,
     }
 }
@@ -3644,6 +3656,371 @@ impl Parser {
         Ok(MatchAggStmt { start, hops, returns, group_by, order_by, limit })
     }
 
+    /// Parse `SELECT return_list FROM MATCH SHORTEST (a[:col])-[r*]->(b[:col])
+    ///   WHERE a._key = 'x' AND b._key = 'y'
+    ///   [AND ANY(n IN nodes(r) WHERE n.field op val)]
+    ///   [ORDER BY alias [ASC|DESC]] [LIMIT n]`
+    fn parse_select_from_match_shortest(
+        &mut self,
+    ) -> Result<crate::query::ShortestSelectStmt, SqlError> {
+        use crate::query::{PathPredicate, ShortestSelectStmt, SimpleCond};
+
+        self.expect_kw(Kw::Select, "SELECT")?;
+        let returns = self.parse_agg_return_list()?;
+
+        self.expect_kw(Kw::From, "FROM")?;
+        self.expect_kw(Kw::Match, "MATCH")?;
+        // SHORTEST ident (already confirmed by is_select_from_match_shortest)
+        self.expect_ident()?; // consume "SHORTEST"
+
+        // (start_bind[:col])
+        self.expect_lparen()?;
+        let start_bind = self.expect_ident()?;
+        if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+        self.expect_rparen()?;
+
+        // -[path_bind*]->
+        if !matches!(self.peek(), Tok::Dash) {
+            return Err(SqlError::UnexpectedToken { expected: "-", got: format!("{:?}", self.peek()) });
+        }
+        self.advance();
+        self.expect_lbracket()?;
+        // Parse optional path_bind name
+        let path_bind = match self.peek().clone() {
+            Tok::Ident(name) => {
+                self.advance();
+                Some(name)
+            }
+            _ => None,
+        };
+        // Consume everything inside [...] (*, ranges, type labels)
+        loop {
+            match self.peek() {
+                Tok::RBracket | Tok::Eof => break,
+                _ => { self.advance(); }
+            }
+        }
+        self.expect_rbracket()?;
+        if !matches!(self.peek(), Tok::Arrow) {
+            return Err(SqlError::UnexpectedToken { expected: "->", got: format!("{:?}", self.peek()) });
+        }
+        self.advance(); // consume ->
+
+        // (end_bind[:col])
+        self.expect_lparen()?;
+        let end_bind = self.expect_ident()?;
+        if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+        self.expect_rparen()?;
+
+        // WHERE — parse _key conditions for start/end, and optional path predicates
+        self.expect_kw(Kw::Where, "WHERE")?;
+
+        let mut from_slug: Option<String> = None;
+        let mut to_slug:   Option<String> = None;
+        let mut predicates: Vec<PathPredicate> = Vec::new();
+
+        loop {
+            // Path predicate: ANY/ALL/NONE/SINGLE (...)
+            match self.peek().clone() {
+                Tok::Kw(Kw::Any) | Tok::Kw(Kw::All) | Tok::Kw(Kw::None_) | Tok::Kw(Kw::Single) => {
+                    let quantifier = self.advance();
+                    self.expect_lparen()?;
+                    // n IN nodes(path_bind) WHERE n.field op val
+                    let _node_var = self.expect_ident()?; // the iteration variable name
+                    self.expect_kw(Kw::In, "IN")?;
+                    // nodes(path_bind_name)
+                    let func_name = self.expect_ident()?;
+                    if func_name.to_ascii_uppercase() != "NODES" {
+                        return Err(SqlError::UnexpectedToken {
+                            expected: "nodes(path_var)",
+                            got: func_name,
+                        });
+                    }
+                    self.expect_lparen()?;
+                    let path_var = self.expect_ident()?;
+                    self.expect_rparen()?;
+                    self.expect_kw(Kw::Where, "WHERE")?;
+                    // n.field op val
+                    let _n_var = self.expect_ident()?; // should match node_var
+                    self.expect_dot()?;
+                    let field = self.expect_ident()?;
+                    let op = self.parse_cmp_op()?;
+                    let val = self.parse_value()?;
+                    self.expect_rparen()?;
+                    let cond = SimpleCond { field, op, val };
+                    let pred = match quantifier {
+                        Tok::Kw(Kw::Any)    => PathPredicate::Any    { var: path_var, cond },
+                        Tok::Kw(Kw::All)    => PathPredicate::All    { var: path_var, cond },
+                        Tok::Kw(Kw::None_)  => PathPredicate::None_  { var: path_var, cond },
+                        Tok::Kw(Kw::Single) => PathPredicate::Single { var: path_var, cond },
+                        _ => unreachable!(),
+                    };
+                    predicates.push(pred);
+                }
+                _ => {
+                    // var._key = 'value' condition
+                    let binding = self.expect_ident()?;
+                    self.expect_dot()?;
+                    let field = self.expect_ident()?;
+                    if !matches!(self.peek(), Tok::Eq) {
+                        return Err(SqlError::UnexpectedToken {
+                            expected: "=",
+                            got: format!("{:?}", self.peek()),
+                        });
+                    }
+                    self.advance();
+                    let value = self.parse_value()?;
+                    let slug_val = value.as_str().unwrap_or("").to_string();
+                    if binding == start_bind && field == "_key" {
+                        from_slug = Some(slug_val);
+                    } else if binding == end_bind && field == "_key" {
+                        to_slug = Some(slug_val);
+                    }
+                    // Other conditions (e.g. _collection) are parsed but not acted on
+                }
+            }
+
+            if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        let from_slug = from_slug.ok_or(SqlError::UnexpectedEnd { expected: "start node _key condition" })?;
+        let to_slug   = to_slug  .ok_or(SqlError::UnexpectedEnd { expected: "end node _key condition" })?;
+
+        // ORDER BY
+        let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
+            self.advance();
+            self.expect_kw(Kw::By, "BY")?;
+            let alias = self.expect_ident()?;
+            let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
+                self.advance(); false
+            } else {
+                if matches!(self.peek(), Tok::Kw(Kw::Asc)) { self.advance(); }
+                true
+            };
+            Some((alias, ascending))
+        } else { None };
+
+        // LIMIT
+        let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
+            self.advance();
+            Some(self.expect_num()? as usize)
+        } else { None };
+
+        Ok(ShortestSelectStmt { from_slug, to_slug, start_bind, end_bind, path_bind, returns, predicates, order_by, limit })
+    }
+
+    /// Parse `SELECT return_list FROM source1, source2, … [ORDER BY alias] [LIMIT n]`
+    ///
+    /// Each source is:
+    /// - `MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'x' AND b._key = 'y'`
+    /// - `MATCH (a:col)-[r:edge]->(b:col) [WHERE …]`
+    /// - `collection_name [AS alias]`
+    fn parse_select_multi_from(
+        &mut self,
+    ) -> Result<crate::query::MultiFromStmt, SqlError> {
+        use crate::query::{FromSource, MatchAggStart, MatchAggStmt, MultiFromStmt};
+
+        self.expect_kw(Kw::Select, "SELECT")?;
+        let returns = self.parse_agg_return_list()?;
+
+        self.expect_kw(Kw::From, "FROM")?;
+
+        // Parse each source
+        let mut sources: Vec<FromSource> = Vec::new();
+        loop {
+            let src = match self.peek().clone() {
+                Tok::Kw(Kw::Match) => {
+                    self.advance(); // consume MATCH
+                    // Check for SHORTEST
+                    if matches!(self.peek(), Tok::Ident(ref name) if name.eq_ignore_ascii_case("SHORTEST")) {
+                        // Delegate to a sub-parser for the SHORTEST pattern
+                        // Re-use parse_select_from_match_shortest logic inline:
+                        self.advance(); // consume SHORTEST
+                        self.expect_lparen()?;
+                        let start_bind = self.expect_ident()?;
+                        if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+                        self.expect_rparen()?;
+                        self.advance(); // consume '-'
+                        self.expect_lbracket()?;
+                        let path_bind = match self.peek().clone() {
+                            Tok::Ident(name) => { self.advance(); Some(name) }
+                            _ => None,
+                        };
+                        loop {
+                            match self.peek() {
+                                Tok::RBracket | Tok::Eof => break,
+                                _ => { self.advance(); }
+                            }
+                        }
+                        self.expect_rbracket()?;
+                        self.advance(); // consume ->
+                        self.expect_lparen()?;
+                        let end_bind = self.expect_ident()?;
+                        if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+                        self.expect_rparen()?;
+
+                        self.expect_kw(Kw::Where, "WHERE")?;
+                        let mut from_slug: Option<String> = None;
+                        let mut to_slug: Option<String> = None;
+                        loop {
+                            let binding = self.expect_ident()?;
+                            self.expect_dot()?;
+                            let field = self.expect_ident()?;
+                            if !matches!(self.peek(), Tok::Eq) {
+                                return Err(SqlError::UnexpectedToken { expected: "=", got: format!("{:?}", self.peek()) });
+                            }
+                            self.advance();
+                            let value = self.parse_value()?;
+                            let slug_val = value.as_str().unwrap_or("").to_string();
+                            if binding == start_bind && field == "_key" { from_slug = Some(slug_val); }
+                            else if binding == end_bind && field == "_key" { to_slug = Some(slug_val); }
+                            if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                                // Check if next is another _key condition (not a predicate)
+                                if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                                    self.advance();
+                                    if matches!(self.peek(), Tok::Kw(Kw::Any | Kw::All | Kw::None_ | Kw::Single)) {
+                                        // predicates — skip for multi-from simplicity
+                                        break;
+                                    }
+                                }
+                            } else { break; }
+                        }
+                        let from_slug = from_slug.ok_or(SqlError::UnexpectedEnd { expected: "start _key" })?;
+                        let to_slug   = to_slug  .ok_or(SqlError::UnexpectedEnd { expected: "end _key" })?;
+                        FromSource::Shortest(crate::query::ShortestSelectStmt {
+                            from_slug, to_slug, start_bind, end_bind, path_bind,
+                            returns: vec![], predicates: vec![], order_by: None, limit: None,
+                        })
+                    } else {
+                        // Regular MATCH hop chain
+                        let start_node = self.parse_match_node()?;
+                        let start_var = start_node.var.clone();
+                        let start_label = start_node.label.clone();
+                        let mut start = match start_node.label {
+                            Some(ref lbl) => MatchAggStart::Collection(sk_hash(lbl)),
+                            None => match start_node.var {
+                                Some(ref v) => MatchAggStart::Slug(sk_hash(v)),
+                                None => MatchAggStart::All,
+                            },
+                        };
+                        let mut hops = Vec::new();
+                        while matches!(self.peek(), Tok::Dash) {
+                            self.advance();
+                            self.expect_lbracket()?;
+                            let mut edge_bind: Option<String> = None;
+                            let mut edge_type_hash: u64 = 0;
+                            match self.peek().clone() {
+                                Tok::Ident(name) => {
+                                    self.advance();
+                                    match self.peek() {
+                                        Tok::Colon => { self.advance(); let et = self.expect_ident()?; edge_bind = Some(name); edge_type_hash = sk_hash(&et); }
+                                        _ => { edge_bind = Some(name); }
+                                    }
+                                }
+                                Tok::Colon => { self.advance(); let et = self.expect_ident()?; edge_type_hash = sk_hash(&et); }
+                                _ => {}
+                            }
+                            loop { match self.peek() { Tok::RBracket | Tok::Eof => break, _ => { self.advance(); } } }
+                            self.expect_rbracket()?;
+                            if !matches!(self.peek(), Tok::Arrow) {
+                                return Err(SqlError::UnexpectedToken { expected: "->", got: format!("{:?}", self.peek()) });
+                            }
+                            self.advance();
+                            self.expect_lparen()?;
+                            let node_bind = self.expect_ident()?;
+                            if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+                            self.expect_rparen()?;
+                            hops.push(crate::query::HopSpec { edge_type_hash, node_bind, edge_bind });
+                        }
+                        // Optional WHERE (only _key on start var acted on)
+                        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
+                            self.advance();
+                            loop {
+                                let cond_var = self.expect_ident()?;
+                                self.expect_dot()?;
+                                let cond_field = self.expect_ident()?;
+                                if !matches!(self.peek(), Tok::Eq) {
+                                    return Err(SqlError::UnexpectedToken { expected: "=", got: format!("{:?}", self.peek()) });
+                                }
+                                self.advance();
+                                let cond_val = self.parse_value()?;
+                                if cond_field == "_key" {
+                                    if let Some(ref sv) = start_var {
+                                        if *sv == cond_var {
+                                            if let Some(key_val) = cond_val.as_str() {
+                                                let full_slug = match start_label {
+                                                    Some(ref lbl) => format!("{}/{}", lbl, key_val),
+                                                    None => key_val.to_string(),
+                                                };
+                                                start = MatchAggStart::Slug(sk_hash(&full_slug));
+                                            }
+                                        }
+                                    }
+                                }
+                                if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                                    self.advance();
+                                } else { break; }
+                            }
+                        }
+                        FromSource::Match(MatchAggStmt {
+                            start, hops, returns: vec![], group_by: None, order_by: None, limit: None,
+                        })
+                    }
+                }
+                Tok::Ident(name) => {
+                    let col_name = name.clone();
+                    self.advance();
+                    // Optional AS alias
+                    let alias = if matches!(self.peek(), Tok::Kw(Kw::As)) {
+                        self.advance();
+                        self.expect_ident()?
+                    } else {
+                        col_name.clone()
+                    };
+                    FromSource::Collection { alias, name_hash: sk_hash(&col_name) }
+                }
+                other => return Err(SqlError::UnexpectedToken {
+                    expected: "MATCH or collection name",
+                    got: format!("{other:?}"),
+                }),
+            };
+            sources.push(src);
+
+            // Continue if there's a comma
+            if matches!(self.peek(), Tok::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        // ORDER BY
+        let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
+            self.advance();
+            self.expect_kw(Kw::By, "BY")?;
+            let alias = self.expect_ident()?;
+            let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
+                self.advance(); false
+            } else {
+                if matches!(self.peek(), Tok::Kw(Kw::Asc)) { self.advance(); }
+                true
+            };
+            Some((alias, ascending))
+        } else { None };
+
+        // LIMIT
+        let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
+            self.advance();
+            Some(self.expect_num()? as usize)
+        } else { None };
+
+        Ok(MultiFromStmt { sources, returns, order_by, limit })
+    }
+
     /// Parse the aggregate RETURN list: `expr AS alias [, expr AS alias ...]`
     fn parse_agg_return_list(
         &mut self,
@@ -4796,6 +5173,10 @@ pub enum MatchOrAgg {
     Steps(Vec<Step>),
     /// Aggregate MATCH — must be executed via `execute_match_agg`.
     Agg(crate::query::MatchAggStmt),
+    /// `SELECT … FROM MATCH SHORTEST` — must be executed via `execute_shortest_select`.
+    Shortest(crate::query::ShortestSelectStmt),
+    /// `SELECT … FROM source1, source2, …` — must be executed via `execute_multi_from`.
+    MultiFrom(crate::query::MultiFromStmt),
 }
 
 /// Parse a MATCH statement and determine whether it is a simple graph query
@@ -4808,8 +5189,18 @@ pub enum MatchOrAgg {
 pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
     let tokens = tokenize(sql)?;
 
-    // SELECT … FROM MATCH — check before regular SELECT routing.
+    // Multi-FROM: SELECT … FROM source1, source2, … (comma between FROM sources)
+    if is_multi_from(&tokens) {
+        let stmt = Parser::new(tokens).parse_select_multi_from()?;
+        return Ok(MatchOrAgg::MultiFrom(stmt));
+    }
+
+    // SELECT … FROM MATCH [SHORTEST] — check before regular SELECT routing.
     if is_select_from_match(&tokens) {
+        if is_select_from_match_shortest(&tokens) {
+            let stmt = Parser::new(tokens).parse_select_from_match_shortest()?;
+            return Ok(MatchOrAgg::Shortest(stmt));
+        }
         let stmt = Parser::new(tokens).parse_select_from_match()?;
         return Ok(MatchOrAgg::Agg(stmt));
     }
@@ -4821,19 +5212,8 @@ pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
         return Ok(MatchOrAgg::Steps(compile(stmt)));
     }
 
-    // Peek past MATCH to detect aggregate return.
-    // We look two tokens after RETURN to see if it's `ident.ident` (var.field)
-    // or COUNT/SUM/AVG/MIN/MAX keyword — those indicate aggregate mode.
-    let agg = is_agg_match(&tokens);
-    let mut parser = Parser::new(tokens);
-
-    if agg {
-        parser.expect_kw(Kw::Match, "MATCH")?;
-        let stmt = parser.parse_match_agg_path()?;
-        return Ok(MatchOrAgg::Agg(stmt));
-    }
-
     // Simple MATCH — compile to Steps.
+    let mut parser = Parser::new(tokens);
     let stmt = parser.parse_match()?;
     let mut all_steps = compile_match(stmt);
     while matches!(parser.peek(), Tok::Kw(Kw::Union)) {
@@ -4853,6 +5233,43 @@ fn is_select_from_match(tokens: &[Tok]) -> bool {
     tokens.windows(2).any(|w| {
         matches!(w, [Tok::Kw(Kw::From), Tok::Kw(Kw::Match)])
     })
+}
+
+/// Return `true` when the SQL is `SELECT … FROM MATCH SHORTEST (…)-[…]->(…) …`.
+fn is_select_from_match_shortest(tokens: &[Tok]) -> bool {
+    // Look for FROM MATCH SHORTEST (3-token sequence)
+    tokens.windows(3).any(|w| {
+        matches!(w[0], Tok::Kw(Kw::From))
+        && matches!(w[1], Tok::Kw(Kw::Match))
+        && matches!(&w[2], Tok::Ident(name) if name.eq_ignore_ascii_case("SHORTEST"))
+    })
+}
+
+/// Return `true` when the SQL has multiple comma-separated FROM sources.
+///
+/// Detects a top-level comma after the FROM keyword (paren depth = 0).
+fn is_multi_from(tokens: &[Tok]) -> bool {
+    if !matches!(tokens.first(), Some(Tok::Kw(Kw::Select))) {
+        return false;
+    }
+    // Find the FROM keyword position
+    let from_pos = match tokens.iter().position(|t| matches!(t, Tok::Kw(Kw::From))) {
+        Some(p) => p,
+        None => return false,
+    };
+    // Scan after FROM for a top-level comma
+    let mut depth: usize = 0;
+    for tok in &tokens[from_pos + 1..] {
+        match tok {
+            Tok::LParen => depth += 1,
+            Tok::RParen => { if depth > 0 { depth -= 1; } }
+            Tok::Comma if depth == 0 => return true,
+            // Stop scanning at ORDER/LIMIT/WHERE/GROUP (these appear after all FROM sources)
+            Tok::Kw(Kw::Where | Kw::Order | Kw::Limit | Kw::Group) if depth == 0 => break,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Map an uppercase PATH_* / time function name + (var, field) to a `MatchAggReturn`.
@@ -4924,7 +5341,15 @@ pub fn parse_and_compile(sql: &str) -> Result<Vec<Step>, SqlError> {
         MatchOrAgg::Steps(steps) => Ok(steps),
         MatchOrAgg::Agg(_) => Err(SqlError::UnexpectedToken {
             expected: "simple MATCH or SELECT (not aggregate MATCH)",
-            got: "aggregate MATCH RETURN".into(),
+            got: "aggregate SELECT FROM MATCH".into(),
+        }),
+        MatchOrAgg::Shortest(_) => Err(SqlError::UnexpectedToken {
+            expected: "simple MATCH or SELECT (not MATCH SHORTEST)",
+            got: "SELECT FROM MATCH SHORTEST".into(),
+        }),
+        MatchOrAgg::MultiFrom(_) => Err(SqlError::UnexpectedToken {
+            expected: "simple MATCH or SELECT (not multi-FROM)",
+            got: "SELECT FROM multiple sources".into(),
         }),
     }
 }
@@ -5980,116 +6405,3 @@ pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError> {
     }
 }
 
-// ── MATCH SHORTEST ────────────────────────────────────────────────────────────
-
-/// The result of compiling a graph path query.
-pub enum CompiledPathQuery {
-    /// `MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'from' AND b._key = 'to'`
-    ShortestPath { from_slug: String, to_slug: String },
-}
-
-/// Parse a `MATCH SHORTEST` path query.
-///
-/// ```text
-/// MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'from_slug' AND b._key = 'to_slug'
-/// ```
-///
-/// - Node binding names (`a`, `b`) can be anything; collection annotations (`:col`) are allowed
-///   but ignored by the BFS executor.
-/// - The edge pattern (`[r*]`, `[r:type*1..5]`, etc.) is parsed but not enforced yet.
-/// - The `WHERE` conditions must identify both endpoints by `._key`; order is not significant.
-pub fn parse_path_query(sql: &str) -> Result<CompiledPathQuery, SqlError> {
-    let tokens = tokenize(sql)?;
-    let mut p = Parser::new(tokens);
-
-    // MATCH
-    match p.advance() {
-        Tok::Kw(Kw::Match) => {}
-        other => return Err(SqlError::UnexpectedToken { expected: "MATCH", got: format!("{other:?}") }),
-    }
-
-    // SHORTEST
-    match p.advance() {
-        Tok::Ident(ref name) if name.eq_ignore_ascii_case("SHORTEST") => {}
-        other => return Err(SqlError::UnexpectedToken { expected: "SHORTEST", got: format!("{other:?}") }),
-    }
-
-    // (from_binding[:col])
-    p.expect_lparen()?;
-    let from_binding = p.expect_ident()?;
-    if matches!(p.peek(), Tok::Colon) { p.advance(); p.expect_ident()?; }
-    p.expect_rparen()?;
-
-    // -[...edge pattern...]->
-    match p.advance() {
-        Tok::Dash => {}
-        other => return Err(SqlError::UnexpectedToken { expected: "-", got: format!("{other:?}") }),
-    }
-    match p.advance() {
-        Tok::LBracket => {}
-        other => return Err(SqlError::UnexpectedToken { expected: "[", got: format!("{other:?}") }),
-    }
-    // Consume edge pattern tokens until ]
-    loop {
-        match p.peek() {
-            Tok::RBracket | Tok::Eof => break,
-            _ => { p.advance(); }
-        }
-    }
-    match p.advance() {
-        Tok::RBracket => {}
-        other => return Err(SqlError::UnexpectedToken { expected: "]", got: format!("{other:?}") }),
-    }
-    match p.advance() {
-        Tok::Arrow => {}
-        other => return Err(SqlError::UnexpectedToken { expected: "->", got: format!("{other:?}") }),
-    }
-
-    // (to_binding[:col])
-    p.expect_lparen()?;
-    let to_binding = p.expect_ident()?;
-    if matches!(p.peek(), Tok::Colon) { p.advance(); p.expect_ident()?; }
-    p.expect_rparen()?;
-
-    // WHERE from_binding._key = 'slug' AND to_binding._key = 'slug'  (any order)
-    p.expect_kw(Kw::Where, "WHERE")?;
-
-    let mut from_slug: Option<String> = None;
-    let mut to_slug: Option<String> = None;
-
-    for _ in 0..2 {
-        // binding . _key = 'value'
-        let binding = p.expect_ident()?;
-        match p.advance() {
-            Tok::Dot => {}
-            other => return Err(SqlError::UnexpectedToken { expected: ".", got: format!("{other:?}") }),
-        }
-        let field = p.expect_ident()?;
-        if field != "_key" {
-            return Err(SqlError::UnexpectedToken { expected: "_key", got: field });
-        }
-        match p.advance() {
-            Tok::Eq => {}
-            other => return Err(SqlError::UnexpectedToken { expected: "=", got: format!("{other:?}") }),
-        }
-        let value = p.expect_str()?;
-
-        if binding == from_binding {
-            from_slug = Some(value);
-        } else if binding == to_binding {
-            to_slug = Some(value);
-        } else {
-            return Err(SqlError::UnexpectedToken {
-                expected: "from or to binding name",
-                got: binding,
-            });
-        }
-
-        if matches!(p.peek(), Tok::Kw(Kw::And)) { p.advance(); }
-    }
-
-    let from_slug = from_slug.ok_or(SqlError::UnexpectedEnd { expected: "from node _key condition" })?;
-    let to_slug   = to_slug  .ok_or(SqlError::UnexpectedEnd { expected: "to node _key condition" })?;
-
-    Ok(CompiledPathQuery::ShortestPath { from_slug, to_slug })
-}

@@ -307,20 +307,19 @@ Graph traversal (MATCH)
 ───────────────────────
 MATCH (a:col)-[:rel*1..3]->(b:col) WHERE a._key = 'x' RETURN b;
 
-Graph aggregation — RETURN form
-────────────────────────────────
-MATCH (a:col)-[r:edge]->(b:col)
-  RETURN b._key AS name, SUM(r.weight) AS total
-  GROUP BY b._key ORDER BY total DESC LIMIT 10;
-
-Graph aggregation — SELECT … FROM MATCH form (equivalent)
-──────────────────────────────────────────────────────────
+Graph aggregation
+─────────────────
 SELECT b._key AS name, SUM(r.weight) AS total
 FROM MATCH (a:col)-[r:edge]->(b:col)
 GROUP BY b._key ORDER BY total DESC LIMIT 10;
 
-Return expressions (RETURN / SELECT list)
-──────────────────────────────────────────
+Multi-FROM cross-join
+─────────────────────
+SELECT a.field AS af, b.field AS bf
+FROM MATCH (a:col)-[:edge]->(b), collection_name AS alias;
+
+SELECT list expressions
+───────────────────────
 var.field AS alias
 COUNT(*) | SUM(expr) | AVG(expr) | MIN(expr) | MAX(expr)
 PATH_AVG(r.field) | PATH_SUM | PATH_MIN | PATH_MAX | PATH_PRODUCT
@@ -329,9 +328,12 @@ CASE WHEN r.field = val THEN 'x' WHEN ... ELSE 'y' END AS alias
 AGE_DAYS(var.field) | AGE_HOURS(var.field) | NOW()
 JSON_ARRAY_LENGTH(var.field)
 
-Shortest path
-─────────────
-db.path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'x' AND b._key = 'y'")
+Shortest path (0 rows = unreachable, 1 row = found)
+────────────────────────────────────────────────────
+SELECT a.field AS from_f, b.field AS to_f, r.length AS hops, r._path_keys AS route
+FROM MATCH SHORTEST (a)-[r*]->(b)
+WHERE a._key = 'start/slug' AND b._key = 'end/slug'
+AND ANY(n IN nodes(r) WHERE n.field = 'val')
 
 Introspection
 ─────────────

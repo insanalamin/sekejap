@@ -2532,7 +2532,7 @@ fn traverse_single_hop_flat() {
     db.link("students/budi", "answers/a2", "answered", 1.0);
 
     let hits = db.query(
-        "MATCH ('students/budi')-[:answered]->(a) RETURN a.score AS score"
+        "SELECT a.score AS score FROM MATCH ('students/budi')-[:answered]->(a)"
     ).unwrap().collect();
 
     assert_eq!(hits.len(), 2);
@@ -2565,9 +2565,9 @@ fn traverse_two_hop_group_sum() {
     db.link("answers/a3", "questions/q3", "for", 1.0);
 
     let hits = db.query(
-        "MATCH ('students/budi')-[:answered]->(a)-[:for]->(q)
-         RETURN q.clo AS clo, SUM(a.score * q.weight) AS clo_score
-         GROUP BY q.clo
+        "SELECT q.clo AS clo, SUM(a.score * q.weight) AS clo_score \
+         FROM MATCH ('students/budi')-[:answered]->(a)-[:for]->(q) \
+         GROUP BY q.clo \
          ORDER BY clo_score DESC"
     ).unwrap().collect();
 
@@ -2600,8 +2600,8 @@ fn traverse_count_and_avg() {
     }
 
     let hits = db.query(
-        "MATCH ('students/budi')-[:answered]->(a)
-         RETURN COUNT(*) AS cnt, AVG(a.score) AS avg_score"
+        "SELECT COUNT(*) AS cnt, AVG(a.score) AS avg_score \
+         FROM MATCH ('students/budi')-[:answered]->(a)"
     ).unwrap().collect();
 
     // Without GROUP BY → one row per path (4 answers × 1 student)
@@ -2625,7 +2625,7 @@ fn traverse_with_limit() {
     }
 
     let hits = db.query(
-        "MATCH ('s/root')-[:to]->(n) RETURN n.val AS val LIMIT 5"
+        "SELECT n.val AS val FROM MATCH ('s/root')-[:to]->(n) LIMIT 5"
     ).unwrap().collect();
     assert_eq!(hits.len(), 5);
 }
@@ -2641,7 +2641,7 @@ fn traverse_from_collection() {
     }
 
     let hits = db.query(
-        "MATCH (s:students)-[:answered]->(a) RETURN a.score AS score"
+        "SELECT a.score AS score FROM MATCH (s:students)-[:answered]->(a)"
     ).unwrap().collect();
     assert_eq!(hits.len(), 2, "one path per student");
 }
@@ -2657,8 +2657,8 @@ fn traverse_min_max() {
     }
 
     let hits = db.query(
-        "MATCH ('root/r')-[:link]->(n)
-         RETURN MIN(n.v) AS min_v, MAX(n.v) AS max_v"
+        "SELECT MIN(n.v) AS min_v, MAX(n.v) AS max_v \
+         FROM MATCH ('root/r')-[:link]->(n)"
     ).unwrap().collect();
     // No GROUP BY → 3 flat rows, min/max evaluated over single-element group each
     assert_eq!(hits.len(), 3);
@@ -3459,8 +3459,9 @@ fn edge_intrinsic_depth() {
 
     // 2-hop path: melbourne -[r1]-> richmond -[r2]-> hawthorn
     let hits = db.query(
-        "MATCH (s:suburbs)-[r:adjacent]->(h1:suburbs)-[r2:adjacent]->(h2:suburbs) \
-         WHERE s._key = 'melbourne' RETURN h2._key AS dest, r2._depth AS depth"
+        "SELECT h2._key AS dest, r2._depth AS depth \
+         FROM MATCH (s:suburbs)-[r:adjacent]->(h1:suburbs)-[r2:adjacent]->(h2:suburbs) \
+         WHERE s._key = 'melbourne'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
@@ -3479,8 +3480,9 @@ fn edge_intrinsic_path_keys() {
     db.link("suburbs/collingwood","suburbs/richmond",    "borders", 1.0);
 
     let hits = db.query(
-        "MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
-         WHERE a._key = 'fitzroy' RETURN c._key AS dest, r2._path_keys AS path"
+        "SELECT c._key AS dest, r2._path_keys AS path \
+         FROM MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
+         WHERE a._key = 'fitzroy'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
@@ -3502,8 +3504,9 @@ fn edge_intrinsic_strength_aggregates() {
     db.link("suburbs/west", "streets/main",  "contains", 0.4);
 
     let hits = db.query(
-        "MATCH (e:events)-[:affects]->(s:suburbs)-[r:contains]->(st:streets) \
-         WHERE e._key = 'flood' RETURN st._key AS street, r._avg_strength AS avg_s, r._min_strength AS min_s"
+        "SELECT st._key AS street, r._avg_strength AS avg_s, r._min_strength AS min_s \
+         FROM MATCH (e:events)-[:affects]->(s:suburbs)-[r:contains]->(st:streets) \
+         WHERE e._key = 'flood'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
@@ -3554,26 +3557,29 @@ fn setup_path_db() -> CoreDB {
 fn shortest_path_returns_correct_route() {
     let db = setup_path_db();
 
-    let result = db
-        .path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/coby' AND b._key = 'characters/sabo'")
-        .expect("path query must not error")
-        .expect("path must exist");
+    // SELECT FROM MATCH SHORTEST — path row: a=start, b=end, r=path object
+    let hits = db.query(
+        "SELECT a.name AS from_name, b.name AS to_name, r.length AS hops, r._path_keys AS path \
+         FROM MATCH SHORTEST (a)-[r*]->(b) \
+         WHERE a._key = 'characters/coby' AND b._key = 'characters/sabo'"
+    ).unwrap().collect();
+
+    assert_eq!(hits.len(), 1, "should find a path");
+    let p = hits[0].payload.as_ref().unwrap();
 
     // Endpoints
-    assert_eq!(result.nodes.first().unwrap().slug, "characters/coby");
-    assert_eq!(result.nodes.last().unwrap().slug, "characters/sabo");
+    assert_eq!(p["from_name"].as_str().unwrap(), "Coby");
+    assert_eq!(p["to_name"].as_str().unwrap(), "Sabo");
 
     // Shortest path is 2 hops: coby → luffy → sabo
-    assert_eq!(result.length, 2, "expected 2 hops");
-    assert_eq!(result.edges.len(), 2);
-    assert_eq!(result.nodes.len(), 3);
+    assert_eq!(p["hops"].as_i64().unwrap(), 2, "expected 2 hops");
 
-    // Edge types on the 2-hop path
-    assert_eq!(result.edges[0].edge_type.as_deref(), Some("knows"));
-    assert_eq!(result.edges[1].edge_type.as_deref(), Some("crew"));
-
-    // Intermediate node
-    assert_eq!(result.nodes[1].slug, "characters/luffy");
+    // Path keys: coby, luffy, sabo
+    let path = p["path"].as_array().unwrap();
+    assert_eq!(path.len(), 3);
+    assert_eq!(path[0].as_str().unwrap(), "characters/coby");
+    assert_eq!(path[1].as_str().unwrap(), "characters/luffy");
+    assert_eq!(path[2].as_str().unwrap(), "characters/sabo");
 }
 
 #[test]
@@ -3581,26 +3587,31 @@ fn shortest_path_no_path_returns_none() {
     let db = setup_path_db();
 
     // sabo has no outgoing edges in our graph, so sabo → coby is impossible
-    let result = db
-        .path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/sabo' AND b._key = 'characters/coby'")
-        .expect("path query must not error");
+    let hits = db.query(
+        "SELECT a.name AS from_name, b.name AS to_name \
+         FROM MATCH SHORTEST (a)-[r*]->(b) \
+         WHERE a._key = 'characters/sabo' AND b._key = 'characters/coby'"
+    ).unwrap().collect();
 
-    assert!(result.is_none(), "expected None when no path exists");
+    assert!(hits.is_empty(), "expected 0 rows when no path exists");
 }
 
 #[test]
 fn shortest_path_same_node_returns_zero_hops() {
     let db = setup_path_db();
 
-    let result = db
-        .path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/luffy' AND b._key = 'characters/luffy'")
-        .expect("path query must not error")
-        .expect("same-node path must be Some");
+    let hits = db.query(
+        "SELECT r.length AS hops, r._path_keys AS path \
+         FROM MATCH SHORTEST (a)-[r*]->(b) \
+         WHERE a._key = 'characters/luffy' AND b._key = 'characters/luffy'"
+    ).unwrap().collect();
 
-    assert_eq!(result.length, 0);
-    assert_eq!(result.nodes.len(), 1);
-    assert!(result.edges.is_empty());
-    assert_eq!(result.nodes[0].slug, "characters/luffy");
+    assert_eq!(hits.len(), 1, "same-node path must return 1 row");
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["hops"].as_i64().unwrap(), 0);
+    let path = p["path"].as_array().unwrap();
+    assert_eq!(path.len(), 1);
+    assert_eq!(path[0].as_str().unwrap(), "characters/luffy");
 }
 
 #[test]
@@ -3608,11 +3619,13 @@ fn shortest_path_missing_node_returns_none() {
     let db = setup_path_db();
 
     // "characters/zoro" was never inserted
-    let result = db
-        .path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/coby' AND b._key = 'characters/zoro'")
-        .expect("path query must not error");
+    let hits = db.query(
+        "SELECT a.name AS from_name, b.name AS to_name \
+         FROM MATCH SHORTEST (a)-[r*]->(b) \
+         WHERE a._key = 'characters/coby' AND b._key = 'characters/zoro'"
+    ).unwrap().collect();
 
-    assert!(result.is_none(), "expected None when target node doesn't exist");
+    assert!(hits.is_empty(), "expected 0 rows when target node doesn't exist");
 }
 
 // ── Target 8: SELECT … FROM MATCH ────────────────────────────────────────────
@@ -3657,9 +3670,9 @@ fn path_product() {
     db.link("suburbs/west", "streets/main",  "contains", 0.4);
 
     let hits = db.query(
-        "MATCH (e:events)-[:affects]->(s:suburbs)-[r:contains]->(st:streets) \
-         WHERE e._key = 'flood' \
-         RETURN PATH_PRODUCT(r._path_strength) AS prod"
+        "SELECT PATH_PRODUCT(r._path_strength) AS prod \
+         FROM MATCH (e:events)-[:affects]->(s:suburbs)-[r:contains]->(st:streets) \
+         WHERE e._key = 'flood'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty(), "should have at least one path row");
@@ -3680,9 +3693,9 @@ fn path_first_last() {
     db.link("suburbs/collingwood", "suburbs/richmond",    "borders", 1.0);
 
     let hits = db.query(
-        "MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
-         WHERE a._key = 'fitzroy' \
-         RETURN PATH_FIRST(r2._path_keys) AS first_stop, PATH_LAST(r2._path_keys) AS last_stop"
+        "SELECT PATH_FIRST(r2._path_keys) AS first_stop, PATH_LAST(r2._path_keys) AS last_stop \
+         FROM MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
+         WHERE a._key = 'fitzroy'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
@@ -3705,10 +3718,10 @@ fn case_when_depth() {
 
     // Two-hop path ends at hawthorn with r2._depth = 2
     let hits = db.query(
-        "MATCH (s:suburbs)-[r:adjacent]->(h1:suburbs)-[r2:adjacent]->(h2:suburbs) \
-         WHERE s._key = 'melbourne' \
-         RETURN h2._key AS dest, \
-                CASE WHEN r2._depth = 1 THEN 'close' WHEN r2._depth = 2 THEN 'far' ELSE 'unknown' END AS proximity"
+        "SELECT h2._key AS dest, \
+                CASE WHEN r2._depth = 1 THEN 'close' WHEN r2._depth = 2 THEN 'far' ELSE 'unknown' END AS proximity \
+         FROM MATCH (s:suburbs)-[r:adjacent]->(h1:suburbs)-[r2:adjacent]->(h2:suburbs) \
+         WHERE s._key = 'melbourne'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
@@ -3726,9 +3739,9 @@ fn now_returns_integer() {
     db.link("suburbs/fitzroy", "suburbs/collingwood", "borders", 1.0);
 
     let hits = db.query(
-        "MATCH (a:suburbs)-[r:borders]->(b:suburbs) \
-         WHERE a._key = 'fitzroy' \
-         RETURN NOW() AS ts"
+        "SELECT NOW() AS ts \
+         FROM MATCH (a:suburbs)-[r:borders]->(b:suburbs) \
+         WHERE a._key = 'fitzroy'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
@@ -3748,13 +3761,119 @@ fn json_array_length() {
     db.link("suburbs/collingwood", "suburbs/richmond",    "borders", 1.0);
 
     let hits = db.query(
-        "MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
-         WHERE a._key = 'fitzroy' \
-         RETURN JSON_ARRAY_LENGTH(r2._path_keys) AS path_len"
+        "SELECT JSON_ARRAY_LENGTH(r2._path_keys) AS path_len \
+         FROM MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
+         WHERE a._key = 'fitzroy'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
     let p = hits[0].payload.as_ref().unwrap();
     // path: fitzroy, collingwood, richmond → length 3
     assert_eq!(p["path_len"].as_i64().unwrap(), 3);
+}
+
+// ── Path predicates on MATCH SHORTEST ────────────────────────────────────────
+
+/// ANY predicate: at least one path node satisfies the condition → 1 row returned.
+/// Path coby → luffy → sabo contains "Luffy" → ANY(n.name = 'Luffy') passes.
+#[test]
+fn shortest_with_any_predicate() {
+    let db = setup_path_db();
+
+    let hits = db.query(
+        "SELECT r.length AS hops \
+         FROM MATCH SHORTEST (a)-[r*]->(b) \
+         WHERE a._key = 'characters/coby' AND b._key = 'characters/sabo' \
+         AND ANY(n IN nodes(r) WHERE n.name = 'Luffy')"
+    ).unwrap().collect();
+
+    assert_eq!(hits.len(), 1, "ANY should pass — Luffy is on the path");
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["hops"].as_i64().unwrap(), 2);
+}
+
+/// ALL predicate: every path node must satisfy condition — fails when it doesn't.
+/// Path coby → luffy → sabo; not all nodes are named 'Coby' → 0 rows.
+#[test]
+fn shortest_with_all_predicate() {
+    let db = setup_path_db();
+
+    let hits = db.query(
+        "SELECT r.length AS hops \
+         FROM MATCH SHORTEST (a)-[r*]->(b) \
+         WHERE a._key = 'characters/coby' AND b._key = 'characters/sabo' \
+         AND ALL(n IN nodes(r) WHERE n.name = 'Coby')"
+    ).unwrap().collect();
+
+    assert!(hits.is_empty(), "ALL should fail — not every node is named Coby");
+}
+
+// ── Multi-FROM cross-join ─────────────────────────────────────────────────────
+
+/// Two independent MATCH sources are cross-joined: 2 × 3 = 6 rows.
+#[test]
+fn multi_from_two_matches() {
+    let mut db = CoreDB::new();
+    db.put("root1/r1", r#"{"_collection":"root1","_key":"r1"}"#).unwrap();
+    db.put("root2/r2", r#"{"_collection":"root2","_key":"r2"}"#).unwrap();
+    for i in 1..=2 {
+        db.put(&format!("alpha/a{i}"), &format!(r#"{{"_collection":"alpha","_key":"a{i}"}}"#)).unwrap();
+        db.link("root1/r1", &format!("alpha/a{i}"), "has", 1.0);
+    }
+    for i in 1..=3 {
+        db.put(&format!("beta/b{i}"), &format!(r#"{{"_collection":"beta","_key":"b{i}"}}"#)).unwrap();
+        db.link("root2/r2", &format!("beta/b{i}"), "has", 1.0);
+    }
+
+    let hits = db.query(
+        "SELECT a._key AS ak, b._key AS bk \
+         FROM MATCH ('root1/r1')-[:has]->(a), MATCH ('root2/r2')-[:has]->(b)"
+    ).unwrap().collect();
+
+    assert_eq!(hits.len(), 6, "2 × 3 Cartesian product = 6 rows");
+}
+
+/// MATCH source cross-joined with a collection source: 2 events × 3 suburbs = 6 rows.
+#[test]
+fn multi_from_match_and_collection() {
+    let mut db = CoreDB::new();
+    db.put("root/r", r#"{"_collection":"root","_key":"r"}"#).unwrap();
+    for k in ["flood", "storm"] {
+        db.put(&format!("events/{k}"), &format!(r#"{{"_collection":"events","_key":"{k}"}}"#)).unwrap();
+        db.link("root/r", &format!("events/{k}"), "caused", 1.0);
+    }
+    for s in ["fitzroy", "richmond", "hawthorn"] {
+        db.put(&format!("suburbs/{s}"), &format!(r#"{{"_collection":"suburbs","_key":"{s}"}}"#)).unwrap();
+    }
+
+    let hits = db.query(
+        "SELECT e._key AS event, s._key AS suburb \
+         FROM MATCH ('root/r')-[:caused]->(e), suburbs AS s"
+    ).unwrap().collect();
+
+    assert_eq!(hits.len(), 6, "2 events × 3 suburbs = 6 rows");
+}
+
+/// MATCH source cross-joined with MATCH SHORTEST: 2 towns × 1 shortest row = 2 rows.
+#[test]
+fn multi_from_match_and_shortest() {
+    let mut db = setup_path_db();
+    db.put("towns/mel", r#"{"_collection":"towns","_key":"mel"}"#).unwrap();
+    db.put("towns/syd", r#"{"_collection":"towns","_key":"syd"}"#).unwrap();
+    db.put("root_n/r",  r#"{"_collection":"root_n","_key":"r"}"#).unwrap();
+    db.link("root_n/r", "towns/mel", "near", 1.0);
+    db.link("root_n/r", "towns/syd", "near", 1.0);
+
+    let hits = db.query(
+        "SELECT t._key AS town, p.length AS hops \
+         FROM MATCH ('root_n/r')-[:near]->(t), \
+              MATCH SHORTEST (x)-[p*]->(y) WHERE x._key = 'characters/coby' AND y._key = 'characters/sabo'"
+    ).unwrap().collect();
+
+    // 2 towns × 1 shortest-path row = 2 rows; each carries the path length
+    assert_eq!(hits.len(), 2, "2 towns × 1 shortest path = 2 rows");
+    for hit in &hits {
+        let p = hit.payload.as_ref().unwrap();
+        assert_eq!(p["hops"].as_i64().unwrap(), 2, "coby→sabo shortest path = 2 hops");
+    }
 }

@@ -2257,6 +2257,70 @@ pub struct CaseCond {
     pub val: Value,
 }
 
+/// A simple field comparison condition used in path predicates.
+#[derive(Clone, Debug)]
+pub struct SimpleCond {
+    pub field: String,
+    pub op:    CmpOp,
+    pub val:   Value,
+}
+
+/// A path predicate applied to the nodes in a `MATCH SHORTEST` result.
+#[derive(Clone, Debug)]
+pub enum PathPredicate {
+    /// At least one node satisfies the condition.
+    Any    { var: String, cond: SimpleCond },
+    /// Every node satisfies the condition.
+    All    { var: String, cond: SimpleCond },
+    /// No node satisfies the condition.
+    None_  { var: String, cond: SimpleCond },
+    /// Exactly one node satisfies the condition.
+    Single { var: String, cond: SimpleCond },
+}
+
+/// A compiled `SELECT … FROM MATCH SHORTEST` statement.
+#[derive(Clone, Debug)]
+pub struct ShortestSelectStmt {
+    /// Full slug of the start node (e.g. `"characters/coby"`).
+    pub from_slug:  String,
+    /// Full slug of the end node.
+    pub to_slug:    String,
+    /// Variable name bound to the start node in the SELECT list.
+    pub start_bind: String,
+    /// Variable name bound to the end node in the SELECT list.
+    pub end_bind:   String,
+    /// Optional variable name bound to the path object (`nodes`, `edges`, `length`, intrinsics).
+    pub path_bind:  Option<String>,
+    /// SELECT expressions: `(expression, output_alias)`.
+    pub returns:    Vec<(MatchAggReturn, String)>,
+    /// Path predicates applied after BFS (ANY/ALL/NONE/SINGLE).
+    pub predicates: Vec<PathPredicate>,
+    /// Optional ORDER BY.
+    pub order_by:   Option<(String, bool)>,
+    /// Optional LIMIT.
+    pub limit:      Option<usize>,
+}
+
+/// A source in a multi-FROM query.
+#[derive(Clone, Debug)]
+pub enum FromSource {
+    /// `FROM MATCH (a:col)-[r:edge]->(b:col) [WHERE …]`
+    Match(MatchAggStmt),
+    /// `FROM MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'x' AND b._key = 'y'`
+    Shortest(ShortestSelectStmt),
+    /// `FROM collection_name [AS alias]`
+    Collection { alias: String, name_hash: u64 },
+}
+
+/// A compiled `SELECT … FROM source1, source2, …` multi-FROM statement.
+#[derive(Clone, Debug)]
+pub struct MultiFromStmt {
+    pub sources:  Vec<FromSource>,
+    pub returns:  Vec<(MatchAggReturn, String)>,
+    pub order_by: Option<(String, bool)>,
+    pub limit:    Option<usize>,
+}
+
 /// Return expression in a MATCH aggregate RETURN clause.
 #[derive(Clone, Debug)]
 pub enum MatchAggReturn {
@@ -2709,6 +2773,222 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
         .into_iter()
         .map(|v| Hit { slug: String::new(), slug_hash: 0, payload: Some(v) })
         .collect()
+}
+
+// ── execute_shortest_select ───────────────────────────────────────────────────
+
+/// Build the single `PathRow` for a `SELECT … FROM MATCH SHORTEST` result.
+/// Returns `None` when no path exists (BFS returned nothing).
+fn build_shortest_path_row(
+    db: &CoreDB,
+    stmt: &ShortestSelectStmt,
+) -> Option<PathRow> {
+    use crate::sk_hash;
+
+    let start = sk_hash(&stmt.from_slug);
+    let end   = sk_hash(&stmt.to_slug);
+    let pr    = db.bfs_shortest_path(start, end)?;
+
+    let mut row: PathRow = HashMap::new();
+
+    // Bind start node
+    if let Some(node) = db.node_data(start) {
+        row.insert(stmt.start_bind.clone(), node.payload.clone());
+    }
+
+    // Bind end node
+    if let Some(node) = db.node_data(end) {
+        row.insert(stmt.end_bind.clone(), node.payload.clone());
+    }
+
+    // Bind path object when path_bind is set
+    if let Some(ref pb) = stmt.path_bind {
+        let node_slugs: Vec<Value> = pr.nodes.iter()
+            .map(|n| Value::String(n.slug.clone()))
+            .collect();
+        let strengths: Vec<Value> = pr.edges.iter()
+            .map(|e| serde_json::json!(e.strength))
+            .collect();
+        let edges_arr: Vec<Value> = pr.edges.iter()
+            .map(|e| serde_json::json!({
+                "from":     e.from_slug,
+                "to":       e.to_slug,
+                "type":     e.edge_type,
+                "strength": e.strength,
+            }))
+            .collect();
+        let path_obj = serde_json::json!({
+            "nodes":          &node_slugs,
+            "edges":          &edges_arr,
+            "length":         pr.length,
+            "_path_keys":     &node_slugs,
+            "_path_strength": &strengths,
+        });
+        row.insert(pb.clone(), path_obj);
+    }
+
+    Some(row)
+}
+
+/// Evaluate a `PathPredicate` against the path stored in `row`.
+///
+/// `nodes(path_bind)` provides the list of node slugs; we load each from DB
+/// to evaluate the field condition.
+fn eval_path_predicate(db: &CoreDB, pred: &PathPredicate, row: &PathRow) -> bool {
+    let (var, cond) = match pred {
+        PathPredicate::Any    { var, cond } => (var, cond),
+        PathPredicate::All    { var, cond } => (var, cond),
+        PathPredicate::None_  { var, cond } => (var, cond),
+        PathPredicate::Single { var, cond } => (var, cond),
+    };
+
+    // Collect node slugs from the path object stored in `row` under `var`
+    let slugs: Vec<String> = row
+        .get(var.as_str())
+        .and_then(|v| v.get("_path_keys"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    let matches: Vec<bool> = slugs.iter().map(|slug| {
+        let hash = crate::sk_hash(slug);
+        if let Some(node) = db.node_data(hash) {
+            let actual = node.payload.get(&cond.field).cloned().unwrap_or(Value::Null);
+            eval_cmp(&actual, &cond.op, &cond.val)
+        } else {
+            false
+        }
+    }).collect();
+
+    match pred {
+        PathPredicate::Any    { .. } => matches.iter().any(|&b| b),
+        PathPredicate::All    { .. } => !matches.is_empty() && matches.iter().all(|&b| b),
+        PathPredicate::None_  { .. } => matches.iter().all(|&b| !b),
+        PathPredicate::Single { .. } => matches.iter().filter(|&&b| b).count() == 1,
+    }
+}
+
+/// Shared ORDER BY + LIMIT + Hit-wrapping finalizer used by shortest and multi-from executors.
+fn finalize_rows(
+    mut result_rows: Vec<Value>,
+    order_by: Option<&(String, bool)>,
+    limit: Option<usize>,
+) -> Vec<Hit> {
+    if let Some((ref field, ascending)) = order_by {
+        result_rows.sort_by(|a, b| {
+            let va = a.get(field.as_str()).and_then(|v| v.as_f64());
+            let vb = b.get(field.as_str()).and_then(|v| v.as_f64());
+            let ord = match (va, vb) {
+                (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, None) => {
+                    let sa = a.get(field.as_str()).map(|v| v.to_string()).unwrap_or_default();
+                    let sb = b.get(field.as_str()).map(|v| v.to_string()).unwrap_or_default();
+                    sa.cmp(&sb)
+                }
+            };
+            if *ascending { ord } else { ord.reverse() }
+        });
+    }
+    if let Some(n) = limit { result_rows.truncate(n); }
+    result_rows
+        .into_iter()
+        .map(|v| Hit { slug: String::new(), slug_hash: 0, payload: Some(v) })
+        .collect()
+}
+
+/// Execute a `SELECT … FROM MATCH SHORTEST` statement.
+///
+/// Returns 0 rows when no path exists, 1 row when found (after predicate filtering).
+pub fn execute_shortest_select(db: &CoreDB, stmt: ShortestSelectStmt) -> Vec<Hit> {
+    let row = match build_shortest_path_row(db, &stmt) {
+        Some(r) => r,
+        None    => return vec![],
+    };
+
+    // Apply path predicates
+    for pred in &stmt.predicates {
+        if !eval_path_predicate(db, pred, &row) {
+            return vec![];
+        }
+    }
+
+    // eval_group for each return expr over the single row
+    let rows_slice: &[PathRow] = std::slice::from_ref(&row);
+    let mut map = serde_json::Map::new();
+    for (ret_expr, alias) in &stmt.returns {
+        map.insert(alias.clone(), ret_expr.eval_group(rows_slice));
+    }
+
+    finalize_rows(vec![Value::Object(map)], stmt.order_by.as_ref(), stmt.limit)
+}
+
+// ── execute_multi_from ────────────────────────────────────────────────────────
+
+/// Compute the Cartesian product of multiple sets of `PathRow`s.
+fn cartesian_product(sources: Vec<Vec<PathRow>>) -> Vec<PathRow> {
+    sources.into_iter().fold(vec![HashMap::new()], |acc, source| {
+        let mut result = Vec::with_capacity(acc.len() * source.len().max(1));
+        for existing_row in &acc {
+            for src_row in &source {
+                let mut merged = existing_row.clone();
+                merged.extend(src_row.iter().map(|(k, v)| (k.clone(), v.clone())));
+                result.push(merged);
+            }
+        }
+        result
+    })
+}
+
+/// Execute a `SELECT … FROM source1, source2, …` multi-FROM statement.
+///
+/// Each source is executed independently; rows are cross-joined (Cartesian product).
+pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
+    let source_rows: Vec<Vec<PathRow>> = stmt.sources.into_iter().map(|src| match src {
+        FromSource::Match(agg) => {
+            let starts: Vec<u64> = match agg.start {
+                MatchAggStart::Slug(h)       => if db.node_data(h).is_some() { vec![h] } else { vec![] },
+                MatchAggStart::Collection(h) => db.collection_members(h).cloned().unwrap_or_default(),
+                MatchAggStart::All           => db.all_hashes(),
+            };
+            collect_paths(db, &starts, &agg.hops)
+        }
+        FromSource::Shortest(s) => {
+            match build_shortest_path_row(db, &s) {
+                Some(row) => vec![row],
+                None      => vec![],
+            }
+        }
+        FromSource::Collection { alias, name_hash } => {
+            db.collection_members(name_hash)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|h| {
+                    let node = db.node_data(h)?;
+                    let mut row: PathRow = HashMap::new();
+                    row.insert(alias.clone(), node.payload.clone());
+                    Some(row)
+                })
+                .collect()
+        }
+    }).collect();
+
+    let all_rows = cartesian_product(source_rows);
+    if all_rows.is_empty() {
+        return vec![];
+    }
+
+    let result_rows: Vec<Value> = all_rows.into_iter().map(|row| {
+        let mut map = serde_json::Map::new();
+        for (ret_expr, alias) in &stmt.returns {
+            map.insert(alias.clone(), ret_expr.eval_group(std::slice::from_ref(&row)));
+        }
+        Value::Object(map)
+    }).collect();
+
+    finalize_rows(result_rows, stmt.order_by.as_ref(), stmt.limit)
 }
 
 fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {

@@ -39,7 +39,7 @@ pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
 
 pub use pipeline::Pipeline;
 pub use query::{Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step};
-pub use sql::{CompiledMutation, CompiledPathQuery, EdgeDelete, EdgeInsert, SqlError, TableSchema};
+pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, SqlError, TableSchema};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -138,22 +138,15 @@ pub struct EdgeHit {
     pub meta: Option<Value>,
 }
 
-// ── PathResult ────────────────────────────────────────────────────────────────
+// ── BfsPath (internal only) ───────────────────────────────────────────────────
 
-/// The result of a `MATCH SHORTEST` query: an ordered chain of nodes and
-/// edges from `start` to `end` (inclusive on both ends).
-///
-/// - `nodes[i]` and `nodes[i+1]` are connected by `edges[i]`.
-/// - `length` is the hop count (`edges.len()`).
-/// - When `start == end`, `nodes` has one entry and `edges` is empty.
+/// Internal result of `bfs_shortest_path`. Not part of the public API.
+/// Use `db.query("SELECT … FROM MATCH SHORTEST …")` instead.
 #[derive(Debug, Clone)]
-pub struct PathResult {
-    /// Ordered nodes: index 0 is the start node, last is the end node.
-    pub nodes: Vec<query::Hit>,
-    /// Ordered edges: `edges[i]` connects `nodes[i]` → `nodes[i+1]`.
-    pub edges: Vec<EdgeHit>,
-    /// Hop count — equals `edges.len()`.
-    pub length: usize,
+pub(crate) struct BfsPath {
+    pub(crate) nodes: Vec<query::Hit>,
+    pub(crate) edges: Vec<EdgeHit>,
+    pub(crate) length: usize,
 }
 
 // ── CoreDB ────────────────────────────────────────────────────────────────────
@@ -1634,15 +1627,20 @@ impl CoreDB {
     /// -- Standard SELECT
     /// SELECT * FROM collection [WHERE ...] [ORDER BY ...] [LIMIT n]
     ///
-    /// -- MATCH aggregate (RETURN form)
-    /// MATCH (a:col)-[r:edge]->(b:col) [WHERE a._key = 'val']
-    /// RETURN b._key AS name, SUM(r.weight) AS total
-    /// [GROUP BY b._key] [ORDER BY total DESC] [LIMIT n]
-    ///
-    /// -- SELECT … FROM MATCH (SQL-first form, identical execution path)
+    /// -- Graph aggregate
     /// SELECT b._key AS name, SUM(r.weight) AS total
     /// FROM MATCH (a:col)-[r:edge]->(b:col) [WHERE a._key = 'val']
     /// [GROUP BY b._key] [ORDER BY total DESC] [LIMIT n]
+    ///
+    /// -- Shortest path (0 rows = unreachable, 1 row = found)
+    /// SELECT a.field AS from_f, b.field AS to_f, r.length AS hops
+    /// FROM MATCH SHORTEST (a)-[r*]->(b)
+    /// WHERE a._key = 'start/slug' AND b._key = 'end/slug'
+    /// [AND ANY(n IN nodes(r) WHERE n.field op val)]
+    ///
+    /// -- Multi-FROM cross-join
+    /// SELECT a.field AS af, b.field AS bf
+    /// FROM MATCH (a:col)-[:edge]->(b), collection_name AS alias
     ///
     /// -- Supported return expressions
     /// var.field | COUNT(*) | SUM(math) | AVG(math) | MIN(math) | MAX(math)
@@ -1669,6 +1667,14 @@ impl CoreDB {
         match sql::parse_match_or_agg(sql)? {
             sql::MatchOrAgg::Agg(stmt) => {
                 let hits = query::execute_match_agg(self, stmt);
+                Ok(Set::from_hits(self, hits))
+            }
+            sql::MatchOrAgg::Shortest(stmt) => {
+                let hits = query::execute_shortest_select(self, stmt);
+                Ok(Set::from_hits(self, hits))
+            }
+            sql::MatchOrAgg::MultiFrom(stmt) => {
+                let hits = query::execute_multi_from(self, stmt);
                 Ok(Set::from_hits(self, hits))
             }
             sql::MatchOrAgg::Steps(steps) => {
@@ -1703,8 +1709,8 @@ impl CoreDB {
     /// each hop so the path can be reconstructed.
     ///
     /// Returns `None` when no path exists.
-    /// Returns a zero-hop `PathResult` when `start == end`.
-    fn bfs_shortest_path(&self, start: u64, end: u64) -> Option<PathResult> {
+    /// Returns a zero-hop `BfsPath` when `start == end`.
+    pub(crate) fn bfs_shortest_path(&self, start: u64, end: u64) -> Option<BfsPath> {
         use std::collections::{HashMap, VecDeque};
 
         // Sentinel: parent for the start node points to itself with a zero
@@ -1721,7 +1727,7 @@ impl CoreDB {
                     slug_hash: start,
                     payload: Some(node.payload.clone()),
                 };
-                return Some(PathResult { nodes: vec![hit], edges: vec![], length: 0 });
+                return Some(BfsPath { nodes: vec![hit], edges: vec![], length: 0 });
             } else {
                 return None; // start node doesn't exist
             }
@@ -1786,7 +1792,7 @@ impl CoreDB {
                             .collect();
 
                         let length = edges.len();
-                        return Some(PathResult { nodes, edges, length });
+                        return Some(BfsPath { nodes, edges, length });
                     }
                     queue.push_back(e.other);
                 }
@@ -1794,27 +1800,6 @@ impl CoreDB {
         }
 
         None // no path found
-    }
-
-    /// Execute a `MATCH SHORTEST` path query.
-    ///
-    /// Returns the shortest BFS path between two nodes, or `None` if no path
-    /// exists. The SQL syntax is:
-    ///
-    /// ```text
-    /// MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'from_slug' AND b._key = 'to_slug'
-    /// ```
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] if the SQL is syntactically invalid.
-    pub fn path_query(&self, sql: &str) -> Result<Option<PathResult>, SqlError> {
-        match sql::parse_path_query(sql)? {
-            sql::CompiledPathQuery::ShortestPath { from_slug, to_slug } => {
-                let start = sk_hash(&from_slug);
-                let end = sk_hash(&to_slug);
-                Ok(self.bfs_shortest_path(start, end))
-            }
-        }
     }
 
     /// Execute a `SHOW` introspection statement.

@@ -45,7 +45,7 @@ class DataFrameAccessor:
         If a node has no payload, a row with only ``_slug`` is emitted.
 
         Args:
-            sql:        Any SELECT, MATCH … RETURN, or SELECT … FROM MATCH query.
+            sql:        Any SELECT or SELECT … FROM MATCH query.
             index_col:  If provided, set this column as the DataFrame index.
 
         Supported query forms::
@@ -53,14 +53,7 @@ class DataFrameAccessor:
             # Standard SELECT
             db.df.query("SELECT * FROM venues LIMIT 100")
 
-            # MATCH aggregate — RETURN form
-            db.df.query(\"\"\"
-                MATCH (a:bands)-[r:played_at]->(b:venues)
-                RETURN b._key AS venue, COUNT(a) AS plays
-                GROUP BY b._key ORDER BY plays DESC
-            \"\"\")
-
-            # SELECT FROM MATCH — SQL-first form (identical result)
+            # Graph aggregate
             db.df.query(\"\"\"
                 SELECT b._key AS venue, COUNT(a) AS plays
                 FROM MATCH (a:bands)-[r:played_at]->(b:venues)
