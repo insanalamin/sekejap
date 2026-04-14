@@ -4,6 +4,7 @@ use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 
 use ::sekejap::CoreDB;
+use ::sekejap::EdgeHit;
 use ::sekejap::Hit;
 
 // ── PyHit ─────────────────────────────────────────────────────────────────────
@@ -38,6 +39,79 @@ fn to_pyhit(h: Hit) -> PyHit {
     PyHit {
         slug: h.slug,
         payload: h.payload.as_ref().map(|v| v.to_string()),
+    }
+}
+
+// ── PyEdgeHit ─────────────────────────────────────────────────────────────────
+
+/// A resolved edge returned from :meth:`DB.path_query`.
+///
+/// Attributes:
+///     from_slug (str | None): Slug of the source node.
+///     to_slug (str | None): Slug of the target node.
+///     edge_type (str | None): Human-readable edge type label, e.g. ``"route_to"``.
+///     strength (float): Edge weight.
+///     meta_json (str | None): Raw JSON string of edge metadata, or ``None``.
+///         Parse with ``json.loads(hit.meta_json)``.
+#[pyclass(name = "EdgeHit")]
+#[derive(Clone)]
+pub struct PyEdgeHit {
+    #[pyo3(get)]
+    pub from_slug: Option<String>,
+    #[pyo3(get)]
+    pub to_slug: Option<String>,
+    #[pyo3(get)]
+    pub edge_type: Option<String>,
+    #[pyo3(get)]
+    pub strength: f32,
+    #[pyo3(get)]
+    pub meta_json: Option<String>,
+}
+
+#[pymethods]
+impl PyEdgeHit {
+    fn __repr__(&self) -> String {
+        format!(
+            "EdgeHit(from={:?}, to={:?}, type={:?}, strength={})",
+            self.from_slug, self.to_slug, self.edge_type, self.strength
+        )
+    }
+}
+
+fn to_pyedgehit(e: EdgeHit) -> PyEdgeHit {
+    PyEdgeHit {
+        from_slug: e.from_slug,
+        to_slug: e.to_slug,
+        edge_type: e.edge_type,
+        strength: e.strength,
+        meta_json: e.meta.as_ref().map(|v| v.to_string()),
+    }
+}
+
+// ── PyPathResult ──────────────────────────────────────────────────────────────
+
+/// The result of a :meth:`DB.path_query` call.
+///
+/// Attributes:
+///     nodes (list[Hit]): Ordered nodes from start to end (inclusive).
+///     edges (list[EdgeHit]): Ordered edges — ``edges[i]`` connects
+///         ``nodes[i]`` to ``nodes[i+1]``.
+///     length (int): Hop count — equals ``len(edges)``.
+#[pyclass(name = "PathResult")]
+#[derive(Clone)]
+pub struct PyPathResult {
+    #[pyo3(get)]
+    pub nodes: Vec<PyHit>,
+    #[pyo3(get)]
+    pub edges: Vec<PyEdgeHit>,
+    #[pyo3(get)]
+    pub length: usize,
+}
+
+#[pymethods]
+impl PyPathResult {
+    fn __repr__(&self) -> String {
+        format!("PathResult(length={}, nodes={})", self.length, self.nodes.len())
     }
 }
 
@@ -127,9 +201,52 @@ impl PyDB {
 
     // ── SQL ───────────────────────────────────────────────────────────────────
 
-    /// Execute a SELECT / MATCH query. Returns a list of :class:`Hit`.
+    /// Execute a SQL query. Returns a list of :class:`Hit`.
     ///
     /// Each ``hit.payload`` is a raw JSON string — use ``json.loads(hit.payload)``.
+    ///
+    /// Supported forms::
+    ///
+    ///     # Standard SELECT
+    ///     db.query("SELECT * FROM characters WHERE bounty >= 1000000000")
+    ///
+    ///     # MATCH aggregate — RETURN form
+    ///     db.query("""
+    ///         MATCH (a:characters)-[r:rival]->(b:characters)
+    ///         RETURN b._key AS name, COUNT(a) AS rivals
+    ///         GROUP BY b._key ORDER BY rivals DESC LIMIT 10
+    ///     """)
+    ///
+    ///     # SELECT … FROM MATCH — SQL-first form (identical execution path)
+    ///     db.query("""
+    ///         SELECT b._key AS name, COUNT(a) AS rivals
+    ///         FROM MATCH (a:characters)-[r:rival]->(b:characters)
+    ///         GROUP BY b._key ORDER BY rivals DESC LIMIT 10
+    ///     """)
+    ///
+    ///     # PATH_* aggregates — operate on path intrinsic arrays
+    ///     db.query("""
+    ///         MATCH (a:islands)-[r:route_to]->(b:islands)-[r2:route_to]->(c:islands)
+    ///         WHERE a._key = 'marineford'
+    ///         RETURN c._key AS dest, PATH_PRODUCT(r2._path_strength) AS reliability
+    ///     """)
+    ///
+    ///     # CASE WHEN
+    ///     db.query("""
+    ///         MATCH (a:characters)-[r:rival]->(b:characters)
+    ///         RETURN b._key AS name,
+    ///                CASE WHEN r._depth = 1 THEN 'direct' ELSE 'indirect' END AS tier
+    ///     """)
+    ///
+    ///     # Time functions: NOW(), AGE_DAYS(var.field), AGE_HOURS(var.field)
+    ///     db.query("MATCH (a:characters)-[r:rival]->(b:characters) RETURN NOW() AS ts")
+    ///
+    ///     # JSON_ARRAY_LENGTH
+    ///     db.query("""
+    ///         MATCH (a:islands)-[r:route_to*1..3]->(b:islands)
+    ///         WHERE a._key = 'marineford'
+    ///         RETURN b._key AS dest, JSON_ARRAY_LENGTH(r._path_keys) AS stops
+    ///     """)
     fn query(&self, sql: &str) -> PyResult<Vec<PyHit>> {
         let hits: Vec<Hit> = self.db()?.query(sql).map_err(db_err)?.collect();
         Ok(hits.into_iter().map(to_pyhit).collect())
@@ -140,6 +257,33 @@ impl PyDB {
     /// Returns the number of rows affected.
     fn execute(&mut self, sql: &str) -> PyResult<usize> {
         self.db_mut()?.execute(sql).map_err(db_err)
+    }
+
+    /// Execute a ``MATCH SHORTEST`` path query.
+    ///
+    /// Returns a :class:`PathResult` if a path exists between the two nodes,
+    /// or ``None`` if no path is reachable.
+    ///
+    /// The same node in both positions returns a zero-hop result (``length=0``).
+    ///
+    /// Example::
+    ///
+    ///     result = db.path_query(
+    ///         "MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'islands/marineford' AND b._key = 'islands/wano'"
+    ///     )
+    ///     if result:
+    ///         print(f"Shortest route: {result.length} hops")
+    ///         for node in result.nodes:
+    ///             print(" ", node.slug)
+    ///         for edge in result.edges:
+    ///             print(f"  {edge.from_slug} -[{edge.edge_type}]-> {edge.to_slug}")
+    fn path_query(&self, sql: &str) -> PyResult<Option<PyPathResult>> {
+        let result = self.db()?.path_query(sql).map_err(db_err)?;
+        Ok(result.map(|r| PyPathResult {
+            nodes: r.nodes.into_iter().map(to_pyhit).collect(),
+            edges: r.edges.into_iter().map(to_pyedgehit).collect(),
+            length: r.length,
+        }))
     }
 
     /// Execute a MATCH + WITH pipeline query.
@@ -229,5 +373,7 @@ impl PyDB {
 fn sekejap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDB>()?;
     m.add_class::<PyHit>()?;
+    m.add_class::<PyEdgeHit>()?;
+    m.add_class::<PyPathResult>()?;
     Ok(())
 }

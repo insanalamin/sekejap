@@ -294,12 +294,44 @@ SQL (end each statement with ;)
 SELECT * FROM collection [WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n];
 SELECT * FROM ALL [WHERE ...];
 INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...);
-MATCH ('slug')-[:edge]->(a)-[:edge]->(b)
-  RETURN b.field AS alias, SUM(a.score * b.weight) AS total
-  GROUP BY b.field ORDER BY total DESC LIMIT 10;
 UPDATE collection SET field = val [WHERE ...];
 DELETE FROM collection [WHERE ...];
 CREATE TABLE collection (_key TEXT PRIMARY KEY, field TYPE, ...);
+
+Graph edges
+───────────
+INSERT ('from')-[:KIND {{strength: n}}]->('to');
+DELETE ('from')-[:KIND]->('to');
+
+Graph traversal (MATCH)
+───────────────────────
+MATCH (a:col)-[:rel*1..3]->(b:col) WHERE a._key = 'x' RETURN b;
+
+Graph aggregation — RETURN form
+────────────────────────────────
+MATCH (a:col)-[r:edge]->(b:col)
+  RETURN b._key AS name, SUM(r.weight) AS total
+  GROUP BY b._key ORDER BY total DESC LIMIT 10;
+
+Graph aggregation — SELECT … FROM MATCH form (equivalent)
+──────────────────────────────────────────────────────────
+SELECT b._key AS name, SUM(r.weight) AS total
+FROM MATCH (a:col)-[r:edge]->(b:col)
+GROUP BY b._key ORDER BY total DESC LIMIT 10;
+
+Return expressions (RETURN / SELECT list)
+──────────────────────────────────────────
+var.field AS alias
+COUNT(*) | SUM(expr) | AVG(expr) | MIN(expr) | MAX(expr)
+PATH_AVG(r.field) | PATH_SUM | PATH_MIN | PATH_MAX | PATH_PRODUCT
+PATH_FIRST(r.field) | PATH_LAST(r.field)
+CASE WHEN r.field = val THEN 'x' WHEN ... ELSE 'y' END AS alias
+AGE_DAYS(var.field) | AGE_HOURS(var.field) | NOW()
+JSON_ARRAY_LENGTH(var.field)
+
+Shortest path
+─────────────
+db.path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'x' AND b._key = 'y'")
 
 Introspection
 ─────────────
@@ -308,12 +340,6 @@ SHOW EDGES;
 SHOW EDGES FROM collection;
 SHOW EDGES FROM col1 TO col2;
 SHOW <collection>;
-
-Graph edges
-───────────
-INSERT ('from')-[:KIND {{strength: n}}]->('to');
-DELETE ('from')-[:KIND]->('to');
-MATCH (a:col)-[:rel*1..3]->(b:col) WHERE a._key = 'x' RETURN b;
 
 Filters
 ───────
@@ -327,10 +353,14 @@ Spatial
 ───────
 ST_DWithin(geometry, POINT(lon lat), km)
 ST_Contains / ST_Within / ST_Intersects
+ORDER BY -ST_DISTANCE_KM(geometry, POINT(lon lat)) DESC
 
 Vector
 ──────
 WHERE VECTOR_NEAR(field, [f32, ...], k)
+ORDER BY field <=> [f32, ...] ASC     -- cosine nearest-first
+ORDER BY field <-> [f32, ...] ASC     -- L2 nearest-first
+ORDER BY VECTOR_COSINE(field, [...]) * 0.7 + BM25(bio, 'q') * 0.3 DESC
 "#
     );
 }

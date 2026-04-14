@@ -91,11 +91,21 @@ hits = db.query("""
 """)
 
 # ── Aggregate: total route days from Marineford to each destination ───────────
+# Both forms are equivalent — use whichever reads more naturally.
 
 hits = db.query("""
     MATCH (start:islands)-[r:route_to*1..3]->(dest:islands)
     WHERE start._key = 'marineford'
     RETURN dest._key AS island, SUM(r.days) AS total_days
+    GROUP BY dest._key
+    ORDER BY total_days ASC
+""")
+
+# SELECT … FROM MATCH — same query, SQL-first syntax
+hits = db.query("""
+    SELECT dest._key AS island, SUM(r.days) AS total_days
+    FROM MATCH (start:islands)-[r:route_to*1..3]->(dest:islands)
+    WHERE start._key = 'marineford'
     GROUP BY dest._key
     ORDER BY total_days ASC
 """)
@@ -149,8 +159,8 @@ hits = db.query("""
 | B-tree | `btree` | `>`, `<`, `BETWEEN`, `ORDER BY field` |
 | GIN | `gin` | `ILIKE '%pattern%'` (exact trigram postings, no verification step) |
 | Spatial | `spatial` | `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects` |
-| HNSW | `hnsw` | `VECTOR_NEAR(field, [...], k)`, `ORDER BY field <=> [...]` |
-| BM25 | `bm25` | `BM25(field, 'query') > score`, `ORDER BY BM25(...) DESC` |
+| HNSW | `hnsw` | `VECTOR_NEAR(field, [...], k)`, `ORDER BY field <=> [...]`, `VECTOR_COSINE(field, [...])` in score expressions |
+| BM25 | `bm25` | `BM25(field, 'query') > score`, `ORDER BY BM25(...) DESC`, `BM25(...)` in score expressions |
 
 All indexes are built via `CREATE INDEX`:
 
@@ -241,6 +251,49 @@ GROUP BY b._key
 ORDER BY total_strength DESC
 LIMIT 10
 
+-- SELECT … FROM MATCH  (equivalent to MATCH … RETURN, SQL-first syntax)
+SELECT b._key AS name, COUNT(a) AS allies, SUM(r.strength) AS total_strength
+FROM MATCH (a:characters)-[r:collaborated_with]->(b:characters)
+GROUP BY b._key
+ORDER BY total_strength DESC
+LIMIT 10
+
+-- Edge intrinsics: _depth, _path_keys, _path_strength, _avg_strength, _min/_max_strength
+-- Available on any named edge binding (e.g. [r:route_to] or [r*])
+MATCH (start:islands)-[r:route_to]->(stop:islands)-[r2:route_to]->(dest:islands)
+WHERE start._key = 'marineford'
+RETURN dest._key AS island, r2._depth AS hops, r2._path_keys AS route
+
+-- PATH_* aggregates — operate on a JSON array in a path intrinsic field
+-- PATH_AVG, PATH_SUM, PATH_MIN, PATH_MAX, PATH_PRODUCT, PATH_FIRST, PATH_LAST
+MATCH (a:islands)-[r:route_to]->(b:islands)-[r2:route_to]->(c:islands)
+WHERE a._key = 'marineford'
+RETURN c._key AS dest,
+       PATH_PRODUCT(r2._path_strength) AS combined_reliability,
+       PATH_FIRST(r2._path_keys)       AS departure,
+       PATH_LAST(r2._path_keys)        AS arrival
+
+-- CASE WHEN — conditional expression in RETURN / SELECT
+MATCH (a:characters)-[r:rival]->(b:characters)
+RETURN b._key AS name,
+       CASE WHEN r._depth = 1 THEN 'direct'
+            WHEN r._depth = 2 THEN 'indirect'
+            ELSE 'distant'
+       END AS rivalry_type
+
+-- Time expressions: NOW(), AGE_DAYS(var.field), AGE_HOURS(var.field)
+-- NOW() returns current Unix timestamp (seconds as i64)
+-- AGE_DAYS / AGE_HOURS accept a Unix int or "YYYY-MM-DD" string field
+MATCH (a:characters)-[r:rival]->(b:characters)
+RETURN b._key AS name,
+       AGE_DAYS(b.last_seen) AS days_since_seen,
+       NOW()                  AS queried_at
+
+-- JSON_ARRAY_LENGTH — length of a JSON array field
+MATCH (a:islands)-[r:route_to*1..3]->(b:islands)
+WHERE a._key = 'marineford'
+RETURN b._key AS dest, JSON_ARRAY_LENGTH(r._path_keys) AS hops_plus_one
+
 -- Spatial
 SELECT * FROM islands WHERE ST_DWithin(geometry, POINT(0.0 0.0), 500.0)
 SELECT * FROM zones   WHERE ST_Contains(geometry, POINT(144.9671 -37.8183))
@@ -254,6 +307,28 @@ SELECT * FROM characters WHERE name ILIKE '%shanks%'
 -- Full-text (BM25 — relevance-ranked)
 SELECT * FROM papers WHERE BM25(abstract, 'neural network') > 0.3
 ORDER BY BM25(abstract, 'neural network') DESC
+
+-- Arithmetic ORDER BY (weighted multi-signal ranking)
+-- Combine any signals with +, -, *, /, (), and unary negation
+ORDER BY BM25(title, 'pirate') * 0.7 + BM25(bio, 'pirate') * 0.3 DESC
+ORDER BY BM25(title, 'pirate') * 0.5 + bounty * 0.5 DESC
+ORDER BY VECTOR_COSINE(embedding, [0.9, 0.1, 0.0]) * 0.6 + BM25(bio, 'pirate') * 0.4 DESC
+ORDER BY (BM25(title, 'luffy') + BM25(bio, 'luffy')) * 0.8 + threat_level * 0.2 DESC
+
+-- Spatial signal: ST_DISTANCE_KM(geometry_field, POINT(lon lat)) → km (f64)
+-- Negate to rank nearest-first: -ST_DISTANCE_KM(...) DESC
+ORDER BY -ST_DISTANCE_KM(location, POINT(144.9671 -37.8183)) DESC
+
+-- Vector distance operators (compile to same score node as the function forms)
+-- a <=> b  ==  VECTOR_COSINE(a, b)    cosine distance (lower = more similar)
+-- a <-> b  ==  VECTOR_L2(a, b)        Euclidean / L2
+-- a <#> b  ==  VECTOR_DOT(a, b)       inner product (NOT negated, unlike pgvector)
+-- a <+> b  ==  VECTOR_L1(a, b)        Manhattan / L1
+ORDER BY embedding <=> [0.9, 0.1, 0.0] ASC   -- nearest cosine first
+
+-- VECTOR_COSINE(field, [vec]) returns cosine distance (lower = more similar)
+-- Numeric payload fields are coerced to f64 (absent or non-numeric = 0.0)
+-- Default direction for score expressions is DESC (highest score first)
 
 -- Filters
 WHERE bounty BETWEEN 1000000000 AND 4000000000
@@ -269,6 +344,46 @@ SHOW EDGES FROM characters                   -- edge types leaving a collection 
 SHOW EDGES FROM characters TO islands        -- edge types between two collections + counts
 SHOW characters                              -- field structure (declared schema or inferred)
 ```
+
+#### Graph path queries
+
+`MATCH SHORTEST` finds the shortest directed path between two nodes. Call it via `db.path_query()` — it returns a `PathResult` (not a `Set`), or `None` when no path exists.
+
+```python
+result = db.path_query(
+    "MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'islands/marineford' AND b._key = 'islands/wano'"
+)
+
+if result:
+    print(f"Shortest route: {result.length} hops")
+
+    for node in result.nodes:
+        print(" ", node.slug)
+
+    for edge in result.edges:
+        print(f"  {edge.from_slug} -[{edge.edge_type}]-> {edge.to_slug}")
+```
+
+```
+Shortest route: 3 hops
+  islands/marineford
+  islands/fishman-island
+  islands/dressrosa
+  islands/wano
+  islands/marineford -[route_to]-> islands/fishman-island
+  islands/fishman-island -[route_to]-> islands/dressrosa
+  islands/dressrosa -[route_to]-> islands/wano
+```
+
+`PathResult` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `nodes` | `list[Hit]` | Ordered nodes, start to end (inclusive) |
+| `edges` | `list[EdgeHit]` | Ordered edges — `edges[i]` connects `nodes[i]` → `nodes[i+1]` |
+| `length` | `int` | Hop count — equals `len(edges)` |
+
+`EdgeHit` fields: `from_slug`, `to_slug`, `edge_type`, `strength`, `meta_json`.
 
 ### Atomic (Rust fluent builder)
 
@@ -306,6 +421,14 @@ db.remove("characters/luffy");
 db.link("characters/zoro", "characters/mihawk", "student_of", 1.0);
 db.link_meta("islands/marineford", "islands/fishman-island", "route_to", 1.0, r#"{"days":3}"#)?;
 db.unlink("characters/zoro", "characters/mihawk", "student_of");
+
+// Shortest path
+let sql = "MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'islands/marineford' AND b._key = 'islands/wano'";
+if let Some(path) = db.path_query(sql)? {
+    println!("{} hops", path.length);
+    for node in &path.nodes  { println!("  {}", node.slug); }
+    for edge in &path.edges  { println!("  {:?} → {:?}", edge.from_slug, edge.to_slug); }
+}
 ```
 
 ### Python DataFrame (`db.df`)
@@ -455,9 +578,20 @@ df = db.df.query(f"""
 """)
 ```
 
-### Graph — rival and alliance networks
+### Graph — rival and alliance networks, path queries
 
 ```python
+# Shortest path between two characters
+result = db.path_query(
+    "MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/luffy' AND b._key = 'characters/mihawk'"
+)
+if result:
+    print(f"Degrees of separation: {result.length}")
+    for node in result.nodes:
+        print(" ", node.slug)
+    for edge in result.edges:
+        print(f"  {edge.from_slug} -[{edge.edge_type}]-> {edge.to_slug}")
+
 # 2-hop rival network from Luffy
 hits = db.query("""
     MATCH (a:characters)-[:rival*1..2]->(b:characters)
@@ -480,6 +614,76 @@ hits = db.query("""
     RETURN a.crew AS from_crew, b.crew AS to_crew, COUNT(r) AS clashes
     GROUP BY a.crew, b.crew
     ORDER BY clashes DESC
+""")
+
+# SELECT … FROM MATCH — SQL-first syntax, same execution path as MATCH … RETURN
+hits = db.query("""
+    SELECT b._key AS name, COUNT(a) AS rivals, SUM(r.intensity) AS total_threat
+    FROM MATCH (a:characters)-[r:rival]->(b:characters)
+    GROUP BY b._key
+    ORDER BY total_threat DESC
+    LIMIT 10
+""")
+```
+
+### PATH_* aggregates — aggregate over path arrays
+
+Edge bindings expose path intrinsics as JSON arrays: `_path_keys`, `_path_strength`, `_path_length`.
+`PATH_*` functions aggregate over those arrays in a single RETURN / SELECT expression.
+
+```python
+# PATH_PRODUCT: multiply all strengths along a 2-hop route (reliability score)
+hits = db.query("""
+    MATCH (start:islands)-[r:route_to]->(mid:islands)-[r2:route_to]->(dest:islands)
+    WHERE start._key = 'marineford'
+    RETURN dest._key AS island,
+           PATH_PRODUCT(r2._path_strength) AS route_reliability,
+           PATH_FIRST(r2._path_keys)       AS departure,
+           PATH_LAST(r2._path_keys)        AS arrival
+    ORDER BY route_reliability DESC
+""")
+
+# PATH_AVG / PATH_SUM / PATH_MIN / PATH_MAX / PATH_FIRST / PATH_LAST work the same way
+hits = db.query("""
+    MATCH (a:characters)-[r:rival]->(b:characters)-[r2:rival]->(c:characters)
+    WHERE a._key = 'shanks'
+    RETURN c._key AS target,
+           PATH_MIN(r2._path_strength)  AS weakest_link,
+           PATH_AVG(r2._path_strength)  AS avg_intensity
+    ORDER BY avg_intensity DESC
+""")
+```
+
+### CASE WHEN, time functions, JSON_ARRAY_LENGTH
+
+```python
+# CASE WHEN — conditional expression in any RETURN / SELECT list
+hits = db.query("""
+    MATCH (a:characters)-[r:rival]->(b:characters)
+    RETURN b._key AS name,
+           CASE WHEN r._depth = 1 THEN 'direct rival'
+                WHEN r._depth = 2 THEN 'indirect rival'
+                ELSE 'distant connection'
+           END AS rivalry_type
+""")
+
+# AGE_DAYS / AGE_HOURS — time since a field's epoch (Unix int or "YYYY-MM-DD")
+# NOW() — current Unix timestamp in seconds
+hits = db.query("""
+    MATCH (a:characters)-[r:rival]->(b:characters)
+    RETURN b._key                AS name,
+           AGE_DAYS(b.last_seen) AS days_inactive,
+           NOW()                 AS queried_at
+    ORDER BY days_inactive DESC
+""")
+
+# JSON_ARRAY_LENGTH — length of a JSON array field (e.g. _path_keys)
+hits = db.query("""
+    MATCH (start:islands)-[r:route_to*1..3]->(dest:islands)
+    WHERE start._key = 'marineford'
+    RETURN dest._key                         AS island,
+           JSON_ARRAY_LENGTH(r._path_keys)   AS stops
+    ORDER BY stops ASC
 """)
 ```
 

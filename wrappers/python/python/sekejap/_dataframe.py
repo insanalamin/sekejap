@@ -45,14 +45,38 @@ class DataFrameAccessor:
         If a node has no payload, a row with only ``_slug`` is emitted.
 
         Args:
-            sql:        Any SELECT / MATCH query.
+            sql:        Any SELECT, MATCH … RETURN, or SELECT … FROM MATCH query.
             index_col:  If provided, set this column as the DataFrame index.
 
-        Example::
+        Supported query forms::
 
-            df = db.df.query("SELECT * FROM researchers LIMIT 100")
-            df = db.df.query(
-                "SELECT * FROM researchers WHERE VECTOR_NEAR(embedding, [...], 20)",
+            # Standard SELECT
+            db.df.query("SELECT * FROM venues LIMIT 100")
+
+            # MATCH aggregate — RETURN form
+            db.df.query(\"\"\"
+                MATCH (a:bands)-[r:played_at]->(b:venues)
+                RETURN b._key AS venue, COUNT(a) AS plays
+                GROUP BY b._key ORDER BY plays DESC
+            \"\"\")
+
+            # SELECT FROM MATCH — SQL-first form (identical result)
+            db.df.query(\"\"\"
+                SELECT b._key AS venue, COUNT(a) AS plays
+                FROM MATCH (a:bands)-[r:played_at]->(b:venues)
+                GROUP BY b._key ORDER BY plays DESC
+            \"\"\")
+
+            # PATH_* aggregates
+            db.df.query(\"\"\"
+                MATCH (a:venues)-[r:route_to*1..3]->(b:venues)
+                WHERE a._key = 'melbourne_cbd'
+                RETURN b._key AS dest, PATH_PRODUCT(r._path_strength) AS reliability
+            \"\"\")
+
+            # Vector search
+            db.df.query(
+                "SELECT * FROM venues WHERE VECTOR_NEAR(embedding, [...], 20)",
                 index_col="_key",
             )
         """

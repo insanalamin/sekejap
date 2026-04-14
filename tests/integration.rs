@@ -2236,6 +2236,230 @@ fn order_by_vector_with_where_filter() {
     assert_eq!(hits[0].slug, "items/a", "a has exact match [1,0]");
 }
 
+// ── ORDER BY arithmetic score expressions ────────────────────────────────────
+
+/// `ORDER BY field * weight` — plain field weighted sort.
+#[test]
+fn order_by_expr_field_multiply() {
+    let mut db = CoreDB::new();
+    db.put("p/1", r#"{"_collection":"p","_key":"1","score":10}"#).unwrap();
+    db.put("p/2", r#"{"_collection":"p","_key":"2","score":30}"#).unwrap();
+    db.put("p/3", r#"{"_collection":"p","_key":"3","score":20}"#).unwrap();
+
+    // score * 1.0 DESC — same as ORDER BY score DESC
+    let hits = db.query("SELECT * FROM p ORDER BY score * 1.0 DESC").unwrap().collect();
+    let scores: Vec<f64> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["score"].as_f64().unwrap())
+        .collect();
+    assert_eq!(scores, [30.0, 20.0, 10.0]);
+}
+
+/// `ORDER BY a + b` — sum of two payload fields.
+#[test]
+fn order_by_expr_field_addition() {
+    let mut db = CoreDB::new();
+    db.put("p/1", r#"{"_collection":"p","_key":"1","a":1,"b":9}"#).unwrap(); // sum=10
+    db.put("p/2", r#"{"_collection":"p","_key":"2","a":5,"b":3}"#).unwrap(); // sum=8
+    db.put("p/3", r#"{"_collection":"p","_key":"3","a":7,"b":7}"#).unwrap(); // sum=14
+
+    let hits = db.query("SELECT * FROM p ORDER BY a + b DESC").unwrap().collect();
+    let sums: Vec<f64> = hits.iter()
+        .map(|h| {
+            let p = h.payload.as_ref().unwrap();
+            p["a"].as_f64().unwrap() + p["b"].as_f64().unwrap()
+        })
+        .collect();
+    assert_eq!(sums, [14.0, 10.0, 8.0]);
+}
+
+/// `ORDER BY a * 0.6 + b * 0.4 DESC` — weighted combination of two fields.
+#[test]
+fn order_by_expr_weighted_fields() {
+    let mut db = CoreDB::new();
+    // weighted = a*0.6 + b*0.4
+    db.put("p/1", r#"{"_collection":"p","_key":"1","a":10,"b":0}"#).unwrap();  // 6.0
+    db.put("p/2", r#"{"_collection":"p","_key":"2","a":0,"b":10}"#).unwrap();  // 4.0
+    db.put("p/3", r#"{"_collection":"p","_key":"3","a":5,"b":10}"#).unwrap();  // 7.0
+
+    let hits = db.query("SELECT * FROM p ORDER BY a * 0.6 + b * 0.4 DESC").unwrap().collect();
+    let keys: Vec<&str> = hits.iter()
+        .map(|h| h.slug.split('/').last().unwrap())
+        .collect();
+    assert_eq!(keys, ["3", "1", "2"]); // 7.0, 6.0, 4.0
+}
+
+/// `ORDER BY (a + b) * 0.5 DESC` — parenthesised sub-expression.
+#[test]
+fn order_by_expr_parentheses() {
+    let mut db = CoreDB::new();
+    db.put("p/1", r#"{"_collection":"p","_key":"1","a":2,"b":8}"#).unwrap();  // (2+8)*0.5=5.0
+    db.put("p/2", r#"{"_collection":"p","_key":"2","a":6,"b":6}"#).unwrap();  // (6+6)*0.5=6.0
+    db.put("p/3", r#"{"_collection":"p","_key":"3","a":1,"b":1}"#).unwrap();  // (1+1)*0.5=1.0
+
+    let hits = db.query("SELECT * FROM p ORDER BY (a + b) * 0.5 DESC").unwrap().collect();
+    let keys: Vec<&str> = hits.iter()
+        .map(|h| h.slug.split('/').last().unwrap())
+        .collect();
+    assert_eq!(keys, ["2", "1", "3"]); // 6.0, 5.0, 1.0
+}
+
+/// `ORDER BY BM25(field, 'q') * 0.7 + BM25(body, 'q') * 0.3 DESC` — two BM25 signals.
+#[test]
+fn order_by_expr_dual_bm25() {
+    // BM25 IDF is positive only when df < N/2. We ensure 'rust' appears in 1
+    // of 5 docs so IDF = ln((5-1+0.5)/(1+0.5)) ≈ ln(3) ≈ 1.1 > 0.
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE docs (_key TEXT, title TEXT, body TEXT)").unwrap();
+    // d1: the only rust doc — should rank first.
+    db.execute("INSERT INTO docs (_key, title, body) VALUES ('d1', 'rust programming guide', 'building systems in rust')").unwrap();
+    // d2-d5: no rust — should all rank below d1.
+    db.execute("INSERT INTO docs (_key, title, body) VALUES ('d2', 'introduction to python', 'scripting with python')").unwrap();
+    db.execute("INSERT INTO docs (_key, title, body) VALUES ('d3', 'web development basics', 'html css javascript guide')").unwrap();
+    db.execute("INSERT INTO docs (_key, title, body) VALUES ('d4', 'database fundamentals', 'sql and nosql databases overview')").unwrap();
+    db.execute("INSERT INTO docs (_key, title, body) VALUES ('d5', 'machine learning overview', 'neural networks and model training')").unwrap();
+    // CREATE INDEX builds the BM25 index from all existing data in the collection.
+    db.execute("CREATE INDEX ON docs USING bm25 (title)").unwrap();
+    db.execute("CREATE INDEX ON docs USING bm25 (body)").unwrap();
+
+    let hits = db
+        .query("SELECT * FROM docs ORDER BY BM25(title, 'rust') * 0.7 + BM25(body, 'rust') * 0.3 DESC")
+        .unwrap()
+        .collect();
+
+    assert_eq!(hits.len(), 5);
+    // d1 is the only rust doc — it must rank first.
+    assert_eq!(hits[0].slug, "docs/d1",
+        "d1 is the only rust doc and must rank first");
+}
+
+/// `ORDER BY BM25(field,'q') * 0.5 + score * 0.5 DESC` — BM25 + numeric field hybrid.
+#[test]
+fn order_by_expr_bm25_plus_field() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE docs (_key TEXT, title TEXT, score REAL)").unwrap();
+    // d1: title matches 'rust' well, score=1
+    db.execute("INSERT INTO docs (_key, title, score) VALUES ('d1', 'rust systems programming', 1)").unwrap();
+    // d2: title matches 'rust', but also has score=100 → should beat d1 via hybrid
+    db.execute("INSERT INTO docs (_key, title, score) VALUES ('d2', 'rust basics', 100)").unwrap();
+    // d3: no match, low score
+    db.execute("INSERT INTO docs (_key, title, score) VALUES ('d3', 'python scripting', 1)").unwrap();
+    // CREATE INDEX builds the BM25 index from all existing data.
+    db.execute("CREATE INDEX ON docs USING bm25 (title)").unwrap();
+
+    let hits = db
+        .query("SELECT * FROM docs ORDER BY BM25(title, 'rust') * 0.5 + score * 0.5 DESC")
+        .unwrap()
+        .collect();
+
+    assert_eq!(hits.len(), 3);
+    // d2 (rust + score=100) should beat d1 (rust + score=1)
+    assert_eq!(hits[0].slug, "docs/d2", "d2 has high score so should rank first");
+    // d3 gets 0 BM25 but score=1; d1 gets BM25 but score=1; d1 wins on BM25
+    let last_key = hits[2].slug.split('/').last().unwrap();
+    assert_eq!(last_key, "d3", "d3 with no title match should rank last");
+}
+
+/// Backward compat: `ORDER BY field ASC` still works unchanged.
+#[test]
+fn order_by_expr_backward_compat_field() {
+    let mut db = CoreDB::new();
+    db.put("p/1", r#"{"_collection":"p","_key":"1","v":3}"#).unwrap();
+    db.put("p/2", r#"{"_collection":"p","_key":"2","v":1}"#).unwrap();
+    db.put("p/3", r#"{"_collection":"p","_key":"3","v":2}"#).unwrap();
+
+    let hits = db.query("SELECT * FROM p ORDER BY v ASC").unwrap().collect();
+    let vals: Vec<i64> = hits.iter().map(|h| h.payload.as_ref().unwrap()["v"].as_i64().unwrap()).collect();
+    assert_eq!(vals, [1, 2, 3]);
+}
+
+/// Backward compat: `ORDER BY field1 ASC, field2 DESC` multi-column still works.
+#[test]
+fn order_by_expr_backward_compat_multi_column() {
+    let mut db = CoreDB::new();
+    db.put("p/1", r#"{"_collection":"p","_key":"1","cat":"a","v":2}"#).unwrap();
+    db.put("p/2", r#"{"_collection":"p","_key":"2","cat":"a","v":1}"#).unwrap();
+    db.put("p/3", r#"{"_collection":"p","_key":"3","cat":"b","v":5}"#).unwrap();
+
+    let hits = db.query("SELECT * FROM p ORDER BY cat ASC, v DESC").unwrap().collect();
+    let keys: Vec<&str> = hits.iter().map(|h| h.slug.split('/').last().unwrap()).collect();
+    assert_eq!(keys, ["1", "2", "3"]); // cat ASC: a before b; within a, v DESC: 2 then 1
+}
+
+/// Backward compat: `ORDER BY field <=> [vec]` vector sort still works.
+#[test]
+fn order_by_expr_backward_compat_vector() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE vdocs (_key TEXT, emb VECTOR)").unwrap();
+    db.execute("INSERT INTO vdocs (_key, emb) VALUES ('v1', [1.0, 0.0, 0.0])").unwrap();
+    db.execute("INSERT INTO vdocs (_key, emb) VALUES ('v2', [0.0, 1.0, 0.0])").unwrap();
+    db.execute("INSERT INTO vdocs (_key, emb) VALUES ('v3', [0.0, 0.0, 1.0])").unwrap();
+
+    let hits = db.query("SELECT * FROM vdocs ORDER BY emb <=> [1.0, 0.0, 0.0]").unwrap().collect();
+    assert_eq!(hits[0].slug, "vdocs/v1");
+}
+
+/// `ORDER BY field <-> [vec]` (L2 operator) and `VECTOR_L2(field, [vec])` function form.
+#[test]
+fn order_by_vector_l2_operator_and_function() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE items (_key TEXT, emb VECTOR)").unwrap();
+    // v1 is at [1,0,0], v2 at [0,1,0], v3 at [0,0,1]
+    db.execute("INSERT INTO items (_key, emb) VALUES ('v1', [1.0, 0.0, 0.0])").unwrap();
+    db.execute("INSERT INTO items (_key, emb) VALUES ('v2', [0.0, 1.0, 0.0])").unwrap();
+    db.execute("INSERT INTO items (_key, emb) VALUES ('v3', [0.0, 0.0, 1.0])").unwrap();
+
+    // Operator form: <-> nearest L2 to [1,0,0] → v1 first
+    let op_hits: Vec<_> = db.query("SELECT * FROM items ORDER BY emb <-> [1.0, 0.0, 0.0]").unwrap().collect();
+    assert_eq!(op_hits[0].slug, "items/v1", "<-> operator: nearest L2 first");
+
+    // Function form: VECTOR_L2 DESC (lowest distance = negative = highest score)
+    let fn_hits: Vec<_> = db.query("SELECT * FROM items ORDER BY -VECTOR_L2(emb, [1.0, 0.0, 0.0]) DESC").unwrap().collect();
+    assert_eq!(fn_hits[0].slug, "items/v1", "VECTOR_L2 function: nearest first");
+}
+
+/// `ORDER BY field <#> [vec]` (Dot product operator) — highest similarity first.
+#[test]
+fn order_by_vector_dot_operator() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE items (_key TEXT, emb VECTOR)").unwrap();
+    db.execute("INSERT INTO items (_key, emb) VALUES ('strong', [0.9, 0.9, 0.9])").unwrap();
+    db.execute("INSERT INTO items (_key, emb) VALUES ('weak',   [0.1, 0.1, 0.1])").unwrap();
+    db.execute("INSERT INTO items (_key, emb) VALUES ('mid',    [0.5, 0.5, 0.5])").unwrap();
+
+    // <#> negates internally so highest dot product = first (ascending negated)
+    let hits: Vec<_> = db.query("SELECT * FROM items ORDER BY emb <#> [1.0, 1.0, 1.0]").unwrap().collect();
+    assert_eq!(hits[0].slug, "items/strong", "<#> operator: highest dot product first");
+    assert_eq!(hits[2].slug, "items/weak",   "<#> operator: lowest dot product last");
+}
+
+// ── ORDER BY spatial + graph signals ──────────────────────────────────────────
+
+/// ST_DISTANCE as a score signal: closer venues rank higher when we negate distance.
+/// Venues (all in Melbourne CBD) ordered by proximity to Flinders Street Station.
+#[test]
+fn order_by_expr_st_distance_descending_proximity() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE venues (_key TEXT, name TEXT, geometry GEO)").unwrap();
+    // Flinders Street Station: 144.9671, -37.8183
+    // Young and Jacksons: 144.9631, -37.8173 — nearest
+    // Melbourne Central: 144.9631, -37.8102 — a bit further
+    // Geelong Station: 144.3617, -38.1499 — ~70 km away
+    db.execute("INSERT INTO venues (_key, name, geometry) VALUES ('fss', 'Flinders Street Station', '{\"type\":\"Point\",\"coordinates\":[144.9671,-37.8183]}')").unwrap();
+    db.execute("INSERT INTO venues (_key, name, geometry) VALUES ('yj', 'Young and Jacksons', '{\"type\":\"Point\",\"coordinates\":[144.9631,-37.8173]}')").unwrap();
+    db.execute("INSERT INTO venues (_key, name, geometry) VALUES ('mc', 'Melbourne Central', '{\"type\":\"Point\",\"coordinates\":[144.9631,-37.8102]}')").unwrap();
+    db.execute("INSERT INTO venues (_key, name, geometry) VALUES ('gs', 'Geelong Station', '{\"type\":\"Point\",\"coordinates\":[144.3617,-38.1499]}')").unwrap();
+
+    // Sort by negative ST_DISTANCE_KM from Flinders Street Station — ascending distance = descending score.
+    // fss itself has distance 0 (most negative negate = highest), geelong is furthest.
+    let hits = db
+        .query("SELECT * FROM venues ORDER BY -ST_DISTANCE_KM(geometry, POINT(144.9671 -37.8183)) DESC")
+        .unwrap()
+        .collect();
+
+    assert_eq!(hits[0].slug, "venues/fss", "distance-0 node must rank first: {:?}", hits.iter().map(|h| &h.slug).collect::<Vec<_>>());
+    assert_eq!(hits.last().unwrap().slug, "venues/gs", "Geelong must rank last");
+}
+
 // ── Cascade edge deletion on node remove ──────────────────────────────────────
 
 /// Deleting a node removes its outgoing edges so the target no longer sees
@@ -3216,4 +3440,321 @@ fn gin_ilike_after_insert() {
     assert!(names.contains(&"The Vines"));
     assert!(names.contains(&"The Avalanches"));
     assert!(names.contains(&"The John Butler Trio"));
+}
+
+// ── Edge intrinsics: r._depth, r._path_keys ──────────────────────────────────
+
+/// `r._depth` counts hops from start.
+/// Graph: Melbourne → Richmond → Hawthorn → Box Hill (each hop "adjacent")
+#[test]
+fn edge_intrinsic_depth() {
+    let mut db = CoreDB::new();
+    db.put("suburbs/melbourne", r#"{"_collection":"suburbs","_key":"melbourne"}"#).unwrap();
+    db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
+    db.put("suburbs/hawthorn",  r#"{"_collection":"suburbs","_key":"hawthorn"}"#).unwrap();
+    db.put("suburbs/box-hill",  r#"{"_collection":"suburbs","_key":"box-hill"}"#).unwrap();
+    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent", 1.0);
+    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent", 1.0);
+    db.link("suburbs/hawthorn",  "suburbs/box-hill", "adjacent", 1.0);
+
+    // 2-hop path: melbourne -[r1]-> richmond -[r2]-> hawthorn
+    let hits = db.query(
+        "MATCH (s:suburbs)-[r:adjacent]->(h1:suburbs)-[r2:adjacent]->(h2:suburbs) \
+         WHERE s._key = 'melbourne' RETURN h2._key AS dest, r2._depth AS depth"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty());
+    let payload = hits[0].payload.as_ref().unwrap();
+    assert_eq!(payload["depth"], 2, "r2._depth must be 2 after 2 hops");
+}
+
+/// `r._path_keys` contains the full slug list from start to current node.
+#[test]
+fn edge_intrinsic_path_keys() {
+    let mut db = CoreDB::new();
+    db.put("suburbs/fitzroy",   r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
+    db.put("suburbs/collingwood", r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
+    db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
+    db.link("suburbs/fitzroy",    "suburbs/collingwood", "borders", 1.0);
+    db.link("suburbs/collingwood","suburbs/richmond",    "borders", 1.0);
+
+    let hits = db.query(
+        "MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
+         WHERE a._key = 'fitzroy' RETURN c._key AS dest, r2._path_keys AS path"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty());
+    let payload = hits[0].payload.as_ref().unwrap();
+    let path = payload["path"].as_array().expect("_path_keys must be array");
+    assert_eq!(path.len(), 3, "3 nodes in path: fitzroy, collingwood, richmond");
+    assert_eq!(path[0].as_str().unwrap(), "suburbs/fitzroy");
+    assert_eq!(path[2].as_str().unwrap(), "suburbs/richmond");
+}
+
+/// `r._avg_strength` and `r._min_strength` reflect edge weights along the path.
+#[test]
+fn edge_intrinsic_strength_aggregates() {
+    let mut db = CoreDB::new();
+    db.put("events/flood", r#"{"_collection":"events","_key":"flood"}"#).unwrap();
+    db.put("suburbs/west", r#"{"_collection":"suburbs","_key":"west"}"#).unwrap();
+    db.put("streets/main", r#"{"_collection":"streets","_key":"main"}"#).unwrap();
+    db.link("events/flood", "suburbs/west",  "affects",  0.8);
+    db.link("suburbs/west", "streets/main",  "contains", 0.4);
+
+    let hits = db.query(
+        "MATCH (e:events)-[:affects]->(s:suburbs)-[r:contains]->(st:streets) \
+         WHERE e._key = 'flood' RETURN st._key AS street, r._avg_strength AS avg_s, r._min_strength AS min_s"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty());
+    let p = hits[0].payload.as_ref().unwrap();
+    // avg = (0.8 + 0.4) / 2 = 0.6
+    let avg = p["avg_s"].as_f64().unwrap();
+    assert!((avg - 0.6).abs() < 1e-4, "avg_strength should be ~0.6, got {avg}");
+    let min = p["min_s"].as_f64().unwrap();
+    assert!((min - 0.4).abs() < 1e-4, "min_strength should be 0.4, got {min}");
+}
+
+// ── MATCH SHORTEST ───────────────────────────────────────────────────────────
+
+/// Build a small graph that contains multiple paths of different lengths and
+/// check that `MATCH SHORTEST` returns the shortest one.
+///
+/// Graph (all edges forward-directed):
+///   coby → luffy  (knows)
+///   coby → garp   (student_of)
+///   garp → luffy  (mentor_of)
+///   luffy → dragon (family)
+///   garp → dragon  (family)
+///   dragon → sabo  (commander_of)
+///   luffy → sabo   (crew)
+///
+/// Shortest path from coby → sabo:
+///   coby → luffy → sabo  (2 hops, via "knows" + "crew")
+fn setup_path_db() -> CoreDB {
+    let mut db = CoreDB::new();
+    db.put("characters/coby",   r#"{"_collection":"characters","name":"Coby"}"#).unwrap();
+    db.put("characters/luffy",  r#"{"_collection":"characters","name":"Luffy"}"#).unwrap();
+    db.put("characters/garp",   r#"{"_collection":"characters","name":"Garp"}"#).unwrap();
+    db.put("characters/dragon", r#"{"_collection":"characters","name":"Dragon"}"#).unwrap();
+    db.put("characters/sabo",   r#"{"_collection":"characters","name":"Sabo"}"#).unwrap();
+
+    db.link("characters/coby",   "characters/luffy",  "knows",        1.0);
+    db.link("characters/coby",   "characters/garp",   "student_of",   1.0);
+    db.link("characters/garp",   "characters/luffy",  "mentor_of",    1.0);
+    db.link("characters/luffy",  "characters/dragon", "family",       1.0);
+    db.link("characters/garp",   "characters/dragon", "family",       1.0);
+    db.link("characters/dragon", "characters/sabo",   "commander_of", 1.0);
+    db.link("characters/luffy",  "characters/sabo",   "crew",         1.0);
+
+    db
+}
+
+#[test]
+fn shortest_path_returns_correct_route() {
+    let db = setup_path_db();
+
+    let result = db
+        .path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/coby' AND b._key = 'characters/sabo'")
+        .expect("path query must not error")
+        .expect("path must exist");
+
+    // Endpoints
+    assert_eq!(result.nodes.first().unwrap().slug, "characters/coby");
+    assert_eq!(result.nodes.last().unwrap().slug, "characters/sabo");
+
+    // Shortest path is 2 hops: coby → luffy → sabo
+    assert_eq!(result.length, 2, "expected 2 hops");
+    assert_eq!(result.edges.len(), 2);
+    assert_eq!(result.nodes.len(), 3);
+
+    // Edge types on the 2-hop path
+    assert_eq!(result.edges[0].edge_type.as_deref(), Some("knows"));
+    assert_eq!(result.edges[1].edge_type.as_deref(), Some("crew"));
+
+    // Intermediate node
+    assert_eq!(result.nodes[1].slug, "characters/luffy");
+}
+
+#[test]
+fn shortest_path_no_path_returns_none() {
+    let db = setup_path_db();
+
+    // sabo has no outgoing edges in our graph, so sabo → coby is impossible
+    let result = db
+        .path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/sabo' AND b._key = 'characters/coby'")
+        .expect("path query must not error");
+
+    assert!(result.is_none(), "expected None when no path exists");
+}
+
+#[test]
+fn shortest_path_same_node_returns_zero_hops() {
+    let db = setup_path_db();
+
+    let result = db
+        .path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/luffy' AND b._key = 'characters/luffy'")
+        .expect("path query must not error")
+        .expect("same-node path must be Some");
+
+    assert_eq!(result.length, 0);
+    assert_eq!(result.nodes.len(), 1);
+    assert!(result.edges.is_empty());
+    assert_eq!(result.nodes[0].slug, "characters/luffy");
+}
+
+#[test]
+fn shortest_path_missing_node_returns_none() {
+    let db = setup_path_db();
+
+    // "characters/zoro" was never inserted
+    let result = db
+        .path_query("MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'characters/coby' AND b._key = 'characters/zoro'")
+        .expect("path query must not error");
+
+    assert!(result.is_none(), "expected None when target node doesn't exist");
+}
+
+// ── Target 8: SELECT … FROM MATCH ────────────────────────────────────────────
+
+/// SELECT list acts as the RETURN clause; same execution path as MATCH … RETURN.
+/// Graph: Melbourne → Richmond → Hawthorn (adjacent edges, 1-hop and 2-hop).
+#[test]
+fn select_from_match() {
+    let mut db = CoreDB::new();
+    db.put("suburbs/melbourne", r#"{"_collection":"suburbs","_key":"melbourne"}"#).unwrap();
+    db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
+    db.put("suburbs/hawthorn",  r#"{"_collection":"suburbs","_key":"hawthorn"}"#).unwrap();
+    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent", 1.0);
+    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent", 1.0);
+
+    // SELECT syntax — identical semantics to the MATCH … RETURN form.
+    // Start variable (s) is not bound in path rows; use destination (n) and edge (r).
+    let hits = db.query(
+        "SELECT n._key AS dest, r._depth AS depth \
+         FROM MATCH (s:suburbs)-[r:adjacent]->(n:suburbs) \
+         WHERE s._key = 'melbourne'"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty());
+    let p = hits[0].payload.as_ref().unwrap();
+    // Single hop: depth = 1, destination = richmond
+    assert_eq!(p["dest"].as_str().unwrap(), "richmond");
+    assert_eq!(p["depth"].as_i64().unwrap(), 1);
+}
+
+// ── Target 9: PATH_* aggregates ───────────────────────────────────────────────
+
+/// PATH_PRODUCT multiplies all elements in the path strength array.
+/// Graph: flood -[0.8]-> west -[0.4]-> main-st  →  product = 0.32
+#[test]
+fn path_product() {
+    let mut db = CoreDB::new();
+    db.put("events/flood", r#"{"_collection":"events","_key":"flood"}"#).unwrap();
+    db.put("suburbs/west", r#"{"_collection":"suburbs","_key":"west"}"#).unwrap();
+    db.put("streets/main", r#"{"_collection":"streets","_key":"main"}"#).unwrap();
+    db.link("events/flood", "suburbs/west",  "affects",  0.8);
+    db.link("suburbs/west", "streets/main",  "contains", 0.4);
+
+    let hits = db.query(
+        "MATCH (e:events)-[:affects]->(s:suburbs)-[r:contains]->(st:streets) \
+         WHERE e._key = 'flood' \
+         RETURN PATH_PRODUCT(r._path_strength) AS prod"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty(), "should have at least one path row");
+    let p = hits[0].payload.as_ref().unwrap();
+    let prod = p["prod"].as_f64().unwrap();
+    assert!((prod - 0.32).abs() < 1e-6, "PATH_PRODUCT should be ~0.32, got {prod}");
+}
+
+/// PATH_FIRST and PATH_LAST return the first/last element of a path array field.
+/// Uses r._path_keys which contains the full slug list from start to current node.
+#[test]
+fn path_first_last() {
+    let mut db = CoreDB::new();
+    db.put("suburbs/fitzroy",    r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
+    db.put("suburbs/collingwood",r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
+    db.put("suburbs/richmond",   r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
+    db.link("suburbs/fitzroy",     "suburbs/collingwood", "borders", 1.0);
+    db.link("suburbs/collingwood", "suburbs/richmond",    "borders", 1.0);
+
+    let hits = db.query(
+        "MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
+         WHERE a._key = 'fitzroy' \
+         RETURN PATH_FIRST(r2._path_keys) AS first_stop, PATH_LAST(r2._path_keys) AS last_stop"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty());
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["first_stop"].as_str().unwrap(), "suburbs/fitzroy");
+    assert_eq!(p["last_stop"].as_str().unwrap(), "suburbs/richmond");
+}
+
+// ── Target 10: CASE WHEN, NOW(), JSON_ARRAY_LENGTH ───────────────────────────
+
+/// CASE WHEN routes on r._depth: depth 1 → "close", depth 2 → "far", else "unknown".
+#[test]
+fn case_when_depth() {
+    let mut db = CoreDB::new();
+    db.put("suburbs/melbourne", r#"{"_collection":"suburbs","_key":"melbourne"}"#).unwrap();
+    db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
+    db.put("suburbs/hawthorn",  r#"{"_collection":"suburbs","_key":"hawthorn"}"#).unwrap();
+    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent", 1.0);
+    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent", 1.0);
+
+    // Two-hop path ends at hawthorn with r2._depth = 2
+    let hits = db.query(
+        "MATCH (s:suburbs)-[r:adjacent]->(h1:suburbs)-[r2:adjacent]->(h2:suburbs) \
+         WHERE s._key = 'melbourne' \
+         RETURN h2._key AS dest, \
+                CASE WHEN r2._depth = 1 THEN 'close' WHEN r2._depth = 2 THEN 'far' ELSE 'unknown' END AS proximity"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty());
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["dest"].as_str().unwrap(), "hawthorn");
+    assert_eq!(p["proximity"].as_str().unwrap(), "far");
+}
+
+/// NOW() returns a positive integer (Unix timestamp in seconds).
+#[test]
+fn now_returns_integer() {
+    let mut db = CoreDB::new();
+    db.put("suburbs/fitzroy",    r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
+    db.put("suburbs/collingwood",r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
+    db.link("suburbs/fitzroy", "suburbs/collingwood", "borders", 1.0);
+
+    let hits = db.query(
+        "MATCH (a:suburbs)-[r:borders]->(b:suburbs) \
+         WHERE a._key = 'fitzroy' \
+         RETURN NOW() AS ts"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty());
+    let p = hits[0].payload.as_ref().unwrap();
+    let ts = p["ts"].as_i64().expect("NOW() must return an integer");
+    assert!(ts > 1_000_000_000, "timestamp should be a plausible Unix epoch, got {ts}");
+}
+
+/// JSON_ARRAY_LENGTH on r._path_keys returns the number of nodes on the path.
+#[test]
+fn json_array_length() {
+    let mut db = CoreDB::new();
+    db.put("suburbs/fitzroy",    r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
+    db.put("suburbs/collingwood",r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
+    db.put("suburbs/richmond",   r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
+    db.link("suburbs/fitzroy",     "suburbs/collingwood", "borders", 1.0);
+    db.link("suburbs/collingwood", "suburbs/richmond",    "borders", 1.0);
+
+    let hits = db.query(
+        "MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
+         WHERE a._key = 'fitzroy' \
+         RETURN JSON_ARRAY_LENGTH(r2._path_keys) AS path_len"
+    ).unwrap().collect();
+
+    assert!(!hits.is_empty());
+    let p = hits[0].payload.as_ref().unwrap();
+    // path: fitzroy, collingwood, richmond → length 3
+    assert_eq!(p["path_len"].as_i64().unwrap(), 3);
 }

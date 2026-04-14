@@ -39,7 +39,7 @@ pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
 
 pub use pipeline::Pipeline;
 pub use query::{Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step};
-pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, SqlError, TableSchema};
+pub use sql::{CompiledMutation, CompiledPathQuery, EdgeDelete, EdgeInsert, SqlError, TableSchema};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -136,6 +136,24 @@ pub struct EdgeHit {
     pub edge_type_hash: u64,
     pub strength: f32,
     pub meta: Option<Value>,
+}
+
+// ── PathResult ────────────────────────────────────────────────────────────────
+
+/// The result of a `MATCH SHORTEST` query: an ordered chain of nodes and
+/// edges from `start` to `end` (inclusive on both ends).
+///
+/// - `nodes[i]` and `nodes[i+1]` are connected by `edges[i]`.
+/// - `length` is the hop count (`edges.len()`).
+/// - When `start == end`, `nodes` has one entry and `edges` is empty.
+#[derive(Debug, Clone)]
+pub struct PathResult {
+    /// Ordered nodes: index 0 is the start node, last is the end node.
+    pub nodes: Vec<query::Hit>,
+    /// Ordered edges: `edges[i]` connects `nodes[i]` → `nodes[i+1]`.
+    pub edges: Vec<EdgeHit>,
+    /// Hop count — equals `edges.len()`.
+    pub length: usize,
 }
 
 // ── CoreDB ────────────────────────────────────────────────────────────────────
@@ -1608,7 +1626,32 @@ impl CoreDB {
         Set::new(self, Step::Collection(sk_hash(name)))
     }
 
-    /// Execute a SQL SELECT query and return a lazy [`Set`].
+    /// Execute a SQL query and return a lazy [`Set`].
+    ///
+    /// Accepts all SekejapQL query forms:
+    ///
+    /// ```text
+    /// -- Standard SELECT
+    /// SELECT * FROM collection [WHERE ...] [ORDER BY ...] [LIMIT n]
+    ///
+    /// -- MATCH aggregate (RETURN form)
+    /// MATCH (a:col)-[r:edge]->(b:col) [WHERE a._key = 'val']
+    /// RETURN b._key AS name, SUM(r.weight) AS total
+    /// [GROUP BY b._key] [ORDER BY total DESC] [LIMIT n]
+    ///
+    /// -- SELECT … FROM MATCH (SQL-first form, identical execution path)
+    /// SELECT b._key AS name, SUM(r.weight) AS total
+    /// FROM MATCH (a:col)-[r:edge]->(b:col) [WHERE a._key = 'val']
+    /// [GROUP BY b._key] [ORDER BY total DESC] [LIMIT n]
+    ///
+    /// -- Supported return expressions
+    /// var.field | COUNT(*) | SUM(math) | AVG(math) | MIN(math) | MAX(math)
+    /// PATH_AVG(var.field) | PATH_SUM | PATH_MIN | PATH_MAX | PATH_PRODUCT
+    /// PATH_FIRST(var.field) | PATH_LAST(var.field)
+    /// CASE WHEN var.field op literal THEN literal [WHEN ...] [ELSE literal] END
+    /// AGE_DAYS(var.field) | AGE_HOURS(var.field) | NOW()
+    /// JSON_ARRAY_LENGTH(var.field)
+    /// ```
     ///
     /// # Errors
     /// Returns [`SqlError`] if the SQL is syntactically invalid.
@@ -1652,6 +1695,126 @@ impl CoreDB {
     pub fn pipeline_query(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError> {
         let pipe = sql::parse_pipeline(sql)?;
         Ok(pipeline::execute_pipeline(self, pipe))
+    }
+
+    // ── Graph path queries ────────────────────────────────────────────────────
+
+    /// BFS from `start` to `end`, tracking the parent pointer and edge used at
+    /// each hop so the path can be reconstructed.
+    ///
+    /// Returns `None` when no path exists.
+    /// Returns a zero-hop `PathResult` when `start == end`.
+    fn bfs_shortest_path(&self, start: u64, end: u64) -> Option<PathResult> {
+        use std::collections::{HashMap, VecDeque};
+
+        // Sentinel: parent for the start node points to itself with a zero
+        // edge_type hash so we can detect "we are at the root" during
+        // reconstruction without a separate visited set.
+        // (from_hash, edge_type_hash, strength, meta)
+        let mut parent: HashMap<u64, (u64, u64, f32, Option<Value>)> = HashMap::new();
+
+        // Same-node degenerate case
+        if start == end {
+            if let Some(node) = self.nodes.get(&start) {
+                let hit = query::Hit {
+                    slug: node.slug.clone(),
+                    slug_hash: start,
+                    payload: Some(node.payload.clone()),
+                };
+                return Some(PathResult { nodes: vec![hit], edges: vec![], length: 0 });
+            } else {
+                return None; // start node doesn't exist
+            }
+        }
+
+        // The start node must exist
+        if !self.nodes.contains_key(&start) {
+            return None;
+        }
+
+        parent.insert(start, (start, 0, 0.0, None)); // sentinel
+        let mut queue: VecDeque<u64> = VecDeque::new();
+        queue.push_back(start);
+
+        while let Some(current) = queue.pop_front() {
+            if let Some(edges) = self.adj_fwd.get(&current) {
+                for e in edges {
+                    if parent.contains_key(&e.other) {
+                        continue; // already visited
+                    }
+                    parent.insert(e.other, (current, e.edge_type, e.strength, e.meta.clone()));
+                    if e.other == end {
+                        // Reconstruct path: walk parent map from end → start, then reverse.
+                        let mut node_hashes: Vec<u64> = Vec::new();
+                        let mut cur = end;
+                        loop {
+                            node_hashes.push(cur);
+                            let (prev, _, _, _) = parent[&cur];
+                            if prev == cur {
+                                break; // reached the sentinel (start node)
+                            }
+                            cur = prev;
+                        }
+                        node_hashes.reverse();
+
+                        // Build Hit list from the ordered hashes
+                        let nodes: Vec<query::Hit> = node_hashes
+                            .iter()
+                            .filter_map(|&h| {
+                                self.nodes.get(&h).map(|n| query::Hit {
+                                    slug: n.slug.clone(),
+                                    slug_hash: h,
+                                    payload: Some(n.payload.clone()),
+                                })
+                            })
+                            .collect();
+
+                        // Build EdgeHit list: edges[i] connects nodes[i] → nodes[i+1]
+                        let edges: Vec<EdgeHit> = node_hashes
+                            .windows(2)
+                            .map(|w| {
+                                let (_, edge_type_hash, strength, meta) = parent[&w[1]].clone();
+                                EdgeHit {
+                                    from_slug: self.nodes.get(&w[0]).map(|n| n.slug.clone()),
+                                    to_slug: self.nodes.get(&w[1]).map(|n| n.slug.clone()),
+                                    edge_type: self.edge_type_names.get(&edge_type_hash).cloned(),
+                                    edge_type_hash,
+                                    strength,
+                                    meta,
+                                }
+                            })
+                            .collect();
+
+                        let length = edges.len();
+                        return Some(PathResult { nodes, edges, length });
+                    }
+                    queue.push_back(e.other);
+                }
+            }
+        }
+
+        None // no path found
+    }
+
+    /// Execute a `MATCH SHORTEST` path query.
+    ///
+    /// Returns the shortest BFS path between two nodes, or `None` if no path
+    /// exists. The SQL syntax is:
+    ///
+    /// ```text
+    /// MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'from_slug' AND b._key = 'to_slug'
+    /// ```
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] if the SQL is syntactically invalid.
+    pub fn path_query(&self, sql: &str) -> Result<Option<PathResult>, SqlError> {
+        match sql::parse_path_query(sql)? {
+            sql::CompiledPathQuery::ShortestPath { from_slug, to_slug } => {
+                let start = sk_hash(&from_slug);
+                let end = sk_hash(&to_slug);
+                Ok(self.bfs_shortest_path(start, end))
+            }
+        }
     }
 
     /// Execute a `SHOW` introspection statement.

@@ -12,12 +12,21 @@
 //! [LIMIT n]
 //! [OFFSET n]
 //!
+//! -- SELECT … FROM MATCH (unified graph aggregate form)
+//! SELECT expr AS alias [, ...]
+//! FROM MATCH (start)-[edge]->(node) [...]
+//! [WHERE start._key = 'val']
+//! [GROUP BY var.field]
+//! [ORDER BY alias [ASC|DESC]]
+//! [LIMIT n]
+//!
 //! INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...)
 //! INSERT ('from')-[:KIND {strength: n, key: val}]->('to')
 //! UPDATE collection SET field = val [, ...] [WHERE ...]
 //! DELETE FROM collection | ALL [WHERE ...]
 //! DELETE ('from')-[:KIND]->('to')
 //! MATCH (node)-[edge]->(node) [WHERE ...] RETURN vars [LIMIT n]
+//! MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'from' AND b._key = 'to'
 //!
 //! CREATE TABLE collection (field type, ...)
 //!     [_key TEXT PRIMARY KEY, ...]
@@ -37,7 +46,19 @@
 //! SHOW CREATE TABLE collection
 //! SHOW collection
 //!
-//! OP    ::= = | != | <> | > | < | >= | <=
+//! -- Return expressions (MATCH … RETURN / SELECT … FROM MATCH)
+//! expr ::= var.field
+//!        | COUNT(*) | SUM(math) | AVG(math) | MIN(math) | MAX(math)
+//!        | PATH_AVG(var.field) | PATH_SUM(var.field) | PATH_MIN(var.field)
+//!        | PATH_MAX(var.field) | PATH_PRODUCT(var.field)
+//!        | PATH_FIRST(var.field) | PATH_LAST(var.field)
+//!        | CASE WHEN var.field op literal THEN literal
+//!               [WHEN ...] [ELSE literal] END
+//!        | AGE_DAYS(var.field) | AGE_HOURS(var.field)
+//!        | NOW()
+//!        | JSON_ARRAY_LENGTH(var.field)
+//!
+//! OP    ::= = | != | <> | > | < | >= | <= | <=> | <-> | <#> | <+>
 //!         | BETWEEN n AND n
 //!         | IN (val, ...)
 //!         | LIKE 'pat' | ILIKE 'pat'
@@ -45,7 +66,7 @@
 //!         | '{"type":"Point",...}'  (auto-parsed JSON)
 //! ```
 
-use crate::query::Step;
+use crate::query::{ScoreExpr, Step};
 use crate::sk_hash;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -139,7 +160,10 @@ enum Tok {
     Dash,      // -
     Plus,      // +
     Slash,     // /
-    CosineOp,  // <=>  (vector distance operator for ORDER BY)
+    VecCosineOp, // <=>  cosine distance
+    VecL2Op,     // <->  Euclidean (L2) distance
+    VecDotOp,    // <#>  inner product
+    VecL1Op,     // <+>  Manhattan (L1) distance
     Eof,
 }
 
@@ -211,6 +235,12 @@ enum Kw {
     Add,
     // Index rebuild
     Reindex,
+    // CASE expression
+    Case,
+    When,
+    Then,
+    Else,
+    End,
 }
 
 fn kw_to_str(kw: &Kw) -> &'static str {
@@ -273,6 +303,11 @@ fn kw_to_str(kw: &Kw) -> &'static str {
         Kw::To => "to",
         Kw::Add => "add",
         Kw::Reindex => "reindex",
+        Kw::Case => "case",
+        Kw::When => "when",
+        Kw::Then => "then",
+        Kw::Else => "else",
+        Kw::End => "end",
     }
 }
 
@@ -336,6 +371,11 @@ fn keyword(s: &str) -> Option<Kw> {
         "TO" => Some(Kw::To),
         "ADD" => Some(Kw::Add),
         "REINDEX" => Some(Kw::Reindex),
+        "CASE" => Some(Kw::Case),
+        "WHEN" => Some(Kw::When),
+        "THEN" => Some(Kw::Then),
+        "ELSE" => Some(Kw::Else),
+        "END" => Some(Kw::End),
         _ => None,
     }
 }
@@ -449,20 +489,30 @@ fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
                 i += 1;
             }
             '<' => {
+                // 3-char vector operators — must be checked before 2-char operators.
                 if i + 2 < len && chars[i + 1] == '=' && chars[i + 2] == '>' {
-                    tokens.push(Tok::CosineOp);
+                    tokens.push(Tok::VecCosineOp); // <=>
+                    i += 3;
+                } else if i + 2 < len && chars[i + 1] == '-' && chars[i + 2] == '>' {
+                    tokens.push(Tok::VecL2Op); // <->
+                    i += 3;
+                } else if i + 2 < len && chars[i + 1] == '#' && chars[i + 2] == '>' {
+                    tokens.push(Tok::VecDotOp); // <#>
+                    i += 3;
+                } else if i + 2 < len && chars[i + 1] == '+' && chars[i + 2] == '>' {
+                    tokens.push(Tok::VecL1Op); // <+>
                     i += 3;
                 } else if i + 1 < len && chars[i + 1] == '=' {
-                    tokens.push(Tok::Lte);
+                    tokens.push(Tok::Lte); // <=
                     i += 2;
                 } else if i + 1 < len && chars[i + 1] == '>' {
-                    tokens.push(Tok::Neq);
+                    tokens.push(Tok::Neq); // <>
                     i += 2;
                 } else if i + 1 < len && chars[i + 1] == '-' {
-                    tokens.push(Tok::BackArrow);
+                    tokens.push(Tok::BackArrow); // <-
                     i += 2;
                 } else {
-                    tokens.push(Tok::Lt);
+                    tokens.push(Tok::Lt); // <
                     i += 1;
                 }
             }
@@ -633,8 +683,10 @@ enum OrderKey {
     /// One or more `field [ASC|DESC]` columns, evaluated left-to-right.
     Fields(Vec<(String, bool)>),
     Bm25(String, String, bool),
-    /// `field <=> [f32, ...]` — sort by ascending cosine distance (nearest first).
-    Vector { field: String, query: Vec<f32> },
+    /// `field <op> [f32, ...]` — sort by vector distance (nearest first, Dot negated).
+    Vector { field: String, query: Vec<f32>, metric: crate::query::VecMetric },
+    /// Arithmetic score expression, e.g. `BM25(title,'q') * 0.7 + popularity * 0.3`.
+    Expr(ScoreExpr, bool),
 }
 
 struct SelectStmt {
@@ -1228,48 +1280,73 @@ impl Parser {
         if matches!(self.peek(), Tok::Kw(Kw::Order)) {
             self.advance();
             self.expect_kw(Kw::By, "BY")?;
-            let field_or_bm25 = self.expect_ident()?;
-            let upper = field_or_bm25.to_uppercase();
-            if upper == "BM25" {
-                // BM25 ORDER BY is single-column — no comma extension
-                let bm25_expr = self.parse_bm25_function()?;
+
+            // Special case: `field <op> [vec]` — vector distance sort (all 4 metrics).
+            // Peek ahead: if first token is a plain ident and the next is a vec operator,
+            // use the fast vector path.
+            let vec_op = if matches!(self.peek(), Tok::Ident(_)) {
+                let saved = self.pos;
+                self.advance(); // consume ident temporarily
+                let op = match self.peek() {
+                    Tok::VecCosineOp => Some(crate::query::VecMetric::Cosine),
+                    Tok::VecL2Op     => Some(crate::query::VecMetric::L2),
+                    Tok::VecDotOp    => Some(crate::query::VecMetric::Dot),
+                    Tok::VecL1Op     => Some(crate::query::VecMetric::L1),
+                    _ => None,
+                };
+                self.pos = saved; // roll back
+                op
+            } else {
+                None
+            };
+
+            if let Some(metric) = vec_op {
+                let field = self.expect_ident()?;
+                self.advance(); // consume operator
+                let query = self.parse_f32_array()?;
+                order_by = Some(OrderKey::Vector { field, query, metric });
+            } else {
+                // Arithmetic score expression (handles plain fields, BM25, VECTOR_SIM,
+                // and any combination with +, -, *, /, parentheses).
+                let expr = self.parse_score_expr()?;
+
+                // Read optional direction. Score expressions default to DESC
+                // (highest score first); plain field sorts default to ASC.
+                let is_plain_field = matches!(&expr, ScoreExpr::Field(_));
                 let ascending = match self.peek() {
                     Tok::Kw(Kw::Desc) => { self.advance(); false }
                     Tok::Kw(Kw::Asc)  => { self.advance(); true  }
-                    _ => true,
+                    _ => is_plain_field, // field → true (ASC), score → false (DESC)
                 };
-                if let CondExpr::Bm25Func { field, query } = bm25_expr {
-                    order_by = Some(OrderKey::Bm25(field, query, ascending));
+
+                // Classify the result:
+                match expr {
+                    // Plain field(s) — use the fast multi-column sort path.
+                    ScoreExpr::Field(name) if matches!(self.peek(), Tok::Comma) => {
+                        // Multi-column: `field1 [ASC|DESC], field2 [ASC|DESC], ...`
+                        let mut cols = vec![(name, ascending)];
+                        while matches!(self.peek(), Tok::Comma) {
+                            self.advance(); // consume comma
+                            let next_ident = self.expect_ident()?;
+                            let next_field = self.parse_json_path_tail(next_ident);
+                            let next_asc = match self.peek() {
+                                Tok::Kw(Kw::Desc) => { self.advance(); false }
+                                Tok::Kw(Kw::Asc)  => { self.advance(); true  }
+                                _ => true,
+                            };
+                            cols.push((next_field, next_asc));
+                        }
+                        order_by = Some(OrderKey::Fields(cols));
+                    }
+                    ScoreExpr::Field(name) => {
+                        // Single-column plain field sort.
+                        order_by = Some(OrderKey::Fields(vec![(name, ascending)]));
+                    }
+                    // Everything else — arithmetic score expression.
+                    other => {
+                        order_by = Some(OrderKey::Expr(other, ascending));
+                    }
                 }
-            } else if matches!(self.peek(), Tok::CosineOp) {
-                // Vector ORDER BY: field <=> [f32, ...]
-                self.advance(); // consume <=>
-                let query = self.parse_f32_array()?;
-                order_by = Some(OrderKey::Vector { field: field_or_bm25, query });
-            } else {
-                // Multi-column field ORDER BY: field1 [ASC|DESC] [, field2 [ASC|DESC] ...]
-                let mut cols: Vec<(String, bool)> = Vec::new();
-                // First column (already parsed its ident above)
-                let first_expr = self.parse_json_path_tail(field_or_bm25);
-                let first_asc = match self.peek() {
-                    Tok::Kw(Kw::Desc) => { self.advance(); false }
-                    Tok::Kw(Kw::Asc)  => { self.advance(); true  }
-                    _ => true,
-                };
-                cols.push((first_expr, first_asc));
-                // Additional columns after comma
-                while matches!(self.peek(), Tok::Comma) {
-                    self.advance(); // consume comma
-                    let next_ident = self.expect_ident()?;
-                    let next_expr = self.parse_json_path_tail(next_ident);
-                    let next_asc = match self.peek() {
-                        Tok::Kw(Kw::Desc) => { self.advance(); false }
-                        Tok::Kw(Kw::Asc)  => { self.advance(); true  }
-                        _ => true,
-                    };
-                    cols.push((next_expr, next_asc));
-                }
-                order_by = Some(OrderKey::Fields(cols));
             }
         }
 
@@ -1931,6 +2008,154 @@ impl Parser {
             }
         }
         Ok(values)
+    }
+
+    // ── Score expression parser (arithmetic ORDER BY) ─────────────────────────
+
+    /// Entry point: parse a score expression with `+` / `-` at the top level.
+    ///
+    /// Grammar:
+    /// ```text
+    /// score_expr  = score_mul ( ('+' | '-') score_mul )*
+    /// score_mul   = score_unary ( ('*' | '/') score_unary )*
+    /// score_unary = '-' score_unary | score_atom
+    /// score_atom  = '(' score_expr ')'
+    ///             | BM25 '(' ident ',' string ')'
+    ///             | VECTOR_COSINE '(' ident ',' f32_array ')'
+    ///             | VECTOR_L2 '(' ident ',' f32_array ')'
+    ///             | VECTOR_DOT '(' ident ',' f32_array ')'
+    ///             | VECTOR_L1 '(' ident ',' f32_array ')'
+    ///             | ST_DISTANCE_KM '(' ident ',' POINT '(' lon lat ')' ')'
+    ///             | ident [ json_path_tail ]
+    ///             | number
+    /// ```
+    fn parse_score_expr(&mut self) -> Result<ScoreExpr, SqlError> {
+        let mut left = self.parse_score_mul()?;
+        loop {
+            match self.peek() {
+                Tok::Plus => {
+                    self.advance();
+                    let right = self.parse_score_mul()?;
+                    left = ScoreExpr::Add(Box::new(left), Box::new(right));
+                }
+                Tok::Dash => {
+                    // Guard: don't consume '->' or '->>' (Arrow / LongArrow are
+                    // their own tokens, so plain Dash here is always subtraction).
+                    self.advance();
+                    let right = self.parse_score_mul()?;
+                    left = ScoreExpr::Sub(Box::new(left), Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_score_mul(&mut self) -> Result<ScoreExpr, SqlError> {
+        let mut left = self.parse_score_unary()?;
+        loop {
+            match self.peek() {
+                Tok::Star => {
+                    self.advance();
+                    let right = self.parse_score_unary()?;
+                    left = ScoreExpr::Mul(Box::new(left), Box::new(right));
+                }
+                Tok::Slash => {
+                    self.advance();
+                    let right = self.parse_score_unary()?;
+                    left = ScoreExpr::Div(Box::new(left), Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_score_unary(&mut self) -> Result<ScoreExpr, SqlError> {
+        if matches!(self.peek(), Tok::Dash) {
+            self.advance();
+            let inner = self.parse_score_unary()?;
+            return Ok(ScoreExpr::Neg(Box::new(inner)));
+        }
+        self.parse_score_atom()
+    }
+
+    fn parse_score_atom(&mut self) -> Result<ScoreExpr, SqlError> {
+        match self.peek().clone() {
+            Tok::Num(n) => {
+                self.advance();
+                Ok(ScoreExpr::Lit(n))
+            }
+            Tok::LParen => {
+                self.advance(); // consume '('
+                let inner = self.parse_score_expr()?;
+                self.expect_rparen()?;
+                Ok(inner)
+            }
+            Tok::Ident(name) => {
+                self.advance();
+                match name.to_ascii_uppercase().as_str() {
+                    "BM25" => {
+                        self.expect_lparen()?;
+                        let field = self.expect_ident()?;
+                        self.expect_comma()?;
+                        let query = self.expect_str()?;
+                        self.expect_rparen()?;
+                        Ok(ScoreExpr::Bm25 { field, query })
+                    }
+                    "VECTOR_COSINE" => {
+                        self.expect_lparen()?;
+                        let field = self.expect_ident()?;
+                        self.expect_comma()?;
+                        let query = self.parse_f32_array()?;
+                        self.expect_rparen()?;
+                        Ok(ScoreExpr::VectorCosine { field, query })
+                    }
+                    "VECTOR_L2" => {
+                        self.expect_lparen()?;
+                        let field = self.expect_ident()?;
+                        self.expect_comma()?;
+                        let query = self.parse_f32_array()?;
+                        self.expect_rparen()?;
+                        Ok(ScoreExpr::VectorL2 { field, query })
+                    }
+                    "VECTOR_DOT" => {
+                        self.expect_lparen()?;
+                        let field = self.expect_ident()?;
+                        self.expect_comma()?;
+                        let query = self.parse_f32_array()?;
+                        self.expect_rparen()?;
+                        Ok(ScoreExpr::VectorDot { field, query })
+                    }
+                    "VECTOR_L1" => {
+                        self.expect_lparen()?;
+                        let field = self.expect_ident()?;
+                        self.expect_comma()?;
+                        let query = self.parse_f32_array()?;
+                        self.expect_rparen()?;
+                        Ok(ScoreExpr::VectorL1 { field, query })
+                    }
+                    "ST_DISTANCE_KM" => {
+                        // ST_DISTANCE_KM(field, POINT(lon lat))
+                        self.expect_lparen()?;
+                        let field = self.expect_ident()?;
+                        self.expect_comma()?;
+                        let (lon, lat) = self.parse_point_literal()?;
+                        self.expect_rparen()?;
+                        Ok(ScoreExpr::StDistance { field, lat, lon })
+                    }
+                    _ => {
+                        // Plain field name, with optional JSON path (col->'key'->>'leaf').
+                        let field = self.parse_json_path_tail(name);
+                        Ok(ScoreExpr::Field(field))
+                    }
+                }
+            }
+            other => Err(SqlError::UnexpectedToken {
+                expected: "score expression (number, field, BM25, VECTOR_COSINE, VECTOR_L2, VECTOR_DOT, VECTOR_L1, ST_DISTANCE_KM, or parentheses)",
+                got: format!("{other:?}"),
+            }),
+        }
     }
 
     /// Parse `POINT(lon lat)` → `(lon, lat)`.
@@ -3096,11 +3321,13 @@ impl Parser {
     /// [LIMIT n]
     /// ```
     fn parse_match_agg_path(&mut self) -> Result<crate::query::MatchAggStmt, SqlError> {
-        use crate::query::{MatchAggStart, MatchAggStmt};
+        use crate::query::{HopSpec, MatchAggStart, MatchAggStmt};
 
         // ── Start node ────────────────────────────────────────────────────
         let start_node = self.parse_match_node()?;
-        let start = match start_node.label {
+        let start_var:   Option<String> = start_node.var.clone();
+        let start_label: Option<String> = start_node.label.clone();
+        let mut start = match start_node.label {
             Some(ref lbl) => MatchAggStart::Collection(sk_hash(lbl)),
             None => match start_node.var {
                 Some(ref v) => MatchAggStart::Slug(sk_hash(v)),
@@ -3109,15 +3336,56 @@ impl Parser {
         };
 
         // ── Hop chain ─────────────────────────────────────────────────────
-        let mut hops: Vec<(u64, String)> = Vec::new();
+        // Edge pattern forms:
+        //   -[r:edge_type]->   edge_bind="r", type=edge_type
+        //   -[:edge_type]->    edge_bind=None, type=edge_type
+        //   -[r*]->            edge_bind="r", type=any (0)
+        //   -[r*1..3]->        edge_bind="r", type=any (range ignored by executor for now)
+        //   -[*]->             edge_bind=None, type=any
+        let mut hops: Vec<HopSpec> = Vec::new();
         while matches!(self.peek(), Tok::Dash) {
             self.advance(); // consume '-'
             self.expect_lbracket()?;
-            if matches!(self.peek(), Tok::Colon) {
-                self.advance();
+
+            // Determine edge_bind and edge_type_hash from the pattern inside [...]
+            let mut edge_bind: Option<String> = None;
+            let mut edge_type_hash: u64 = 0; // 0 = any
+
+            match self.peek().clone() {
+                Tok::Ident(name) => {
+                    self.advance(); // consume ident (potential bind name)
+                    match self.peek() {
+                        Tok::Colon => {
+                            // r:edge_type
+                            self.advance(); // consume ':'
+                            let et = self.expect_ident()?;
+                            edge_bind = Some(name);
+                            edge_type_hash = sk_hash(&et);
+                        }
+                        _ => {
+                            // r* or r alone — edge bind, any type
+                            edge_bind = Some(name);
+                        }
+                    }
+                }
+                Tok::Colon => {
+                    // :edge_type — no bind name
+                    self.advance(); // consume ':'
+                    let et = self.expect_ident()?;
+                    edge_type_hash = sk_hash(&et);
+                }
+                _ => { /* * or ] — anonymous, any type */ }
             }
-            let edge_type = self.expect_ident()?;
+
+            // Consume remaining tokens in [...] (*, ranges, etc.)
+            loop {
+                match self.peek() {
+                    Tok::RBracket | Tok::Eof => break,
+                    _ => { self.advance(); }
+                }
+            }
             self.expect_rbracket()?;
+
             if !matches!(self.peek(), Tok::Arrow) {
                 return Err(SqlError::UnexpectedToken {
                     expected: "->",
@@ -3126,9 +3394,54 @@ impl Parser {
             }
             self.advance(); // consume '->'
             self.expect_lparen()?;
-            let bind_name = self.expect_ident()?;
+            let node_bind = self.expect_ident()?;
+            if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; } // skip :col
             self.expect_rparen()?;
-            hops.push((sk_hash(&edge_type), bind_name));
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind });
+        }
+
+        // ── WHERE clause (optional) ───────────────────────────────────────
+        // Supported: WHERE start_var._key = 'slug'  — refines Collection → Slug.
+        // Multiple AND conditions are parsed but only _key on the start var acts.
+        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
+            self.advance(); // consume WHERE
+            loop {
+                // Parse one condition: var.field = value
+                let cond_var = self.expect_ident()?;
+                self.expect_dot()?;
+                let cond_field = self.expect_ident()?;
+                if !matches!(self.peek(), Tok::Eq) {
+                    return Err(SqlError::UnexpectedToken {
+                        expected: "=",
+                        got: format!("{:?}", self.peek()),
+                    });
+                }
+                self.advance(); // consume '='
+                let cond_val = self.parse_value()?;
+
+                // _key on the start var upgrades MatchAggStart to Slug.
+                // Reconstruct full slug: if start has a collection label,
+                // slug = "label/key_value", else use the value as-is.
+                if cond_field == "_key" {
+                    if let Some(ref sv) = start_var {
+                        if *sv == cond_var {
+                            if let Some(key_val) = cond_val.as_str() {
+                                let full_slug = match start_label {
+                                    Some(ref lbl) => format!("{}/{}", lbl, key_val),
+                                    None => key_val.to_string(),
+                                };
+                                start = MatchAggStart::Slug(sk_hash(&full_slug));
+                            }
+                        }
+                    }
+                }
+
+                if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                    self.advance(); // consume AND, continue to next condition
+                } else {
+                    break;
+                }
+            }
         }
 
         // ── RETURN clause ─────────────────────────────────────────────────
@@ -3159,6 +3472,160 @@ impl Parser {
                 if matches!(self.peek(), Tok::Kw(Kw::Asc)) {
                     self.advance();
                 }
+                true
+            };
+            Some((alias, ascending))
+        } else {
+            None
+        };
+
+        // ── LIMIT ─────────────────────────────────────────────────────────
+        let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
+            self.advance();
+            Some(self.expect_num()? as usize)
+        } else {
+            None
+        };
+
+        Ok(MatchAggStmt { start, hops, returns, group_by, order_by, limit })
+    }
+
+    /// Parse `SELECT return_list FROM MATCH (start)-[edge]->(node)... [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`
+    ///
+    /// The SELECT list acts as the RETURN clause; no RETURN keyword is present.
+    fn parse_select_from_match(&mut self) -> Result<crate::query::MatchAggStmt, SqlError> {
+        use crate::query::{HopSpec, MatchAggStart, MatchAggStmt};
+
+        self.expect_kw(Kw::Select, "SELECT")?;
+        let returns = self.parse_agg_return_list()?;
+
+        self.expect_kw(Kw::From, "FROM")?;
+        self.expect_kw(Kw::Match, "MATCH")?;
+
+        // ── Start node ────────────────────────────────────────────────────
+        let start_node = self.parse_match_node()?;
+        let start_var:   Option<String> = start_node.var.clone();
+        let start_label: Option<String> = start_node.label.clone();
+        let mut start = match start_node.label {
+            Some(ref lbl) => MatchAggStart::Collection(sk_hash(lbl)),
+            None => match start_node.var {
+                Some(ref v) => MatchAggStart::Slug(sk_hash(v)),
+                None => MatchAggStart::All,
+            },
+        };
+
+        // ── Hop chain (same as parse_match_agg_path) ──────────────────────
+        let mut hops: Vec<HopSpec> = Vec::new();
+        while matches!(self.peek(), Tok::Dash) {
+            self.advance(); // consume '-'
+            self.expect_lbracket()?;
+
+            let mut edge_bind: Option<String> = None;
+            let mut edge_type_hash: u64 = 0;
+
+            match self.peek().clone() {
+                Tok::Ident(name) => {
+                    self.advance();
+                    match self.peek() {
+                        Tok::Colon => {
+                            self.advance();
+                            let et = self.expect_ident()?;
+                            edge_bind = Some(name);
+                            edge_type_hash = sk_hash(&et);
+                        }
+                        _ => { edge_bind = Some(name); }
+                    }
+                }
+                Tok::Colon => {
+                    self.advance();
+                    let et = self.expect_ident()?;
+                    edge_type_hash = sk_hash(&et);
+                }
+                _ => {}
+            }
+
+            loop {
+                match self.peek() {
+                    Tok::RBracket | Tok::Eof => break,
+                    _ => { self.advance(); }
+                }
+            }
+            self.expect_rbracket()?;
+
+            if !matches!(self.peek(), Tok::Arrow) {
+                return Err(SqlError::UnexpectedToken {
+                    expected: "->",
+                    got: format!("{:?}", self.peek()),
+                });
+            }
+            self.advance();
+            self.expect_lparen()?;
+            let node_bind = self.expect_ident()?;
+            if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+            self.expect_rparen()?;
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind });
+        }
+
+        // ── WHERE (same as parse_match_agg_path) ──────────────────────────
+        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
+            self.advance();
+            loop {
+                let cond_var = self.expect_ident()?;
+                self.expect_dot()?;
+                let cond_field = self.expect_ident()?;
+                if !matches!(self.peek(), Tok::Eq) {
+                    return Err(SqlError::UnexpectedToken {
+                        expected: "=",
+                        got: format!("{:?}", self.peek()),
+                    });
+                }
+                self.advance();
+                let cond_val = self.parse_value()?;
+
+                if cond_field == "_key" {
+                    if let Some(ref sv) = start_var {
+                        if *sv == cond_var {
+                            if let Some(key_val) = cond_val.as_str() {
+                                let full_slug = match start_label {
+                                    Some(ref lbl) => format!("{}/{}", lbl, key_val),
+                                    None => key_val.to_string(),
+                                };
+                                start = MatchAggStart::Slug(sk_hash(&full_slug));
+                            }
+                        }
+                    }
+                }
+
+                if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // ── GROUP BY ──────────────────────────────────────────────────────
+        let group_by = if matches!(self.peek(), Tok::Kw(Kw::Group)) {
+            self.advance();
+            self.expect_kw(Kw::By, "BY")?;
+            let var = self.expect_ident()?;
+            self.expect_dot()?;
+            let field = self.expect_ident()?;
+            Some((var, field))
+        } else {
+            None
+        };
+
+        // ── ORDER BY ──────────────────────────────────────────────────────
+        let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
+            self.advance();
+            self.expect_kw(Kw::By, "BY")?;
+            let alias = self.expect_ident()?;
+            let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
+                self.advance();
+                false
+            } else {
+                if matches!(self.peek(), Tok::Kw(Kw::Asc)) { self.advance(); }
                 true
             };
             Some((alias, ascending))
@@ -3227,15 +3694,61 @@ impl Parser {
                     _ => unreachable!(),
                 }
             }
-            Tok::Ident(_) => {
-                let var = self.expect_ident()?;
-                self.expect_dot()?;
-                let field = self.expect_ident()?;
-                MatchAggReturn::Field { var, field }
+            Tok::Ident(ref name_peek) => {
+                let upper = name_peek.to_ascii_uppercase();
+                if upper.starts_with("PATH_")
+                    || matches!(upper.as_str(), "AGE_DAYS" | "AGE_HOURS" | "JSON_ARRAY_LENGTH")
+                {
+                    let func_name = self.expect_ident()?.to_ascii_uppercase();
+                    self.expect_lparen()?;
+                    let var = self.expect_ident()?;
+                    self.expect_dot()?;
+                    let field = self.expect_ident()?;
+                    self.expect_rparen()?;
+                    path_func_variant(&func_name, var, field)?
+                } else if upper == "NOW" {
+                    self.advance(); // consume NOW
+                    self.expect_lparen()?;
+                    self.expect_rparen()?;
+                    MatchAggReturn::Now
+                } else {
+                    let var = self.expect_ident()?;
+                    self.expect_dot()?;
+                    let field = self.expect_ident()?;
+                    MatchAggReturn::Field { var, field }
+                }
+            }
+            Tok::Kw(Kw::Case) => {
+                use crate::query::{CaseCond, CmpOp};
+                self.advance(); // consume CASE
+                let mut branches: Vec<(CaseCond, Value)> = Vec::new();
+                let mut else_val = Value::Null;
+                loop {
+                    match self.peek().clone() {
+                        Tok::Kw(Kw::When) => {
+                            self.advance(); // consume WHEN
+                            let var = self.expect_ident()?;
+                            self.expect_dot()?;
+                            let field = self.expect_ident()?;
+                            let op: CmpOp = self.parse_cmp_op()?;
+                            let val = self.parse_value()?;
+                            self.expect_kw(Kw::Then, "THEN")?;
+                            let then_val = self.parse_value()?;
+                            branches.push((CaseCond { var, field, op, val }, then_val));
+                        }
+                        Tok::Kw(Kw::Else) => {
+                            self.advance(); // consume ELSE
+                            else_val = self.parse_value()?;
+                        }
+                        _ => break,
+                    }
+                }
+                self.expect_kw(Kw::End, "END")?;
+                MatchAggReturn::Case { branches, else_val }
             }
             other => {
                 return Err(SqlError::UnexpectedToken {
-                    expected: "field expression or aggregate function (SUM, AVG, MIN, MAX, COUNT)",
+                    expected: "field expression or aggregate function (SUM, AVG, MIN, MAX, COUNT, PATH_*, CASE, NOW, AGE_DAYS, AGE_HOURS, JSON_ARRAY_LENGTH)",
                     got: format!("{other:?}"),
                 })
             }
@@ -3249,6 +3762,18 @@ impl Parser {
             MatchAggReturn::Avg(_) => "avg".to_string(),
             MatchAggReturn::Min(_) => "min".to_string(),
             MatchAggReturn::Max(_) => "max".to_string(),
+            MatchAggReturn::PathAvg { .. } => "path_avg".to_string(),
+            MatchAggReturn::PathSum { .. } => "path_sum".to_string(),
+            MatchAggReturn::PathMin { .. } => "path_min".to_string(),
+            MatchAggReturn::PathMax { .. } => "path_max".to_string(),
+            MatchAggReturn::PathProduct { .. } => "path_product".to_string(),
+            MatchAggReturn::PathFirst { .. } => "path_first".to_string(),
+            MatchAggReturn::PathLast { .. } => "path_last".to_string(),
+            MatchAggReturn::Case { .. } => "case".to_string(),
+            MatchAggReturn::AgeDays { .. } => "age_days".to_string(),
+            MatchAggReturn::AgeHours { .. } => "age_hours".to_string(),
+            MatchAggReturn::Now => "now".to_string(),
+            MatchAggReturn::JsonArrayLen { .. } => "json_array_length".to_string(),
         };
         let alias = if matches!(self.peek(), Tok::Kw(Kw::As)) {
             self.advance();
@@ -3312,6 +3837,23 @@ impl Parser {
             }
             other => Err(SqlError::UnexpectedToken {
                 expected: "number, var.field, or (expr)",
+                got: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// Parse a comparison operator token into a [`CmpOp`].
+    fn parse_cmp_op(&mut self) -> Result<crate::query::CmpOp, SqlError> {
+        use crate::query::CmpOp;
+        match self.peek() {
+            Tok::Eq  => { self.advance(); Ok(CmpOp::Eq) }
+            Tok::Neq => { self.advance(); Ok(CmpOp::Neq) }
+            Tok::Lt  => { self.advance(); Ok(CmpOp::Lt) }
+            Tok::Gt  => { self.advance(); Ok(CmpOp::Gt) }
+            Tok::Lte => { self.advance(); Ok(CmpOp::Lte) }
+            Tok::Gte => { self.advance(); Ok(CmpOp::Gte) }
+            other => Err(SqlError::UnexpectedToken {
+                expected: "comparison operator (=, !=, <>, <, >, <=, >=)",
                 got: format!("{other:?}"),
             }),
         }
@@ -4002,8 +4544,11 @@ fn append_tail(
             OrderKey::Bm25(field, query, ascending) => {
                 steps.push(Step::Bm25Sort(field, query, ascending));
             }
-            OrderKey::Vector { field, query } => {
-                steps.push(Step::SortByVector { field, query });
+            OrderKey::Vector { field, query, metric } => {
+                steps.push(Step::SortByVector { field, query, metric });
+            }
+            OrderKey::Expr(expr, ascending) => {
+                steps.push(Step::SortByExpr { expr, ascending });
             }
         }
     }
@@ -4263,6 +4808,12 @@ pub enum MatchOrAgg {
 pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
     let tokens = tokenize(sql)?;
 
+    // SELECT … FROM MATCH — check before regular SELECT routing.
+    if is_select_from_match(&tokens) {
+        let stmt = Parser::new(tokens).parse_select_from_match()?;
+        return Ok(MatchOrAgg::Agg(stmt));
+    }
+
     // Non-MATCH SQL goes through the regular pipeline.
     if !matches!(tokens.first(), Some(Tok::Kw(Kw::Match))) {
         let mut parser = Parser::new(tokens);
@@ -4294,6 +4845,41 @@ pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
     Ok(MatchOrAgg::Steps(all_steps))
 }
 
+/// Return `true` when the SQL is `SELECT … FROM MATCH (…)-[…]->(…) …`.
+fn is_select_from_match(tokens: &[Tok]) -> bool {
+    if !matches!(tokens.first(), Some(Tok::Kw(Kw::Select))) {
+        return false;
+    }
+    tokens.windows(2).any(|w| {
+        matches!(w, [Tok::Kw(Kw::From), Tok::Kw(Kw::Match)])
+    })
+}
+
+/// Map an uppercase PATH_* / time function name + (var, field) to a `MatchAggReturn`.
+fn path_func_variant(
+    name: &str,
+    var: String,
+    field: String,
+) -> Result<crate::query::MatchAggReturn, SqlError> {
+    use crate::query::MatchAggReturn;
+    match name {
+        "PATH_AVG"     => Ok(MatchAggReturn::PathAvg { var, field }),
+        "PATH_SUM"     => Ok(MatchAggReturn::PathSum { var, field }),
+        "PATH_MIN"     => Ok(MatchAggReturn::PathMin { var, field }),
+        "PATH_MAX"     => Ok(MatchAggReturn::PathMax { var, field }),
+        "PATH_PRODUCT" => Ok(MatchAggReturn::PathProduct { var, field }),
+        "PATH_FIRST"   => Ok(MatchAggReturn::PathFirst { var, field }),
+        "PATH_LAST"    => Ok(MatchAggReturn::PathLast { var, field }),
+        "AGE_DAYS"     => Ok(MatchAggReturn::AgeDays { var, field }),
+        "AGE_HOURS"    => Ok(MatchAggReturn::AgeHours { var, field }),
+        "JSON_ARRAY_LENGTH" => Ok(MatchAggReturn::JsonArrayLen { var, field }),
+        _ => Err(SqlError::UnexpectedToken {
+            expected: "known PATH_* or time function",
+            got: name.to_string(),
+        }),
+    }
+}
+
 /// Look at the token stream to determine if a MATCH statement has an
 /// aggregate RETURN clause (var.field or SUM/AVG/MIN/MAX/COUNT).
 fn is_agg_match(tokens: &[Tok]) -> bool {
@@ -4311,8 +4897,16 @@ fn is_agg_match(tokens: &[Tok]) -> bool {
         | Some(Tok::Kw(Kw::Avg))
         | Some(Tok::Kw(Kw::Min))
         | Some(Tok::Kw(Kw::Max)) => true,
+        // CASE WHEN → aggregate
+        Some(Tok::Kw(Kw::Case)) => true,
         // identifier followed by `.` → var.field (aggregate field ref)
-        Some(Tok::Ident(_)) => matches!(tokens.get(pos + 1), Some(Tok::Dot)),
+        // identifier that is a PATH_* or time function → aggregate
+        Some(Tok::Ident(name)) => {
+            let upper = name.to_ascii_uppercase();
+            matches!(tokens.get(pos + 1), Some(Tok::Dot))
+                || upper.starts_with("PATH_")
+                || matches!(upper.as_str(), "AGE_DAYS" | "AGE_HOURS" | "JSON_ARRAY_LENGTH" | "NOW")
+        }
         _ => false,
     }
 }
@@ -4578,6 +5172,7 @@ mod tests {
                 Step::Distinct => "Distinct",
                 Step::Sort(..) => "Sort",
                 Step::SortByVector { .. } => "SortByVector",
+                Step::SortByExpr { .. } => "SortByExpr",
                 Step::Skip(_) => "Skip",
                 Step::Take(_) => "Take",
                 Step::Select(_) => "Select",
@@ -5030,7 +5625,8 @@ mod tests {
         let steps =
             parse_and_compile("SELECT * FROM articles ORDER BY BM25(body, 'rust tutorial') DESC")
                 .unwrap();
-        assert_eq!(step_names(&steps), ["Collection", "Bm25Sort"]);
+        // Simple BM25 now compiles to SortByExpr (arithmetic expression path).
+        assert_eq!(step_names(&steps), ["Collection", "SortByExpr"]);
     }
 
     #[test]
@@ -5038,7 +5634,7 @@ mod tests {
         let steps =
             parse_and_compile("SELECT * FROM articles ORDER BY BM25(body, 'rust tutorial') ASC")
                 .unwrap();
-        assert_eq!(step_names(&steps), ["Collection", "Bm25Sort"]);
+        assert_eq!(step_names(&steps), ["Collection", "SortByExpr"]);
     }
 
     #[test]
@@ -5056,7 +5652,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             step_names(&steps),
-            ["Collection", "WhereEq", "Bm25Sort", "Take"]
+            ["Collection", "WhereEq", "SortByExpr", "Take"]
         );
     }
 
@@ -5382,4 +5978,118 @@ pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError> {
             got: format!("{other:?}"),
         }),
     }
+}
+
+// ── MATCH SHORTEST ────────────────────────────────────────────────────────────
+
+/// The result of compiling a graph path query.
+pub enum CompiledPathQuery {
+    /// `MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'from' AND b._key = 'to'`
+    ShortestPath { from_slug: String, to_slug: String },
+}
+
+/// Parse a `MATCH SHORTEST` path query.
+///
+/// ```text
+/// MATCH SHORTEST (a)-[r*]->(b) WHERE a._key = 'from_slug' AND b._key = 'to_slug'
+/// ```
+///
+/// - Node binding names (`a`, `b`) can be anything; collection annotations (`:col`) are allowed
+///   but ignored by the BFS executor.
+/// - The edge pattern (`[r*]`, `[r:type*1..5]`, etc.) is parsed but not enforced yet.
+/// - The `WHERE` conditions must identify both endpoints by `._key`; order is not significant.
+pub fn parse_path_query(sql: &str) -> Result<CompiledPathQuery, SqlError> {
+    let tokens = tokenize(sql)?;
+    let mut p = Parser::new(tokens);
+
+    // MATCH
+    match p.advance() {
+        Tok::Kw(Kw::Match) => {}
+        other => return Err(SqlError::UnexpectedToken { expected: "MATCH", got: format!("{other:?}") }),
+    }
+
+    // SHORTEST
+    match p.advance() {
+        Tok::Ident(ref name) if name.eq_ignore_ascii_case("SHORTEST") => {}
+        other => return Err(SqlError::UnexpectedToken { expected: "SHORTEST", got: format!("{other:?}") }),
+    }
+
+    // (from_binding[:col])
+    p.expect_lparen()?;
+    let from_binding = p.expect_ident()?;
+    if matches!(p.peek(), Tok::Colon) { p.advance(); p.expect_ident()?; }
+    p.expect_rparen()?;
+
+    // -[...edge pattern...]->
+    match p.advance() {
+        Tok::Dash => {}
+        other => return Err(SqlError::UnexpectedToken { expected: "-", got: format!("{other:?}") }),
+    }
+    match p.advance() {
+        Tok::LBracket => {}
+        other => return Err(SqlError::UnexpectedToken { expected: "[", got: format!("{other:?}") }),
+    }
+    // Consume edge pattern tokens until ]
+    loop {
+        match p.peek() {
+            Tok::RBracket | Tok::Eof => break,
+            _ => { p.advance(); }
+        }
+    }
+    match p.advance() {
+        Tok::RBracket => {}
+        other => return Err(SqlError::UnexpectedToken { expected: "]", got: format!("{other:?}") }),
+    }
+    match p.advance() {
+        Tok::Arrow => {}
+        other => return Err(SqlError::UnexpectedToken { expected: "->", got: format!("{other:?}") }),
+    }
+
+    // (to_binding[:col])
+    p.expect_lparen()?;
+    let to_binding = p.expect_ident()?;
+    if matches!(p.peek(), Tok::Colon) { p.advance(); p.expect_ident()?; }
+    p.expect_rparen()?;
+
+    // WHERE from_binding._key = 'slug' AND to_binding._key = 'slug'  (any order)
+    p.expect_kw(Kw::Where, "WHERE")?;
+
+    let mut from_slug: Option<String> = None;
+    let mut to_slug: Option<String> = None;
+
+    for _ in 0..2 {
+        // binding . _key = 'value'
+        let binding = p.expect_ident()?;
+        match p.advance() {
+            Tok::Dot => {}
+            other => return Err(SqlError::UnexpectedToken { expected: ".", got: format!("{other:?}") }),
+        }
+        let field = p.expect_ident()?;
+        if field != "_key" {
+            return Err(SqlError::UnexpectedToken { expected: "_key", got: field });
+        }
+        match p.advance() {
+            Tok::Eq => {}
+            other => return Err(SqlError::UnexpectedToken { expected: "=", got: format!("{other:?}") }),
+        }
+        let value = p.expect_str()?;
+
+        if binding == from_binding {
+            from_slug = Some(value);
+        } else if binding == to_binding {
+            to_slug = Some(value);
+        } else {
+            return Err(SqlError::UnexpectedToken {
+                expected: "from or to binding name",
+                got: binding,
+            });
+        }
+
+        if matches!(p.peek(), Tok::Kw(Kw::And)) { p.advance(); }
+    }
+
+    let from_slug = from_slug.ok_or(SqlError::UnexpectedEnd { expected: "from node _key condition" })?;
+    let to_slug   = to_slug  .ok_or(SqlError::UnexpectedEnd { expected: "to node _key condition" })?;
+
+    Ok(CompiledPathQuery::ShortestPath { from_slug, to_slug })
 }

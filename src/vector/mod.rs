@@ -23,6 +23,7 @@ pub trait Distance {
 pub struct L2Distance;
 pub struct DotProduct;
 pub struct CosineDistance;
+pub struct L1Distance;
 
 impl Distance for L2Distance {
     #[inline(always)]
@@ -98,6 +99,13 @@ impl Distance for CosineDistance {
             let sim = dot / (mag_a * mag_b);
             1.0 - sim.max(-1.0).min(1.0)
         }
+    }
+}
+
+impl Distance for L1Distance {
+    #[inline(always)]
+    fn eval(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
     }
 }
 

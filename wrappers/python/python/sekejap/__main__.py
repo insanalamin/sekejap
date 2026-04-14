@@ -39,7 +39,7 @@ def _run_sql(db: DB, sql: str) -> None:
             _print_hits(db.query(sql))
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
-    elif first in ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP"):
+    elif first in ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "REINDEX"):
         try:
             n = db.execute(sql)
             if n == 0:
@@ -57,7 +57,8 @@ def _run_sql(db: DB, sql: str) -> None:
             print(f"error: {e}", file=sys.stderr)
     else:
         print(
-            f"unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE CREATE DROP",
+            "unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE"
+            " CREATE DROP ALTER REINDEX",
             file=sys.stderr,
         )
 
@@ -84,14 +85,58 @@ sekejap dot commands
 .help               show this help
 .quit / .q / .exit  exit
 
-SQL (end each statement with ;)
-────────────────────────────────
+SQL — standard (end each statement with ;)
+──────────────────────────────────────────
 SELECT * FROM collection [WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n];
 INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...);
 UPDATE collection SET field = val [WHERE ...];
 DELETE FROM collection [WHERE ...];
 CREATE TABLE collection (_key TEXT PRIMARY KEY, field TYPE);
-MATCH (a:col)-[:rel]->(b:col) WHERE a._key = 'x' RETURN b;
+ALTER TABLE collection ADD COLUMN field TYPE;
+ALTER TABLE collection DROP COLUMN field;
+ALTER TABLE collection RENAME COLUMN old TO new;
+ALTER TABLE collection RENAME TO new_name;
+REINDEX ON collection USING method (field);
+
+SQL — graph aggregate — RETURN form
+────────────────────────────────────
+MATCH (a:col)-[r:rel]->(b:col)
+    [WHERE a._key = 'val']
+    RETURN expr AS alias [, ...]
+    [GROUP BY col] [ORDER BY col [DESC]] [LIMIT n];
+
+SQL — graph aggregate — SELECT FROM MATCH form
+───────────────────────────────────────────────
+SELECT expr AS alias [, ...]
+FROM MATCH (a:col)-[r:rel]->(b:col)
+    [WHERE a._key = 'val']
+    [GROUP BY col] [ORDER BY col [DESC]] [LIMIT n];
+
+Return expressions
+──────────────────
+var._key, var.field         node / edge field
+COUNT(var)                  number of paths
+SUM(var.field)              numeric sum
+AVG(var.field)              numeric mean
+MIN(var.field)              minimum
+MAX(var.field)              maximum
+r._depth                    hop depth of edge bind
+r._path_keys                JSON array of slug keys along path
+r._path_strength            JSON array of edge strengths along path
+PATH_PRODUCT(r._path_strength)   product of all values in array
+PATH_AVG / PATH_SUM / PATH_MIN / PATH_MAX(r.field)
+PATH_FIRST(r._path_keys)    first element of path array
+PATH_LAST(r._path_keys)     last element of path array
+JSON_ARRAY_LENGTH(r._path_keys)  length of a path array
+CASE WHEN var.field = val THEN lit ELSE lit END
+NOW()                       current Unix timestamp (integer)
+AGE_DAYS(var.field)         days since epoch field
+AGE_HOURS(var.field)        hours since epoch field
+
+Shortest path
+─────────────
+MATCH SHORTEST (a)-[r*]->(b)
+    WHERE a._key = 'col/key1' AND b._key = 'col/key2';
 
 Introspection
 ─────────────
@@ -102,8 +147,10 @@ SHOW EDGES FROM col1 TO col2;
 SHOW <collection>;
 
 Filters: =  !=  >  <  >=  <=  BETWEEN n AND n  IN (...)  LIKE  IS NULL
-Spatial: ST_DWithin  ST_Contains  ST_Within  ST_Intersects
+Spatial: ST_DWithin  ST_Contains  ST_Within  ST_Intersects  ST_DISTANCE_KM(a,b)
 Vector:  WHERE VECTOR_NEAR(field, [f32, ...], k)
+         VECTOR_COSINE(a,b)  VECTOR_L2(a,b)  VECTOR_DOT(a,b)  VECTOR_L1(a,b)
+         a <=> b  a <-> b  a <#> b  a <+> b
 """)
 
     elif cmd == ".open":

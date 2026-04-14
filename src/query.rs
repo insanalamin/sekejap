@@ -15,6 +15,64 @@ pub struct Hit {
     pub payload: Option<Value>,
 }
 
+// ── VecMetric ─────────────────────────────────────────────────────────────────
+
+/// Which vector distance metric to use.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum VecMetric {
+    /// Cosine distance (`<=>`, `VECTOR_COSINE`). Lower = more similar.
+    Cosine,
+    /// Squared Euclidean distance (`<->`, `VECTOR_L2`). Lower = closer.
+    L2,
+    /// Inner product (`<#>`, `VECTOR_DOT`). Higher = more similar (negated for sort).
+    Dot,
+    /// Manhattan / taxicab distance (`<+>`, `VECTOR_L1`). Lower = closer.
+    L1,
+}
+
+// ── ScoreExpr ─────────────────────────────────────────────────────────────────
+
+/// An arithmetic score expression used in `ORDER BY` scoring.
+///
+/// Evaluates to an `f64` per node. Designed for weighted multi-signal ranking:
+///
+/// ```sql
+/// ORDER BY BM25(title, 'rust') * 0.7 + BM25(body, 'rust') * 0.3 DESC
+/// ORDER BY VECTOR_COSINE(embedding, [0.1, 0.2]) * 0.5 + popularity * 0.5 DESC
+/// ```
+#[derive(Clone, Debug)]
+pub enum ScoreExpr {
+    /// Numeric literal, e.g. `0.7`.
+    Lit(f64),
+    /// Payload field coerced to `f64` (absent or non-numeric → 0.0).
+    Field(String),
+    /// BM25 relevance score: `BM25(field, 'query')`.
+    Bm25 { field: String, query: String },
+    /// Cosine similarity (1 − cosine distance): `VECTOR_COSINE(field, [vec])`.
+    VectorCosine { field: String, query: Vec<f32> },
+    /// Squared Euclidean distance: `VECTOR_L2(field, [vec])`.
+    VectorL2 { field: String, query: Vec<f32> },
+    /// Inner product: `VECTOR_DOT(field, [vec])`. Higher = more similar.
+    VectorDot { field: String, query: Vec<f32> },
+    /// Manhattan distance: `VECTOR_L1(field, [vec])`. Lower = closer.
+    VectorL1 { field: String, query: Vec<f32> },
+    /// Great-circle distance in km: `ST_DISTANCE_KM(field, POINT(lon lat))`.
+    ///
+    /// Returns the Haversine distance from the node's geometry to the given point.
+    /// Absent or non-GeoJSON fields → `f64::MAX` (very far away).
+    StDistance { field: String, lat: f64, lon: f64 },
+    /// `a + b`.
+    Add(Box<ScoreExpr>, Box<ScoreExpr>),
+    /// `a - b`.
+    Sub(Box<ScoreExpr>, Box<ScoreExpr>),
+    /// `a * b`.
+    Mul(Box<ScoreExpr>, Box<ScoreExpr>),
+    /// `a / b` — division by zero yields `0.0`.
+    Div(Box<ScoreExpr>, Box<ScoreExpr>),
+    /// `-a`.
+    Neg(Box<ScoreExpr>),
+}
+
 // ── Step ──────────────────────────────────────────────────────────────────────
 
 /// A single pipeline step.
@@ -122,8 +180,13 @@ pub enum Step {
     // ── Ordering / pagination / projection ────────────────────────────────────
     /// Multi-column sort. Columns applied left-to-right; ties broken by next column.
     Sort(Vec<(String, bool)>), // (field, ascending) — evaluated in order
-    /// Sort by cosine distance to a query vector (ascending — nearest first).
-    SortByVector { field: String, query: Vec<f32> },
+    /// Sort by vector distance (ascending — nearest first; Dot negated so higher = first).
+    SortByVector { field: String, query: Vec<f32>, metric: VecMetric },
+    /// Sort by an arithmetic score expression (highest score first by default).
+    ///
+    /// `ascending = false` (default for scores): highest score → first result.
+    /// `ascending = true`: lowest score → first result.
+    SortByExpr { expr: ScoreExpr, ascending: bool },
     Skip(usize),
     Take(usize),
     /// Project only these fields in the returned payload.
@@ -1119,6 +1182,106 @@ fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool {
     }
 }
 
+// ── ScoreExpr helpers ─────────────────────────────────────────────────────────
+
+/// Collect all unique (field, query) pairs from BM25 leaves in the expression.
+fn gather_bm25_keys(expr: &ScoreExpr, out: &mut HashSet<(String, String)>) {
+    match expr {
+        ScoreExpr::Bm25 { field, query } => { out.insert((field.clone(), query.clone())); }
+        ScoreExpr::Add(a, b) | ScoreExpr::Sub(a, b)
+        | ScoreExpr::Mul(a, b) | ScoreExpr::Div(a, b) => {
+            gather_bm25_keys(a, out);
+            gather_bm25_keys(b, out);
+        }
+        ScoreExpr::Neg(a) => gather_bm25_keys(a, out),
+        _ => {}
+    }
+}
+
+/// Collect the first query vector seen per (metric, field) pair in the expression.
+fn gather_vector_keys(expr: &ScoreExpr, out: &mut HashMap<(VecMetric, String), Vec<f32>>) {
+    match expr {
+        ScoreExpr::VectorCosine { field, query } => {
+            out.entry((VecMetric::Cosine, field.clone())).or_insert_with(|| query.clone());
+        }
+        ScoreExpr::VectorL2 { field, query } => {
+            out.entry((VecMetric::L2, field.clone())).or_insert_with(|| query.clone());
+        }
+        ScoreExpr::VectorDot { field, query } => {
+            out.entry((VecMetric::Dot, field.clone())).or_insert_with(|| query.clone());
+        }
+        ScoreExpr::VectorL1 { field, query } => {
+            out.entry((VecMetric::L1, field.clone())).or_insert_with(|| query.clone());
+        }
+        ScoreExpr::Add(a, b) | ScoreExpr::Sub(a, b)
+        | ScoreExpr::Mul(a, b) | ScoreExpr::Div(a, b) => {
+            gather_vector_keys(a, out);
+            gather_vector_keys(b, out);
+        }
+        ScoreExpr::Neg(a) => gather_vector_keys(a, out),
+        _ => {}
+    }
+}
+
+/// Evaluate a `ScoreExpr` for one node, given pre-computed score maps.
+fn eval_score(
+    expr: &ScoreExpr,
+    hash: u64,
+    payload: &Value,
+    db: &CoreDB,
+    bm25_maps: &HashMap<(String, String), HashMap<u64, f64>>,
+    vec_maps: &HashMap<(VecMetric, String), HashMap<u64, f32>>,
+) -> f64 {
+    // Shorthand for recursive calls.
+    macro_rules! rec {
+        ($e:expr) => {
+            eval_score($e, hash, payload, db, bm25_maps, vec_maps)
+        };
+    }
+    match expr {
+        ScoreExpr::Lit(n) => *n,
+        ScoreExpr::Field(name) => payload.get(name).and_then(|v| v.as_f64()).unwrap_or(0.0),
+        ScoreExpr::Bm25 { field, query } => {
+            bm25_maps
+                .get(&(field.clone(), query.clone()))
+                .and_then(|m| m.get(&hash))
+                .copied()
+                .unwrap_or(0.0)
+        }
+        ScoreExpr::VectorCosine { field, .. } => {
+            vec_maps.get(&(VecMetric::Cosine, field.clone()))
+                .and_then(|m| m.get(&hash)).map(|&s| s as f64).unwrap_or(0.0)
+        }
+        ScoreExpr::VectorL2 { field, .. } => {
+            vec_maps.get(&(VecMetric::L2, field.clone()))
+                .and_then(|m| m.get(&hash)).map(|&s| s as f64).unwrap_or(0.0)
+        }
+        ScoreExpr::VectorDot { field, .. } => {
+            vec_maps.get(&(VecMetric::Dot, field.clone()))
+                .and_then(|m| m.get(&hash)).map(|&s| s as f64).unwrap_or(0.0)
+        }
+        ScoreExpr::VectorL1 { field, .. } => {
+            vec_maps.get(&(VecMetric::L1, field.clone()))
+                .and_then(|m| m.get(&hash)).map(|&s| s as f64).unwrap_or(0.0)
+        }
+        ScoreExpr::StDistance { field, lat, lon } => {
+            let point = serde_json::json!({ "type": "Point", "coordinates": [lon, lat] });
+            payload
+                .get(field)
+                .and_then(|geom| crate::geo::distance_km(geom, &point))
+                .unwrap_or(f64::MAX)
+        }
+        ScoreExpr::Add(a, b) => rec!(a) + rec!(b),
+        ScoreExpr::Sub(a, b) => rec!(a) - rec!(b),
+        ScoreExpr::Mul(a, b) => rec!(a) * rec!(b),
+        ScoreExpr::Div(a, b) => {
+            let denom = rec!(b);
+            if denom == 0.0 { 0.0 } else { rec!(a) / denom }
+        }
+        ScoreExpr::Neg(a) => -rec!(a),
+    }
+}
+
 // ── Executor ──────────────────────────────────────────────────────────────────
 
 /// Execute the step pipeline and return candidate slug hashes in order.
@@ -1915,13 +2078,17 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     std::cmp::Ordering::Equal
                 });
             }
-            Step::SortByVector { field, query } => {
-                use crate::vector::{CosineDistance, Distance};
+            Step::SortByVector { field, query, metric } => {
+                use crate::vector::{CosineDistance, L2Distance, DotProduct, L1Distance, Distance};
                 if let Some(field_vecs) = db.vector_field(field) {
                     let mut scored: Vec<(u64, f32)> = candidates.iter().map(|&h| {
-                        let dist = field_vecs.get(&h)
-                            .map(|v| CosineDistance::eval(query, v))
-                            .unwrap_or(f32::MAX);
+                        let dist = field_vecs.get(&h).map(|v| match metric {
+                            VecMetric::Cosine => CosineDistance::eval(query, v),
+                            VecMetric::L2     => L2Distance::eval(query, v),
+                            // Negate dot product so higher similarity → lower sort key → first.
+                            VecMetric::Dot    => -DotProduct::eval(query, v),
+                            VecMetric::L1     => L1Distance::eval(query, v),
+                        }).unwrap_or(f32::MAX);
                         (h, dist)
                     }).collect();
                     scored.sort_unstable_by(|a, b| {
@@ -1929,6 +2096,68 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     });
                     candidates = scored.into_iter().map(|(h, _)| h).collect();
                 }
+            }
+            Step::SortByExpr { expr, ascending } => {
+                use crate::vector::{CosineDistance, L2Distance, DotProduct, L1Distance, Distance};
+
+                // Pre-compute BM25 score maps (one search per unique field+query pair).
+                let mut bm25_keys: HashSet<(String, String)> = HashSet::new();
+                gather_bm25_keys(expr, &mut bm25_keys);
+                let bm25_maps: HashMap<(String, String), HashMap<u64, f64>> = bm25_keys
+                    .into_iter()
+                    .filter_map(|(field, query)| {
+                        let index = db.bm25_indexes.get(&field)?;
+                        let k = candidates.len().max(100);
+                        let results = index.search(&query, k);
+                        let m: HashMap<u64, f64> =
+                            results.iter().map(|h| (h.doc_id, h.score)).collect();
+                        Some(((field, query), m))
+                    })
+                    .collect();
+
+                // Pre-compute vector score maps keyed by (metric, field).
+                let mut vec_keys: HashMap<(VecMetric, String), Vec<f32>> = HashMap::new();
+                gather_vector_keys(expr, &mut vec_keys);
+                let vec_maps: HashMap<(VecMetric, String), HashMap<u64, f32>> = vec_keys
+                    .into_iter()
+                    .filter_map(|((metric, field), query_vec)| {
+                        let field_vecs = db.vector_field(&field)?;
+                        let m: HashMap<u64, f32> = candidates
+                            .iter()
+                            .map(|&h| {
+                                let score = field_vecs.get(&h).map(|v| match &metric {
+                                    VecMetric::Cosine => 1.0 - CosineDistance::eval(&query_vec, v),
+                                    VecMetric::L2     => L2Distance::eval(&query_vec, v),
+                                    VecMetric::Dot    => DotProduct::eval(&query_vec, v),
+                                    VecMetric::L1     => L1Distance::eval(&query_vec, v),
+                                }).unwrap_or(0.0);
+                                (h, score)
+                            })
+                            .collect();
+                        Some(((metric, field), m))
+                    })
+                    .collect();
+
+                let asc = *ascending;
+                let mut scored: Vec<(u64, f64)> = candidates
+                    .iter()
+                    .map(|&h| {
+                        let payload = db
+                            .node_data(h)
+                            .map(|n| &n.payload)
+                            .unwrap_or(&Value::Null);
+                        let s = eval_score(
+                            expr, h, payload, db,
+                            &bm25_maps, &vec_maps,
+                        );
+                        (h, s)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    let ord = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+                    if asc { ord } else { ord.reverse() }
+                });
+                candidates = scored.into_iter().map(|(h, _)| h).collect();
             }
             Step::Skip(n) => {
                 let n = *n;
@@ -2008,6 +2237,26 @@ impl MathExpr {
     }
 }
 
+/// Comparison operator for CASE WHEN conditions.
+#[derive(Clone, Debug)]
+pub enum CmpOp {
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    Lte,
+    Gte,
+}
+
+/// A single CASE WHEN condition: `var.field op literal`.
+#[derive(Clone, Debug)]
+pub struct CaseCond {
+    pub var: String,
+    pub field: String,
+    pub op: CmpOp,
+    pub val: Value,
+}
+
 /// Return expression in a MATCH aggregate RETURN clause.
 #[derive(Clone, Debug)]
 pub enum MatchAggReturn {
@@ -2023,6 +2272,30 @@ pub enum MatchAggReturn {
     Min(MathExpr),
     /// `MAX(math_expr)`
     Max(MathExpr),
+    /// `PATH_AVG(var.field)` — average of JSON array elements in field (first row)
+    PathAvg { var: String, field: String },
+    /// `PATH_SUM(var.field)` — sum of JSON array elements in field (first row)
+    PathSum { var: String, field: String },
+    /// `PATH_MIN(var.field)` — min of JSON array elements in field (first row)
+    PathMin { var: String, field: String },
+    /// `PATH_MAX(var.field)` — max of JSON array elements in field (first row)
+    PathMax { var: String, field: String },
+    /// `PATH_PRODUCT(var.field)` — product of JSON array elements in field (first row)
+    PathProduct { var: String, field: String },
+    /// `PATH_FIRST(var.field)` — first element of JSON array in field (first row)
+    PathFirst { var: String, field: String },
+    /// `PATH_LAST(var.field)` — last element of JSON array in field (first row)
+    PathLast { var: String, field: String },
+    /// `CASE WHEN var.field op literal THEN literal ... [ELSE literal] END`
+    Case { branches: Vec<(CaseCond, Value)>, else_val: Value },
+    /// `AGE_DAYS(var.field)` — whole days elapsed since field's Unix epoch
+    AgeDays { var: String, field: String },
+    /// `AGE_HOURS(var.field)` — whole hours elapsed since field's Unix epoch
+    AgeHours { var: String, field: String },
+    /// `NOW()` — current Unix timestamp in seconds as `i64`
+    Now,
+    /// `JSON_ARRAY_LENGTH(var.field)` — length of a JSON array field
+    JsonArrayLen { var: String, field: String },
 }
 
 impl MatchAggReturn {
@@ -2053,8 +2326,175 @@ impl MatchAggReturn {
                 let max = rows.iter().map(|r| expr.eval(r)).fold(f64::NEG_INFINITY, f64::max);
                 if max.is_infinite() { Value::Null } else { serde_json::json!(max) }
             }
+            MatchAggReturn::PathAvg { var, field } => {
+                let nums = path_field_nums(rows, var, field);
+                if nums.is_empty() { Value::Null } else { serde_json::json!(nums.iter().sum::<f64>() / nums.len() as f64) }
+            }
+            MatchAggReturn::PathSum { var, field } => {
+                let nums = path_field_nums(rows, var, field);
+                if nums.is_empty() { Value::Null } else { serde_json::json!(nums.iter().sum::<f64>()) }
+            }
+            MatchAggReturn::PathMin { var, field } => {
+                let nums = path_field_nums(rows, var, field);
+                let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
+                if min.is_infinite() { Value::Null } else { serde_json::json!(min) }
+            }
+            MatchAggReturn::PathMax { var, field } => {
+                let nums = path_field_nums(rows, var, field);
+                let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                if max.is_infinite() { Value::Null } else { serde_json::json!(max) }
+            }
+            MatchAggReturn::PathProduct { var, field } => {
+                let nums = path_field_nums(rows, var, field);
+                if nums.is_empty() { Value::Null } else { serde_json::json!(nums.iter().fold(1.0_f64, |acc, x| acc * x)) }
+            }
+            MatchAggReturn::PathFirst { var, field } => {
+                rows.first()
+                    .and_then(|r| r.get(var.as_str()))
+                    .and_then(|v| v.get(field.as_str()))
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }
+            MatchAggReturn::PathLast { var, field } => {
+                rows.first()
+                    .and_then(|r| r.get(var.as_str()))
+                    .and_then(|v| v.get(field.as_str()))
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.last())
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }
+            MatchAggReturn::Case { branches, else_val } => {
+                let row = match rows.first() {
+                    Some(r) => r,
+                    None => return else_val.clone(),
+                };
+                for (cond, then_val) in branches {
+                    let actual = row.get(cond.var.as_str())
+                        .and_then(|v| v.get(cond.field.as_str()))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if eval_cmp(&actual, &cond.op, &cond.val) {
+                        return then_val.clone();
+                    }
+                }
+                else_val.clone()
+            }
+            MatchAggReturn::AgeDays { var, field } => {
+                let v = rows.first()
+                    .and_then(|r| r.get(var.as_str()))
+                    .and_then(|v| v.get(field.as_str()))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                match field_as_epoch(&v) {
+                    None => Value::Null,
+                    Some(epoch) => {
+                        let now = now_secs();
+                        serde_json::json!((now - epoch) / 86400)
+                    }
+                }
+            }
+            MatchAggReturn::AgeHours { var, field } => {
+                let v = rows.first()
+                    .and_then(|r| r.get(var.as_str()))
+                    .and_then(|v| v.get(field.as_str()))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                match field_as_epoch(&v) {
+                    None => Value::Null,
+                    Some(epoch) => {
+                        let now = now_secs();
+                        serde_json::json!((now - epoch) / 3600)
+                    }
+                }
+            }
+            MatchAggReturn::Now => serde_json::json!(now_secs()),
+            MatchAggReturn::JsonArrayLen { var, field } => {
+                rows.first()
+                    .and_then(|r| r.get(var.as_str()))
+                    .and_then(|v| v.get(field.as_str()))
+                    .and_then(|v| v.as_array())
+                    .map(|a| serde_json::json!(a.len() as i64))
+                    .unwrap_or(Value::Null)
+            }
         }
     }
+}
+
+// ── Private helpers ────────────────────────────────────────────────────────────
+
+/// Extract all f64 elements from `row[var][field]` (first row, must be JSON array).
+fn path_field_nums(rows: &[PathRow], var: &str, field: &str) -> Vec<f64> {
+    rows.first()
+        .and_then(|r| r.get(var))
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+        .unwrap_or_default()
+}
+
+/// Evaluate a comparison between a JSON value and an RHS literal.
+fn eval_cmp(actual: &Value, op: &CmpOp, rhs: &Value) -> bool {
+    match op {
+        // Use numeric comparison for Eq/Neq to handle int vs float mismatch
+        // (e.g. _depth stored as i64 but SQL literal parsed as f64).
+        CmpOp::Eq  => actual == rhs || cmp_ordered(actual, rhs) == Some(std::cmp::Ordering::Equal),
+        CmpOp::Neq => actual != rhs && cmp_ordered(actual, rhs) != Some(std::cmp::Ordering::Equal),
+        CmpOp::Lt  => cmp_ordered(actual, rhs) == Some(std::cmp::Ordering::Less),
+        CmpOp::Gt  => cmp_ordered(actual, rhs) == Some(std::cmp::Ordering::Greater),
+        CmpOp::Lte => matches!(cmp_ordered(actual, rhs), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+        CmpOp::Gte => matches!(cmp_ordered(actual, rhs), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+    }
+}
+
+fn cmp_ordered(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
+        return x.partial_cmp(&y);
+    }
+    if let (Some(x), Some(y)) = (a.as_str(), b.as_str()) {
+        return Some(x.cmp(y));
+    }
+    None
+}
+
+/// Convert a JSON value (Unix int or "YYYY-MM-DD" string) to a Unix epoch (seconds).
+fn field_as_epoch(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() { return Some(n); }
+    if let Some(n) = v.as_f64() { return Some(n as i64); }
+    if let Some(s) = v.as_str() {
+        if s.len() == 10 {
+            let parts: Vec<&str> = s.splitn(3, '-').collect();
+            if parts.len() == 3 {
+                if let (Ok(y), Ok(m), Ok(d)) = (
+                    parts[0].parse::<i64>(),
+                    parts[1].parse::<i64>(),
+                    parts[2].parse::<i64>(),
+                ) {
+                    return Some(ymd_to_epoch(y, m, d));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Proleptic Gregorian calendar date → Unix epoch seconds (midnight UTC).
+fn ymd_to_epoch(y: i64, m: i64, d: i64) -> i64 {
+    // Julian Day Number (JDN) algorithm by Fliegel & Van Flandern (1968).
+    let jdn = (1461 * (y + 4800 + (m - 14) / 12)) / 4
+        + (367 * (m - 2 - 12 * ((m - 14) / 12))) / 12
+        - (3 * ((y + 4900 + (m - 14) / 12) / 100)) / 4
+        + d - 32075;
+    (jdn - 2_440_588) * 86400 // 2440588 = JDN of 1970-01-01
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Starting point for a MATCH aggregate statement.
@@ -2068,13 +2508,26 @@ pub enum MatchAggStart {
     All,
 }
 
+/// One hop in a MATCH aggregate path.
+#[derive(Clone, Debug)]
+pub struct HopSpec {
+    /// Hash of the required edge type (`0` = any type).
+    pub edge_type_hash: u64,
+    /// Name to bind the destination node in [`PathRow`].
+    pub node_bind: String,
+    /// Optional edge binding — if set, that name is bound in [`PathRow`] to a JSON
+    /// object exposing path intrinsics: `_depth`, `_path_keys`, `_path_strength`,
+    /// `_avg_strength`, `_min_strength`, `_max_strength`.
+    pub edge_bind: Option<String>,
+}
+
 /// A fully parsed and compiled MATCH aggregate statement.
 #[derive(Clone, Debug)]
 pub struct MatchAggStmt {
     /// Where traversal begins.
     pub start: MatchAggStart,
-    /// Hop chain: `(edge_type_hash, bind_name)`.
-    pub hops: Vec<(u64, String)>,
+    /// Hop chain.
+    pub hops: Vec<HopSpec>,
     /// `RETURN` clause: `(expression, output_alias)`.
     pub returns: Vec<(MatchAggReturn, String)>,
     /// `GROUP BY`: `(var, field)` — the bound variable and its field to group on.
@@ -2089,42 +2542,71 @@ pub struct MatchAggStmt {
 ///
 /// Returns one [`PathRow`] per complete source → endpoint path.
 /// Each row maps each bind name to the node payload at that hop.
-pub fn collect_paths(db: &CoreDB, starts: &[u64], hops: &[(u64, String)]) -> Vec<PathRow> {
+///
+/// If a hop has an `edge_bind`, that binding is a JSON object with path intrinsics:
+/// `_depth`, `_path_keys`, `_path_strength`, `_avg_strength`, `_min_strength`, `_max_strength`.
+pub fn collect_paths(db: &CoreDB, starts: &[u64], hops: &[HopSpec]) -> Vec<PathRow> {
     if hops.is_empty() || starts.is_empty() {
         return vec![];
     }
 
     let mut result = Vec::new();
 
-    // Stack entries: (current_hash, next_hop_index, accumulated_bindings)
-    let mut stack: Vec<(u64, usize, Vec<(String, Value)>)> = starts
+    // Stack entries: (current_hash, hop_idx, bindings, path_slugs, path_strengths)
+    // path_slugs   — node slugs visited so far, starting with the start node
+    // path_strengths — edge strengths traversed so far
+    let mut stack: Vec<(u64, usize, Vec<(String, Value)>, Vec<String>, Vec<f32>)> = starts
         .iter()
         .filter_map(|&h| {
-            if db.node_data(h).is_some() {
-                Some((h, 0usize, Vec::new()))
-            } else {
-                None
-            }
+            let start_slug = db.node_data(h).map(|n| n.slug.clone())?;
+            Some((h, 0usize, Vec::new(), vec![start_slug], Vec::new()))
         })
         .collect();
 
-    while let Some((current_h, hop_idx, bindings)) = stack.pop() {
-        let (edge_type_h, bind_name) = &hops[hop_idx];
+    while let Some((current_h, hop_idx, bindings, path_slugs, path_strengths)) = stack.pop() {
+        let hop = &hops[hop_idx];
 
         if let Some(edges) = db.fwd_edges(current_h) {
             for e in edges {
-                if e.edge_type == *edge_type_h {
-                    if let Some(node) = db.node_data(e.other) {
-                        let mut new_bindings = bindings.clone();
-                        new_bindings.push((bind_name.clone(), node.payload.clone()));
+                // edge_type_hash == 0 means "any type"
+                if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                    continue;
+                }
+                if let Some(node) = db.node_data(e.other) {
+                    let mut new_bindings = bindings.clone();
+                    let mut new_path_slugs = path_slugs.clone();
+                    let mut new_path_strengths = path_strengths.clone();
 
-                        let next_hop = hop_idx + 1;
-                        if next_hop >= hops.len() {
-                            // Complete path — build PathRow
-                            result.push(new_bindings.into_iter().collect());
-                        } else {
-                            stack.push((e.other, next_hop, new_bindings));
-                        }
+                    new_path_slugs.push(node.slug.clone());
+                    new_path_strengths.push(e.strength);
+
+                    // Bind edge intrinsics if the hop has an edge variable.
+                    if let Some(ref edge_bind) = hop.edge_bind {
+                        let depth = hop_idx + 1;
+                        let n = new_path_strengths.len() as f64;
+                        let sum: f64 = new_path_strengths.iter().map(|&s| s as f64).sum();
+                        let avg = if n > 0.0 { sum / n } else { 0.0 };
+                        let min = new_path_strengths.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let max = new_path_strengths.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let edge_obj = serde_json::json!({
+                            "_depth":          depth,
+                            "_path_keys":      &new_path_slugs,
+                            "_path_strength":  &new_path_strengths,
+                            "_avg_strength":   avg,
+                            "_min_strength":   if min.is_infinite() { 0.0_f32 } else { min },
+                            "_max_strength":   if max.is_infinite() { 0.0_f32 } else { max },
+                        });
+                        new_bindings.push((edge_bind.clone(), edge_obj));
+                    }
+
+                    // Bind the destination node.
+                    new_bindings.push((hop.node_bind.clone(), node.payload.clone()));
+
+                    let next_hop = hop_idx + 1;
+                    if next_hop >= hops.len() {
+                        result.push(new_bindings.into_iter().collect());
+                    } else {
+                        stack.push((e.other, next_hop, new_bindings, new_path_slugs, new_path_strengths));
                     }
                 }
             }
