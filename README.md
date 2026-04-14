@@ -78,16 +78,16 @@ db.execute("INSERT ('islands/dressrosa')-[:route_to {days: 5}]->('islands/wano')
 # ── Graph: who trained under Mihawk, and who are their rivals? ────────────────
 
 hits = db.query("""
-    MATCH (a:characters)-[:student_of]->(:characters {_key: 'mihawk'})<-[:rival]-(b:characters)
-    RETURN b
+    SELECT b._key AS name
+    FROM MATCH (a:characters)-[:student_of]->(:characters {_key: 'mihawk'})<-[:rival]-(b:characters)
 """)
 
 # ── Graph: reachable islands within 3 hops from Marineford ───────────────────
 
 hits = db.query("""
-    MATCH (start:islands)-[:route_to*1..3]->(dest:islands)
+    SELECT dest._key AS island
+    FROM MATCH (start:islands)-[:route_to*1..3]->(dest:islands)
     WHERE start._key = 'marineford'
-    RETURN dest
 """)
 
 # ── Aggregate: total route days from Marineford to each destination ───────────
@@ -230,9 +230,9 @@ INSERT ('islands/marineford')-[:route_to {days: 3}]->('islands/fishman-island')
 DELETE ('islands/marineford')-[:route_to]->('islands/fishman-island')
 
 -- Graph traversal
-MATCH (a:islands)-[:route_to*1..5]->(dest:islands)
+SELECT dest._key AS island
+FROM MATCH (a:islands)-[:route_to*1..5]->(dest:islands)
 WHERE a._key = 'marineford'
-RETURN dest
 
 -- Graph aggregation
 SELECT b._key AS name, COUNT(a) AS allies, SUM(r.strength) AS total_strength
@@ -591,9 +591,9 @@ if hits:
 
 # 2-hop rival network from Luffy
 hits = db.query("""
-    MATCH (a:characters)-[:rival*1..2]->(b:characters)
+    SELECT b._key AS name
+    FROM MATCH (a:characters)-[:rival*1..2]->(b:characters)
     WHERE a._key = 'luffy'
-    RETURN b
 """)
 
 # Most feared pirates by rival count
@@ -699,11 +699,11 @@ nearby = db.df.query("SELECT * FROM characters WHERE ST_DWithin(location, POINT(
 
 # Step 2: walk Shanks' rival graph
 rivals = db.query("""
-    MATCH (a:characters)-[:rival*1..3]->(b:characters)
+    SELECT b._key AS name
+    FROM MATCH (a:characters)-[:rival*1..3]->(b:characters)
     WHERE a._key = 'shanks'
-    RETURN b
 """)
-rival_keys = {h.slug.split("/")[1] for h in rivals}
+rival_keys = {json.loads(h.payload)["name"] for h in rivals if h.payload}
 
 # Step 3: filter nearby pirates who appear in the rival graph
 candidates = nearby[nearby["_key"].isin(rival_keys)]
