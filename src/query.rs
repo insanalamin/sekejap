@@ -550,6 +550,11 @@ fn field_output_key(expr: &str) -> String {
     if expr.starts_with("__JP_TEXT__") || expr.starts_with("__JP_OBJ__") {
         return expr.rsplit("__").next().unwrap_or(expr).to_string();
     }
+    // ST_AsGeoJSON(field) — default output key is the inner field name.
+    // e.g. __ST_AsGeoJSON__geometry → "geometry"
+    if let Some(field) = expr.strip_prefix("__ST_AsGeoJSON__") {
+        return field.to_string();
+    }
     expr.to_string()
 }
 
@@ -629,6 +634,20 @@ fn eval_field_expr(expr: &str, payload: &serde_json::Value) -> Option<serde_json
             return Some(point);
         }
         return None;
+    }
+    // ST_AsGeoJSON(field) — serialise the named geometry field to a GeoJSON
+    // text string, matching PostGIS ST_AsGeoJSON() semantics.
+    //
+    // Since sekejap stores geometry as a native JSON object in the payload,
+    // this is simply a re-serialisation to `Value::String`.  The caller gets
+    // a string like `"{\"type\":\"Point\",\"coordinates\":[144.96,-37.81]}"`.
+    //
+    // If the field is absent or the geometry cannot be serialised, `None` is
+    // returned and the column is omitted from the result row.
+    if let Some(field) = expr.strip_prefix("__ST_AsGeoJSON__") {
+        let geom = payload.get(field)?;
+        let s = serde_json::to_string(geom).ok()?;
+        return Some(Value::String(s));
     }
     if expr.starts_with("__FUNC__") {
         let rest = expr.strip_prefix("__FUNC__")?;

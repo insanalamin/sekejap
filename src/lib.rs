@@ -454,6 +454,16 @@ impl CoreDB {
             for field_vecs in self.vectors.values_mut() {
                 field_vecs.remove(&hash);
             }
+
+            // Incrementally update BM25 indexes: adjusts the running
+            // `num_docs` and `sum_doc_len` counters and drops the
+            // `doc_id_to_idx` entry so the deleted node is invisible
+            // to subsequent searches immediately — without a full
+            // rebuild.  The corresponding `doc_lengths` slot becomes a
+            // harmless 4-byte orphan until the next rebuild.
+            for bm25_idx in self.bm25_indexes.values_mut() {
+                bm25_idx.delete(hash);
+            }
         }
     }
 
@@ -2511,17 +2521,30 @@ impl CoreDB {
         self.record_index_version("bm25", field, BM25_INDEX_VERSION);
     }
 
-    /// Search using BM25 index and return ranked results.
+    /// Search the BM25 index for `field` and return the top-`top_k`
+    /// results ranked by relevance score (highest first).
     ///
-    /// Returns `(doc_id, score)` pairs sorted by relevance score (highest first).
-    /// Requires the field to have been indexed with [`build_bm25_index`](Self::build_bm25_index).
+    /// Requires [`build_bm25_index`](Self::build_bm25_index) to have
+    /// been called for `field`.  Returns an empty `Vec` if the index
+    /// does not exist or the query produces no matches.
     ///
-    /// # Arguments
-    /// * `field` - The indexed field to search
-    /// * `query` - Search query (will be tokenized and matched)
-    /// * `top_k` - Maximum number of results to return
+    /// # Deletion safety
+    ///
+    /// Two complementary guards ensure deleted documents never appear:
+    ///
+    /// 1. **Inside the index** — [`Bm25Index::delete`] is called by
+    ///    [`remove`](Self::remove) and removes the document's entry
+    ///    from `doc_id_to_idx`, so it can never score in `search`.
+    /// 2. **Here** — results are filtered through `self.nodes` as a
+    ///    belt-and-suspenders check covering any narrow window between
+    ///    a node deletion and the BM25 index update.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<(doc_id, score)>` — `doc_id` is `sk_hash(slug)`.
     ///
     /// # Example
+    ///
     /// ```
     /// # use sekejap::CoreDB;
     /// let mut db = CoreDB::new();
@@ -2530,7 +2553,7 @@ impl CoreDB {
     /// db.build_bm25_index("name");
     ///
     /// let results = db.bm25_search("name", "rust tutorial", 10);
-    /// // results[0] is the most relevant doc for "rust tutorial"
+    /// // results[0] is the most relevant doc — deleted docs never appear
     /// ```
     pub fn bm25_search(&self, field: &str, query: &str, top_k: usize) -> Vec<(u64, f64)> {
         self.bm25_indexes
@@ -2538,6 +2561,10 @@ impl CoreDB {
             .map(|idx| {
                 idx.search(query, top_k)
                     .into_iter()
+                    // Belt-and-suspenders: exclude any doc not present in
+                    // the live node map, covering the narrow window between
+                    // node deletion and BM25 index update.
+                    .filter(|hit| self.nodes.contains_key(&hit.doc_id))
                     .map(|hit| (hit.doc_id, hit.score))
                     .collect()
             })
@@ -3683,6 +3710,71 @@ mod hybrid_query_tests {
             let v = db.get_vector("docs/d1", "emb").expect("vector must survive WAL replay");
             assert_eq!(v, &[0.5_f32, 0.5]);
         }
+    }
+
+    /// `ST_AsGeoJSON(field)` in SELECT must return the geometry value as a
+    /// JSON text string (Value::String), matching PostGIS semantics.
+    /// Without AS alias the output key is the inner field name.
+    #[test]
+    fn test_st_asgeojson_select() {
+        let mut db = CoreDB::new();
+        db.put(
+            "places/mel",
+            r#"{"_collection":"places","name":"Melbourne",
+                "geometry":{"type":"Point","coordinates":[144.9631,-37.8136]}}"#,
+        )
+        .unwrap();
+
+        // Without alias — output key should be "geometry"
+        let hits: Vec<_> = db
+            .query("SELECT ST_AsGeoJSON(geometry) FROM places")
+            .unwrap()
+            .collect();
+        assert_eq!(hits.len(), 1);
+        let payload = hits[0].payload.as_ref().unwrap();
+        let geom_str = payload["geometry"].as_str()
+            .expect("ST_AsGeoJSON must return a string value");
+        let geom: serde_json::Value = serde_json::from_str(geom_str).unwrap();
+        assert_eq!(geom["type"], "Point");
+        assert_eq!(geom["coordinates"][0].as_f64().unwrap(), 144.9631);
+
+        // With alias — output key should be "geom"
+        let hits: Vec<_> = db
+            .query("SELECT ST_AsGeoJSON(geometry) AS geom FROM places")
+            .unwrap()
+            .collect();
+        let payload = hits[0].payload.as_ref().unwrap();
+        assert!(payload["geom"].is_string(), "aliased column must be present as string");
+    }
+
+    /// `ST_GeomFromGeoJSON('...')` in INSERT VALUES must store the geometry as
+    /// a proper JSON object (not a raw string) in the node payload.
+    #[test]
+    fn test_st_geomfromgeojson_insert() {
+        let mut db = CoreDB::new();
+        db.execute(
+            r#"INSERT INTO places (_key, name, geometry)
+               VALUES ('fitzroy', 'Fitzroy',
+                       ST_GeomFromGeoJSON('{"type":"Point","coordinates":[144.9775,-37.7963]}'))"#,
+        )
+        .unwrap();
+
+        let hits: Vec<_> = db
+            .query("SELECT * FROM places WHERE _key = 'fitzroy'")
+            .unwrap()
+            .collect();
+        assert_eq!(hits.len(), 1);
+        let payload = hits[0].payload.as_ref().unwrap();
+        // geometry must be a JSON object, not a raw string
+        assert!(
+            payload["geometry"].is_object(),
+            "geometry must be stored as a JSON object, not a string"
+        );
+        assert_eq!(payload["geometry"]["type"], "Point");
+        assert_eq!(
+            payload["geometry"]["coordinates"][0].as_f64().unwrap(),
+            144.9775
+        );
     }
 
     /// Deleting a node must remove its vector from the index immediately.

@@ -1156,6 +1156,33 @@ impl Parser {
     }
 
     fn parse_value(&mut self) -> Result<Value, SqlError> {
+        // ST_GeomFromGeoJSON('json') — parse a GeoJSON text literal and return
+        // it as a JSON object value.  Validates that the string is a GeoJSON
+        // geometry (has a "type" field and "coordinates" or "geometries").
+        // Used in INSERT INTO … VALUES to insert geometry from a string literal:
+        //   INSERT INTO places (_key, geometry) VALUES ('p1', ST_GeomFromGeoJSON('…'))
+        if let Tok::Ident(ref name) = self.peek().clone() {
+            if name.to_uppercase() == "ST_GEOMFROMGEOJSON" {
+                self.advance(); // consume identifier
+                self.expect_lparen()?;
+                let json_str = self.expect_str()?;
+                self.expect_rparen()?;
+                let val: Value = serde_json::from_str(&json_str).map_err(|e| {
+                    SqlError::InvalidValue(format!("ST_GeomFromGeoJSON: invalid JSON: {e}"))
+                })?;
+                let valid = val.get("type").is_some()
+                    && (val.get("coordinates").is_some()
+                        || val.get("geometries").is_some());
+                if valid {
+                    return Ok(val);
+                }
+                return Err(SqlError::InvalidValue(
+                    "ST_GeomFromGeoJSON: not a valid GeoJSON geometry \
+                     (must have \"type\" and \"coordinates\" or \"geometries\")"
+                        .into(),
+                ));
+            }
+        }
         // Vector literal: [f32, f32, ...] — used in INSERT/UPDATE for vector fields.
         if matches!(self.peek(), Tok::LBracket) {
             let floats = self.parse_f32_array()?;
@@ -1429,6 +1456,25 @@ impl Parser {
             let field = self.expect_ident()?;
             self.expect_rparen()?;
             return Ok(FieldOrBm25::Field(format!("__ST_Centroid__{}", field)));
+        }
+        // ST_AsGeoJSON(field) — serialise a geometry field to a GeoJSON text
+        // string in the SELECT list, matching PostGIS semantics.
+        // Supports an optional AS alias:
+        //   SELECT ST_AsGeoJSON(geometry) AS geom FROM places
+        if matches!(self.peek(), Tok::LParen) && ident.to_uppercase() == "ST_ASGEOJSON" {
+            self.advance(); // consume (
+            let field = self.expect_ident()?;
+            self.expect_rparen()?;
+            let encoded = format!("__ST_AsGeoJSON__{}", field);
+            // Optional AS alias — output key defaults to the inner field name.
+            let encoded = if matches!(self.peek(), Tok::Kw(Kw::As)) {
+                self.advance();
+                let alias = self.expect_ident()?;
+                format!("__AS__{}\x01{}", alias, encoded)
+            } else {
+                encoded
+            };
+            return Ok(FieldOrBm25::Field(encoded));
         }
         if matches!(self.peek(), Tok::LParen) {
             let func_upper = ident.to_uppercase();
@@ -5742,6 +5788,73 @@ mod tests {
             }
             _ => panic!("expected Insert"),
         }
+    }
+
+    /// ST_GeomFromGeoJSON('...') in INSERT VALUES must parse the JSON string
+    /// into a proper JSON object stored under the geometry field.
+    #[test]
+    fn parse_insert_st_geomfromgeojson() {
+        let sql = r#"INSERT INTO places (_key, name, geometry)
+                     VALUES ('mel', 'Melbourne',
+                             ST_GeomFromGeoJSON('{"type":"Point","coordinates":[144.9631,-37.8136]}'))"#;
+        let m = parse_mutation(sql).unwrap();
+        match m {
+            CompiledMutation::Insert { payload_json, .. } => {
+                let v: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+                assert_eq!(v["geometry"]["type"], "Point");
+                assert_eq!(v["geometry"]["coordinates"][0].as_f64().unwrap(), 144.9631);
+                assert_eq!(v["geometry"]["coordinates"][1].as_f64().unwrap(), -37.8136);
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    /// ST_GeomFromGeoJSON with a malformed JSON string must return an error.
+    #[test]
+    fn parse_insert_st_geomfromgeojson_invalid_json() {
+        let sql = r#"INSERT INTO places (_key, geometry) VALUES ('p1', ST_GeomFromGeoJSON('{bad}'))"#;
+        assert!(parse_mutation(sql).is_err(), "should reject invalid JSON");
+    }
+
+    /// ST_GeomFromGeoJSON with valid JSON that is NOT a GeoJSON geometry
+    /// (missing "type" field) must return an error.
+    #[test]
+    fn parse_insert_st_geomfromgeojson_not_geojson() {
+        let sql = r#"INSERT INTO places (_key, geometry) VALUES ('p1', ST_GeomFromGeoJSON('{"name":"Fitzroy"}'))"#;
+        assert!(parse_mutation(sql).is_err(), "should reject non-geometry JSON");
+    }
+
+    /// ST_AsGeoJSON(field) in the SELECT list must compile to a sentinel field
+    /// name that the executor can identify and evaluate.
+    #[test]
+    fn parse_select_st_asgeojson() {
+        let steps = parse_and_compile("SELECT ST_AsGeoJSON(geometry) FROM places").unwrap();
+        // The Select step must contain the __ST_AsGeoJSON__ sentinel.
+        let has_sentinel = steps.iter().any(|s| {
+            if let Step::Select(fields) = s {
+                fields.iter().any(|f| f.starts_with("__ST_AsGeoJSON__"))
+            } else {
+                false
+            }
+        });
+        assert!(has_sentinel, "expected __ST_AsGeoJSON__ sentinel in Select step");
+    }
+
+    /// ST_AsGeoJSON(field) AS alias must encode both the sentinel and the alias.
+    #[test]
+    fn parse_select_st_asgeojson_with_alias() {
+        let steps =
+            parse_and_compile("SELECT ST_AsGeoJSON(geometry) AS geom FROM places").unwrap();
+        let has_alias = steps.iter().any(|s| {
+            if let Step::Select(fields) = s {
+                fields
+                    .iter()
+                    .any(|f| f.contains("__AS__geom") && f.contains("__ST_AsGeoJSON__"))
+            } else {
+                false
+            }
+        });
+        assert!(has_alias, "expected aliased __ST_AsGeoJSON__ in Select step");
     }
 
     #[test]
