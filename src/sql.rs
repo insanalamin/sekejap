@@ -99,6 +99,9 @@ pub enum SqlError {
         field: String,
         reason: String,
     },
+    /// A SELECT column is neither in the GROUP BY clause nor wrapped in an aggregate function.
+    /// PostgreSQL raises the same error; MySQL silently picks a random row (we do not).
+    GroupByViolation(String),
 }
 
 impl fmt::Display for SqlError {
@@ -124,6 +127,10 @@ impl fmt::Display for SqlError {
             SqlError::IndexBuildFailed { collection, method, field, reason } => write!(
                 f,
                 "cannot build {method} index on {collection}.{field}: {reason}.\n  Hint: once data is ready, run: REINDEX ON {collection} USING {method} ({field})"
+            ),
+            SqlError::GroupByViolation(col) => write!(
+                f,
+                "column \"{col}\" must appear in the GROUP BY clause or be used in an aggregate function"
             ),
         }
     }
@@ -1306,6 +1313,24 @@ impl Parser {
             while matches!(self.peek(), Tok::Comma) {
                 self.advance();
                 group_by.push(self.expect_ident()?);
+            }
+        }
+
+        // PG standard: every non-aggregate, non-function SELECT field must appear in
+        // the GROUP BY list.  Skipped for SELECT * (fields is empty).
+        if !group_by.is_empty() && !fields.is_empty() {
+            for f in &fields {
+                // Strip __AS__alias\x01 wrapper to expose the inner expression.
+                let inner = if let Some(rest) = f.strip_prefix("__AS__") {
+                    if let Some(idx) = rest.find('\x01') { &rest[idx + 1..] } else { f.as_str() }
+                } else {
+                    f.as_str()
+                };
+                // Aggregates and function sentinels (anything starting with __) are exempt.
+                if inner.starts_with("__") { continue; }
+                if !group_by.iter().any(|g| g == inner) {
+                    return Err(SqlError::GroupByViolation(inner.to_string()));
+                }
             }
         }
 
@@ -3507,16 +3532,33 @@ impl Parser {
         let returns = self.parse_agg_return_list()?;
 
         // ── GROUP BY ──────────────────────────────────────────────────────
+        // Supports multiple keys: GROUP BY a.city, b.role
         let group_by = if matches!(self.peek(), Tok::Kw(Kw::Group)) {
-            self.advance(); // GROUP
+            self.advance();
             self.expect_kw(Kw::By, "BY")?;
-            let var = self.expect_ident()?;
-            self.expect_dot()?;
-            let field = self.expect_ident()?;
-            Some((var, field))
+            let mut keys: Vec<(String, String)> = Vec::new();
+            loop {
+                let var = self.expect_ident()?;
+                self.expect_dot()?;
+                let field = self.expect_ident()?;
+                keys.push((var, field));
+                if matches!(self.peek(), Tok::Comma) { self.advance(); } else { break; }
+            }
+            Some(keys)
         } else {
             None
         };
+
+        // PG enforcement: Field returns (var.field) must appear in GROUP BY.
+        if let Some(ref gkeys) = group_by {
+            for (ret_expr, _alias) in &returns {
+                if let crate::query::MatchAggReturn::Field { var, field } = ret_expr {
+                    if !gkeys.iter().any(|(gv, gf)| gv == var && gf == field) {
+                        return Err(SqlError::GroupByViolation(format!("{var}.{field}")));
+                    }
+                }
+            }
+        }
 
         // ── ORDER BY ──────────────────────────────────────────────────────
         let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
@@ -3663,16 +3705,33 @@ impl Parser {
         }
 
         // ── GROUP BY ──────────────────────────────────────────────────────
+        // Supports multiple keys: GROUP BY a.city, b.role
         let group_by = if matches!(self.peek(), Tok::Kw(Kw::Group)) {
             self.advance();
             self.expect_kw(Kw::By, "BY")?;
-            let var = self.expect_ident()?;
-            self.expect_dot()?;
-            let field = self.expect_ident()?;
-            Some((var, field))
+            let mut keys: Vec<(String, String)> = Vec::new();
+            loop {
+                let var = self.expect_ident()?;
+                self.expect_dot()?;
+                let field = self.expect_ident()?;
+                keys.push((var, field));
+                if matches!(self.peek(), Tok::Comma) { self.advance(); } else { break; }
+            }
+            Some(keys)
         } else {
             None
         };
+
+        // PG enforcement: Field returns (var.field) must appear in GROUP BY.
+        if let Some(ref gkeys) = group_by {
+            for (ret_expr, _alias) in &returns {
+                if let crate::query::MatchAggReturn::Field { var, field } = ret_expr {
+                    if !gkeys.iter().any(|(gv, gf)| gv == var && gf == field) {
+                        return Err(SqlError::GroupByViolation(format!("{var}.{field}")));
+                    }
+                }
+            }
+        }
 
         // ── ORDER BY ──────────────────────────────────────────────────────
         let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {

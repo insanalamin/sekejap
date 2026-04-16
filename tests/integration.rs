@@ -1619,6 +1619,36 @@ fn group_by_having_sum() {
     assert_eq!(hits[0].payload.as_ref().unwrap()["acct"].as_str().unwrap(), "X");
 }
 
+#[test]
+fn group_by_pg_violation_rejected() {
+    let mut db = CoreDB::new();
+    db.put("o/1", r#"{"_collection":"o","_key":"1","cat":"A","name":"Vines"}"#).unwrap();
+    // "name" is not in GROUP BY and not aggregated — must error.
+    let err = db.query("SELECT cat, name FROM o GROUP BY cat");
+    assert!(err.is_err(), "PG violation should be rejected at parse time");
+    let msg = err.err().unwrap().to_string();
+    assert!(msg.contains("name"), "error should mention the offending column");
+}
+
+#[test]
+fn group_by_multi_field_set() {
+    let mut db = CoreDB::new();
+    db.put("e/1", r#"{"_collection":"e","_key":"1","dept":"eng","city":"Melbourne","salary":100}"#).unwrap();
+    db.put("e/2", r#"{"_collection":"e","_key":"2","dept":"eng","city":"Melbourne","salary":200}"#).unwrap();
+    db.put("e/3", r#"{"_collection":"e","_key":"3","dept":"eng","city":"Fitzroy","salary":150}"#).unwrap();
+    db.put("e/4", r#"{"_collection":"e","_key":"4","dept":"hr","city":"Melbourne","salary":120}"#).unwrap();
+
+    let hits = db.query(
+        "SELECT dept, city, COUNT(*) AS cnt FROM e GROUP BY dept, city ORDER BY cnt DESC"
+    ).unwrap().collect();
+    // 3 groups: eng/Melbourne=2, eng/Fitzroy=1, hr/Melbourne=1
+    assert_eq!(hits.len(), 3);
+    let top = hits[0].payload.as_ref().unwrap();
+    assert_eq!(top["dept"].as_str().unwrap(), "eng");
+    assert_eq!(top["city"].as_str().unwrap(), "Melbourne");
+    assert_eq!(top["cnt"].as_i64().unwrap(), 2);
+}
+
 // ── Multi-column ORDER BY ─────────────────────────────────────────────────────
 
 #[test]
@@ -2584,6 +2614,43 @@ fn traverse_two_hop_group_sum() {
     let second = hits[1].payload.as_ref().unwrap();
     let second_score = second.get("clo_score").and_then(|v| v.as_f64()).unwrap();
     assert!((second_score - 0.68).abs() < 1e-9, "c1 score should be 0.68");
+}
+
+/// Multi-field MATCH GROUP BY: GROUP BY b.role, b.tier — uniform interface with Set path.
+///
+/// Note: the start variable is not bound in PathRow; GROUP BY fields must reference
+/// destination-hop variables.  This test groups on two fields of the same destination `b`.
+#[test]
+fn traverse_match_group_by_multi_field() {
+    let mut db = CoreDB::new();
+    db.put("users/u1", r#"{"_collection":"users","_key":"u1"}"#).unwrap();
+    db.put("users/u2", r#"{"_collection":"users","_key":"u2"}"#).unwrap();
+    db.put("users/u3", r#"{"_collection":"users","_key":"u3"}"#).unwrap();
+    // Two roles share (admin, high); one is (viewer, low)
+    db.put("roles/r1", r#"{"_collection":"roles","_key":"r1","role":"admin","tier":"high"}"#).unwrap();
+    db.put("roles/r2", r#"{"_collection":"roles","_key":"r2","role":"viewer","tier":"low"}"#).unwrap();
+    db.put("roles/r3", r#"{"_collection":"roles","_key":"r3","role":"admin","tier":"high"}"#).unwrap();
+
+    db.link("users/u1", "roles/r1", "has", 1.0);
+    db.link("users/u2", "roles/r2", "has", 1.0);
+    db.link("users/u3", "roles/r3", "has", 1.0);
+
+    let hits = db.query(
+        "SELECT b.role AS role, b.tier AS tier, COUNT(*) AS cnt \
+         FROM MATCH (a:users)-[:has]->(b:roles) \
+         GROUP BY b.role, b.tier \
+         ORDER BY cnt DESC"
+    ).unwrap().collect();
+
+    // (admin, high) = 2 paths, (viewer, low) = 1 path
+    assert_eq!(hits.len(), 2);
+    let top = hits[0].payload.as_ref().unwrap();
+    assert_eq!(top["role"].as_str().unwrap(), "admin");
+    assert_eq!(top["tier"].as_str().unwrap(), "high");
+    assert_eq!(top["cnt"].as_i64().unwrap(), 2);
+    let bot = hits[1].payload.as_ref().unwrap();
+    assert_eq!(bot["role"].as_str().unwrap(), "viewer");
+    assert_eq!(bot["cnt"].as_i64().unwrap(), 1);
 }
 
 /// Aggregate MATCH COUNT(*) and AVG aggregation.

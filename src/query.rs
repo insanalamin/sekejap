@@ -558,6 +558,20 @@ fn field_output_key(expr: &str) -> String {
     expr.to_string()
 }
 
+/// Extract the raw (unaliased) field name from an encoded SELECT expression.
+///
+/// Strips `__AS__alias\x01` if present and returns the inner expression.
+/// For plain fields this is a no-op.  Used by the GROUP BY executor to look up
+/// a non-aggregate field's value in the group's uniform field map.
+fn field_inner_name(expr: &str) -> &str {
+    if let Some(rest) = expr.strip_prefix("__AS__") {
+        if let Some(idx) = rest.find('\x01') {
+            return &rest[idx + 1..];
+        }
+    }
+    expr
+}
+
 /// Check whether a stored JSON value matches any entry in an IN-list.
 ///
 /// Falls back to f64 comparison when the stored value is a JSON integer but the
@@ -785,7 +799,8 @@ impl<'db> Set<'db> {
             });
 
         // ── GROUP BY mode ─────────────────────────────────────────────────────
-        // Partition candidates into groups; return one Hit per passing group.
+        // Single-pass: fetch each node's payload exactly once, extract the group
+        // key, and accumulate aggregates inline — no intermediate Vec<u64> per group.
         let group_by_fields: Option<Vec<String>> = self.steps.iter().find_map(|s| {
             if let Step::GroupBy(f) = s { Some(f.clone()) } else { None }
         });
@@ -803,105 +818,120 @@ impl<'db> Set<'db> {
             let take_n = self.steps.iter().find_map(|s| if let Step::Take(n) = s { Some(*n) } else { None });
             let distinct = self.steps.iter().any(|s| matches!(s, Step::Distinct));
 
-            // Build ordered groups: group_key_string → Vec<u64>
+            /// Per-group accumulation state.
+            struct GroupState {
+                /// Running aggregate accumulators, keyed by output alias.
+                accums: HashMap<String, AggAccum>,
+                /// Uniform values of the GROUP BY fields (same for every member).
+                group_vals: HashMap<String, Value>,
+                /// Full payload of the first node seen — used only for `SELECT *`.
+                first_payload: Option<Value>,
+            }
+
             let mut group_order: Vec<String> = Vec::new();
-            let mut groups: HashMap<String, Vec<u64>> = HashMap::new();
+            let mut groups: HashMap<String, GroupState> = HashMap::new();
+
             for &h in &hashes {
                 if let Some(node) = self.db.node_data(h) {
+                    // Build composite group key — one JSON-encoded segment per GROUP BY field.
                     let key = group_fields.iter()
-                        .map(|f| serde_json::to_string(node.payload.get(f).unwrap_or(&Value::Null)).unwrap_or_default())
+                        .map(|f| serde_json::to_string(
+                            node.payload.get(f).unwrap_or(&Value::Null)
+                        ).unwrap_or_default())
                         .collect::<Vec<_>>()
                         .join("\x00");
+
                     if !groups.contains_key(&key) {
                         group_order.push(key.clone());
+                        let mut gv = HashMap::new();
+                        for gf in group_fields {
+                            if let Some(v) = node.payload.get(gf) {
+                                gv.insert(gf.clone(), v.clone());
+                            }
+                        }
+                        groups.insert(key.clone(), GroupState {
+                            accums: HashMap::new(),
+                            group_vals: gv,
+                            first_payload: Some(node.payload.clone()),
+                        });
                     }
-                    groups.entry(key).or_default().push(h);
+                    let state = groups.get_mut(&key).unwrap();
+
+                    // Accumulate aggregate expressions for this node.
+                    for f in fields {
+                        if let Some(agg_expr) = agg_inner(f) {
+                            let out_key = field_output_key(f);
+                            let rest = agg_expr.strip_prefix("__AGG__").unwrap_or(agg_expr);
+                            let mut parts = rest.splitn(2, "__");
+                            let func = parts.next().unwrap_or("COUNT").to_uppercase();
+                            let arg = parts.next().unwrap_or("*");
+                            let acc = state.accums
+                                .entry(out_key)
+                                .or_insert_with(|| AggAccum::new(&func, arg));
+                            acc.push(&node.payload);
+                        }
+                    }
                 }
             }
 
             let mut results: Vec<Hit> = group_order.into_iter().filter_map(|key| {
-                let members = &groups[&key];
-                // Compute aggregates for this group
-                let has_agg_fields = fields.iter().any(|f| agg_inner(f).is_some());
-                let mut states: HashMap<String, AggAccum> = HashMap::new();
-                let mut non_agg: HashMap<String, Value> = HashMap::new();
-                for &h in members {
-                    if let Some(node) = self.db.node_data(h) {
-                        for f in fields {
-                            if let Some(agg_expr) = agg_inner(f) {
-                                let out_key = field_output_key(f);
-                                let rest = agg_expr.strip_prefix("__AGG__").unwrap_or(agg_expr);
-                                let mut parts = rest.splitn(2, "__");
-                                let func = parts.next().unwrap_or("COUNT").to_uppercase();
-                                let arg = parts.next().unwrap_or("*");
-                                let state = states.entry(out_key).or_insert_with(|| AggAccum::new(&func, arg));
-                                state.push(&node.payload);
-                            } else if !non_agg.contains_key(&field_output_key(f)) {
-                                if let Some(v) = eval_field_expr(f, &node.payload) {
-                                    non_agg.insert(field_output_key(f), v);
-                                }
-                            }
-                        }
-                    }
-                }
+                let state = groups.remove(&key)?;
 
-                // Build synthetic payload for HAVING evaluation:
-                // includes raw __AGG__ keys so HAVING steps can find them
+                // Build synthetic payload for HAVING: raw __AGG__ keys + GROUP BY fields.
                 let mut synthetic = serde_json::Map::new();
                 for f in fields {
                     if let Some(agg_expr) = agg_inner(f) {
-                        // Use raw __AGG__ key for HAVING lookup
                         let out_key = field_output_key(f);
-                        if let Some(state) = states.get(&out_key) {
-                            synthetic.insert(agg_expr.to_string(), state.finalize());
+                        if let Some(acc) = state.accums.get(&out_key) {
+                            synthetic.insert(agg_expr.to_string(), acc.finalize());
                         }
-                    } else if let Some(v) = non_agg.get(&field_output_key(f)) {
-                        synthetic.insert(field_output_key(f), v.clone());
                     }
                 }
-                // Also include group-by fields for HAVING field = value filters
-                if let Some(first_h) = members.first() {
-                    if let Some(node) = self.db.node_data(*first_h) {
-                        for gf in group_fields {
-                            if let Some(v) = node.payload.get(gf) {
-                                synthetic.insert(gf.clone(), v.clone());
-                            }
-                        }
-                    }
+                for (gf, v) in &state.group_vals {
+                    synthetic.insert(gf.clone(), v.clone());
                 }
                 let synthetic_val = Value::Object(synthetic);
 
-                // Apply HAVING conditions
+                // Apply HAVING conditions.
                 for having in &having_steps {
                     if !having.iter().all(|s| eval_step_on_payload(s, &synthetic_val)) {
                         return None;
                     }
                 }
 
-                // Build output payload
-                let map = if has_agg_fields || !fields.is_empty() {
+                // Build output payload.
+                let map = if !fields.is_empty() {
                     let mut m = serde_json::Map::new();
                     for f in fields {
                         let out_key = field_output_key(f);
-                        if let Some(state) = states.get(&out_key) {
-                            m.insert(out_key, state.finalize());
-                        } else if let Some(v) = non_agg.get(&out_key) {
-                            m.insert(out_key, v.clone());
+                        if let Some(acc) = state.accums.get(&out_key) {
+                            // Aggregate field — finalize accumulator.
+                            m.insert(out_key, acc.finalize());
+                        } else {
+                            // Non-aggregate field (enforced to be a GROUP BY key by the parser).
+                            // Look up by raw inner field name; emit under the output alias.
+                            let inner = field_inner_name(f);
+                            if let Some(v) = state.group_vals.get(inner) {
+                                m.insert(out_key, v.clone());
+                            } else if let Some(ref fp) = state.first_payload {
+                                // Function sentinels (ST_AsGeoJSON, JSON path, etc.)
+                                if let Some(v) = eval_field_expr(f, fp) {
+                                    m.insert(out_key, v);
+                                }
+                            }
                         }
                     }
                     Value::Object(m)
                 } else {
-                    // SELECT * — return first member's full payload
-                    members.first()
-                        .and_then(|&h| self.db.node_data(h))
-                        .map(|n| n.payload.clone())
-                        .unwrap_or(Value::Object(serde_json::Map::new()))
+                    // SELECT * — return first node's full payload.
+                    state.first_payload
+                        .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
                 };
 
                 Some(Hit { slug: String::new(), slug_hash: 0, payload: Some(map) })
             }).collect();
 
-            // Sort grouped results
+            // Sort grouped results.
             if let Some(columns) = sort_step {
                 results.sort_by(|a, b| {
                     for (sort_field, asc) in columns {
@@ -915,12 +945,10 @@ impl<'db> Set<'db> {
                     std::cmp::Ordering::Equal
                 });
             }
-            // OFFSET / LIMIT on grouped results
             if let Some(n) = skip_n {
                 if n >= results.len() { results.clear(); } else { results.drain(..n); }
             }
             if let Some(n) = take_n { results.truncate(n); }
-            // DISTINCT on grouped results
             if distinct {
                 let mut seen: HashSet<String> = HashSet::new();
                 results.retain(|hit| {
@@ -2613,8 +2641,9 @@ pub struct MatchAggStmt {
     pub hops: Vec<HopSpec>,
     /// `RETURN` clause: `(expression, output_alias)`.
     pub returns: Vec<(MatchAggReturn, String)>,
-    /// `GROUP BY`: `(var, field)` — the bound variable and its field to group on.
-    pub group_by: Option<(String, String)>,
+    /// `GROUP BY`: list of `(var, field)` pairs — supports multi-field grouping,
+    /// e.g. `GROUP BY a.city, b.role`.
+    pub group_by: Option<Vec<(String, String)>>,
     /// `ORDER BY`: `(alias, ascending)`.
     pub order_by: Option<(String, bool)>,
     /// `LIMIT n`.
@@ -2721,17 +2750,23 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     }
 
     // 3. GROUP BY or flat pass-through
-    let mut result_rows: Vec<Value> = if let Some((ref gvar, ref gfield)) = stmt.group_by {
+    let mut result_rows: Vec<Value> = if let Some(ref group_keys) = stmt.group_by {
+        // Build one group key per path row by concatenating all (var, field) values.
         let mut group_order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<PathRow>> = HashMap::new();
 
         for row in paths {
-            let key_val = row
-                .get(gvar.as_str())
-                .and_then(|v| v.get(gfield.as_str()))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let key = serde_json::to_string(&key_val).unwrap_or_default();
+            let key = group_keys.iter()
+                .map(|(gvar, gfield)| {
+                    serde_json::to_string(
+                        row.get(gvar.as_str())
+                            .and_then(|v| v.get(gfield.as_str()))
+                            .unwrap_or(&Value::Null),
+                    )
+                    .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join("\x00");
             if !groups.contains_key(&key) {
                 group_order.push(key.clone());
             }
