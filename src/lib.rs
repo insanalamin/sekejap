@@ -384,6 +384,27 @@ impl CoreDB {
             },
         );
 
+        // Rebuild BM25 indexes for any field present in the new payload.
+        // Full rebuild per field is O(N) but necessary since BM25 postings are
+        // compressed; no true incremental-add path exists.  For CMS workloads
+        // (low write throughput, many reads) this is acceptable.
+        if !self.bm25_indexes.is_empty() {
+            let bm25_fields: Vec<String> = self.bm25_indexes
+                .keys()
+                .filter(|f| {
+                    self.nodes
+                        .get(&hash)
+                        .and_then(|n| n.payload.get(f.as_str()))
+                        .and_then(|v| v.as_str())
+                        .is_some()
+                })
+                .cloned()
+                .collect();
+            for field in bm25_fields {
+                self.build_bm25_index(&field);
+            }
+        }
+
         // Update spatial grid incrementally
         if let Some(grid) = &mut self.spatial_grid {
             grid.remove(hash);
@@ -2061,15 +2082,54 @@ impl CoreDB {
     /// Returns [`SqlError`] if the SQL is invalid.
     pub fn execute(&mut self, sql: &str) -> Result<usize, SqlError> {
         match sql::parse_mutation(sql)? {
-            sql::CompiledMutation::Insert { collection, slug, payload_json, vectors } => {
-                // Type-check against schema if one is registered for this collection.
-                if let Some(schema) = self.schemas.get(&collection) {
-                    let payload: Value = serde_json::from_str(&payload_json)
+            sql::CompiledMutation::Insert { collection, mut slug, payload_json, vectors } => {
+                // Clone schema once so we can drop the immutable borrow before put().
+                let payload_json = if let Some(schema) = self.schemas.get(&collection).cloned() {
+                    let mut payload: Value = serde_json::from_str(&payload_json)
                         .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
-                    if let Some(err) = validate_payload_against_schema(schema, &payload) {
+                    // Apply DEFAULT UUIDV4 / DEFAULT UUIDV5 for fields absent from the payload.
+                    if let Value::Object(ref mut map) = payload {
+                        for field in &schema.fields {
+                            if map.contains_key(&field.name) {
+                                continue; // explicit value wins
+                            }
+                            if field.default_uuid4 {
+                                map.insert(
+                                    field.name.clone(),
+                                    Value::String(crate::scalar::uuid_v4()),
+                                );
+                            } else if let Some((ns, nm)) = &field.default_uuid5 {
+                                map.insert(
+                                    field.name.clone(),
+                                    Value::String(crate::scalar::uuid_v5(ns, nm)),
+                                );
+                            }
+                        }
+                        // If _key was absent from INSERT (empty sentinel slug), resolve slug now
+                        // using the UUID that was just injected into the payload.
+                        if slug.is_empty() {
+                            match map.get("_key").and_then(|v| v.as_str()) {
+                                Some(key_val) => {
+                                    slug = format!("{}/{}", collection, key_val);
+                                    map.insert("_id".into(), Value::String(slug.clone()));
+                                }
+                                None => {
+                                    return Err(SqlError::MissingField { field: "_key" });
+                                }
+                            }
+                        }
+                    }
+                    if let Some(err) = validate_payload_against_schema(&schema, &payload) {
                         return Err(err);
                     }
-                }
+                    serde_json::to_string(&payload)
+                        .map_err(|e| SqlError::InvalidValue(e.to_string()))?
+                } else if slug.is_empty() {
+                    // No schema and no _key — that's a hard error
+                    return Err(SqlError::MissingField { field: "_key" });
+                } else {
+                    payload_json
+                };
                 self.put(&slug, &payload_json)
                     .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
                 for (field, data) in vectors {

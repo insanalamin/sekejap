@@ -3944,3 +3944,381 @@ fn multi_from_match_and_shortest() {
         assert_eq!(p["hops"].as_i64().unwrap(), 2, "coby→sabo shortest path = 2 hops");
     }
 }
+
+// ── Date scalar functions ──────────────────────────────────────────────────────
+
+/// YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/DOW/QUARTER in SELECT.
+#[test]
+fn date_parts_in_select() {
+    let mut db = CoreDB::new();
+    db.put(
+        "posts/p1",
+        r#"{"_collection":"posts","_key":"p1","published_at":"2024-07-15T14:30:45Z"}"#,
+    )
+    .unwrap();
+
+    let hits = db.query(
+        "SELECT YEAR(published_at) AS yr, MONTH(published_at) AS mo, \
+         DAY(published_at) AS dy, HOUR(published_at) AS hr, \
+         MINUTE(published_at) AS mi, SECOND(published_at) AS sc, \
+         DOW(published_at) AS dow, QUARTER(published_at) AS qtr \
+         FROM posts WHERE _key = 'p1'",
+    )
+    .unwrap()
+    .collect();
+
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["yr"].as_i64().unwrap(), 2024, "year");
+    assert_eq!(p["mo"].as_i64().unwrap(), 7,    "month");
+    assert_eq!(p["dy"].as_i64().unwrap(), 15,   "day");
+    assert_eq!(p["hr"].as_i64().unwrap(), 14,   "hour");
+    assert_eq!(p["mi"].as_i64().unwrap(), 30,   "minute");
+    assert_eq!(p["sc"].as_i64().unwrap(), 45,   "second");
+    // 2024-07-15 is a Monday → DOW = 1 (Sun=0, Mon=1)
+    assert_eq!(p["dow"].as_i64().unwrap(), 1,   "dow");
+    assert_eq!(p["qtr"].as_i64().unwrap(), 3,   "quarter");
+}
+
+/// DATE_TRUNC in SELECT.
+#[test]
+fn date_trunc_in_select() {
+    let mut db = CoreDB::new();
+    db.put(
+        "ev/e1",
+        r#"{"_collection":"ev","_key":"e1","ts":"2024-07-15T14:30:45Z"}"#,
+    )
+    .unwrap();
+
+    let hits = db
+        .query("SELECT DATE_TRUNC('month', ts) AS trunc FROM ev WHERE _key = 'e1'")
+        .unwrap()
+        .collect();
+
+    assert_eq!(hits.len(), 1);
+    let trunc = hits[0].payload.as_ref().unwrap()["trunc"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Truncated to month start: 2024-07-01T00:00:00
+    assert!(
+        trunc.starts_with("2024-07-01T00:00:00"),
+        "expected 2024-07-01T00:00:00…, got {trunc}"
+    );
+}
+
+/// YEAR() in WHERE clause filters correctly.
+#[test]
+fn date_func_in_where() {
+    let mut db = CoreDB::new();
+    db.put(
+        "art/a1",
+        r#"{"_collection":"art","_key":"a1","published_at":"2022-03-10T00:00:00Z"}"#,
+    )
+    .unwrap();
+    db.put(
+        "art/a2",
+        r#"{"_collection":"art","_key":"a2","published_at":"2024-07-15T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let hits = db
+        .query("SELECT _key FROM art WHERE YEAR(published_at) = 2024")
+        .unwrap()
+        .collect();
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].payload.as_ref().unwrap()["_key"]
+            .as_str()
+            .unwrap(),
+        "a2"
+    );
+}
+
+/// MONTH() > filter.
+#[test]
+fn date_func_month_gt_in_where() {
+    let mut db = CoreDB::new();
+    db.put("bl/b1", r#"{"_collection":"bl","_key":"b1","ts":"2024-03-01T00:00:00Z"}"#).unwrap();
+    db.put("bl/b2", r#"{"_collection":"bl","_key":"b2","ts":"2024-09-01T00:00:00Z"}"#).unwrap();
+    db.put("bl/b3", r#"{"_collection":"bl","_key":"b3","ts":"2024-06-15T00:00:00Z"}"#).unwrap();
+
+    let hits = db
+        .query("SELECT _key FROM bl WHERE MONTH(ts) > 6")
+        .unwrap()
+        .collect();
+
+    // b2 (month=9) and b3 (month=6 — NOT > 6) and b1 (month=3)
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].payload.as_ref().unwrap()["_key"].as_str().unwrap(),
+        "b2"
+    );
+}
+
+/// NOW() in WHERE returns a unix-ms integer enabling _created_unix comparisons.
+/// We verify it parses and executes without error (result may be 0 rows for
+/// a freshly created node since _created_unix is set to now and NOW() is now).
+#[test]
+fn now_in_where_is_numeric() {
+    let mut db = CoreDB::new();
+    db.put("art/x1", r#"{"_collection":"art","_key":"x1"}"#).unwrap();
+
+    // Should parse and execute without error — result may vary by timing.
+    let result = db.query("SELECT _key FROM art WHERE _created_unix < NOW()");
+    assert!(result.is_ok(), "NOW() in WHERE should parse and execute");
+}
+
+/// BM25 index is updated after INSERT so newly added nodes are searchable.
+#[test]
+fn bm25_updated_after_insert() {
+    let mut db = CoreDB::new();
+    // Two pre-existing docs so the rebuilt corpus has N≥3 (needed for IDF > 0
+    // when a term appears in exactly one document: ln((N-1+0.5)/(1+0.5)) > 0 iff N > 2).
+    db.put(
+        "docs/d1",
+        r#"{"_collection":"docs","_key":"d1","body":"rust programming language"}"#,
+    )
+    .unwrap();
+    db.put(
+        "docs/d0",
+        r#"{"_collection":"docs","_key":"d0","body":"web development frontend tooling"}"#,
+    )
+    .unwrap();
+    db.build_bm25_index("body");
+
+    // Insert a new document after the index is built
+    db.put(
+        "docs/d2",
+        r#"{"_collection":"docs","_key":"d2","body":"Melbourne cup horse race"}"#,
+    )
+    .unwrap();
+
+    // d2 should surface via SQL BM25 search immediately
+    let hits = db
+        .query("SELECT _key FROM docs WHERE BM25(body, 'Melbourne horse') > 0.0")
+        .unwrap()
+        .collect();
+    let found_d2 = hits.iter().any(|h| {
+        h.payload
+            .as_ref()
+            .and_then(|p| p.get("_key"))
+            .and_then(|v| v.as_str())
+            == Some("d2")
+    });
+    assert!(
+        found_d2,
+        "newly inserted doc must be BM25-searchable; got {} hits",
+        hits.len()
+    );
+}
+
+/// MATCH start variable is bound in SELECT — a.title returns the start node field.
+#[test]
+fn match_start_var_is_bound() {
+    let mut db = CoreDB::new();
+    db.put(
+        "posts/p1",
+        r#"{"_collection":"posts","_key":"p1","title":"Rust is great"}"#,
+    )
+    .unwrap();
+    db.put(
+        "tags/t1",
+        r#"{"_collection":"tags","_key":"t1","name":"programming"}"#,
+    )
+    .unwrap();
+    db.link("posts/p1", "tags/t1", "tagged_with", 1.0);
+
+    let hits = db
+        .query(
+            "SELECT a.title AS post_title, b.name AS tag_name \
+             FROM MATCH (a:posts)-[:tagged_with]->(b:tags)",
+        )
+        .unwrap()
+        .collect();
+
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(
+        p["post_title"].as_str().unwrap(),
+        "Rust is great",
+        "start var 'a' must be bound"
+    );
+    assert_eq!(p["tag_name"].as_str().unwrap(), "programming");
+}
+
+// ── DEFAULT UUIDV4 / UUIDV5 column defaults ───────────────────────────────────
+
+/// INSERT omitting a field with DEFAULT UUIDV4() — field is auto-filled with a UUID.
+#[test]
+fn default_uuidv4_auto_filled_on_insert() {
+    let mut db = CoreDB::new();
+    db.execute(
+        "CREATE TABLE items (_key TEXT PRIMARY KEY, pub_id TEXT DEFAULT UUIDV4(), name TEXT)",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO items (_key, name) VALUES ('item-1', 'Widget')").unwrap();
+
+    let hits = db.query("SELECT _key, pub_id, name FROM items").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["_key"].as_str().unwrap(), "item-1");
+    assert_eq!(p["name"].as_str().unwrap(), "Widget");
+
+    let pub_id = p["pub_id"].as_str().expect("pub_id must be auto-filled");
+    // Valid UUIDv4: 8-4-4-4-12 hex, version nibble = 4, variant bits = 8/9/a/b
+    assert_eq!(pub_id.len(), 36, "UUID must be 36 chars with hyphens");
+    assert_eq!(&pub_id[14..15], "4", "version nibble must be 4");
+}
+
+/// Explicit value in INSERT overrides DEFAULT UUIDV4().
+#[test]
+fn default_uuidv4_explicit_value_wins() {
+    let mut db = CoreDB::new();
+    db.execute(
+        "CREATE TABLE items (_key TEXT PRIMARY KEY, pub_id TEXT DEFAULT UUIDV4(), name TEXT)",
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO items (_key, pub_id, name) VALUES ('item-2', 'my-fixed-id', 'Gadget')",
+    )
+    .unwrap();
+
+    let hits = db.query("SELECT pub_id FROM items").unwrap().collect();
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(
+        p["pub_id"].as_str().unwrap(),
+        "my-fixed-id",
+        "explicit value must not be overridden by default"
+    );
+}
+
+/// Two separate INSERTs produce two different UUIDs (randomness check).
+#[test]
+fn default_uuidv4_unique_per_row() {
+    let mut db = CoreDB::new();
+    db.execute(
+        "CREATE TABLE items (_key TEXT PRIMARY KEY, pub_id TEXT DEFAULT UUIDV4(), name TEXT)",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO items (_key, name) VALUES ('a', 'Alpha')").unwrap();
+    db.execute("INSERT INTO items (_key, name) VALUES ('b', 'Beta')").unwrap();
+
+    let hits = db.query("SELECT _key, pub_id FROM items").unwrap().collect();
+    assert_eq!(hits.len(), 2);
+    let ids: Vec<&str> = hits
+        .iter()
+        .map(|h| h.payload.as_ref().unwrap()["pub_id"].as_str().unwrap())
+        .collect();
+    assert_ne!(ids[0], ids[1], "each row must get a distinct UUID");
+}
+
+/// DEFAULT UUIDV5 produces a deterministic UUID — same inputs same output.
+#[test]
+fn default_uuidv5_deterministic() {
+    // DNS namespace UUID
+    let ns = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    let sql = format!(
+        "CREATE TABLE items (_key TEXT PRIMARY KEY, stable_id TEXT DEFAULT UUIDV5('{ns}', 'sekejap-test'))"
+    );
+    let mut db = CoreDB::new();
+    db.execute(&sql).unwrap();
+
+    db.execute("INSERT INTO items (_key) VALUES ('x1')").unwrap();
+    db.execute("INSERT INTO items (_key) VALUES ('x2')").unwrap();
+
+    let hits = db.query("SELECT stable_id FROM items").unwrap().collect();
+    assert_eq!(hits.len(), 2);
+
+    let id0 = hits[0].payload.as_ref().unwrap()["stable_id"].as_str().unwrap().to_string();
+    let id1 = hits[1].payload.as_ref().unwrap()["stable_id"].as_str().unwrap().to_string();
+
+    // Both rows share the same literal name → same UUID
+    assert_eq!(id0, id1, "UUIDV5 with same inputs must produce the same UUID");
+
+    // Must be 36-char UUID format
+    assert_eq!(id0.len(), 36);
+}
+
+/// ALTER TABLE ADD COLUMN with DEFAULT UUIDV4() — new column gets UUID on subsequent INSERTs.
+#[test]
+fn alter_table_add_column_default_uuidv4() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE items (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("ALTER TABLE items ADD COLUMN ext_id TEXT DEFAULT UUIDV4()").unwrap();
+
+    db.execute("INSERT INTO items (_key, name) VALUES ('w1', 'Widget')").unwrap();
+
+    let hits = db.query("SELECT ext_id FROM items").unwrap().collect();
+    let p = hits[0].payload.as_ref().unwrap();
+    let ext_id = p["ext_id"].as_str().expect("ext_id must be auto-filled after ALTER TABLE");
+    assert_eq!(ext_id.len(), 36);
+    assert_eq!(&ext_id[14..15], "4");
+}
+
+// ── Auto _key injection ────────────────────────────────────────────────────────
+
+/// CREATE TABLE without _key → _key DEFAULT UUIDV4() is auto-injected.
+/// INSERT without _key → slug auto-generated, node is queryable.
+#[test]
+fn create_table_without_key_auto_injects_uuid_key() {
+    let mut db = CoreDB::new();
+    // No _key in schema definition
+    db.execute("CREATE TABLE articles (title TEXT, body TEXT)").unwrap();
+
+    // INSERT without _key — UUID auto-generated
+    db.execute("INSERT INTO articles (title, body) VALUES ('Hello', 'World')").unwrap();
+
+    let hits = db.query("SELECT _key, title FROM articles").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["title"].as_str().unwrap(), "Hello");
+
+    let key = p["_key"].as_str().expect("_key must be auto-generated");
+    assert_eq!(key.len(), 36, "_key must be a UUID");
+    assert_eq!(&key[14..15], "4", "must be UUIDv4");
+}
+
+/// Two keyless INSERTs produce two distinct _key UUIDs.
+#[test]
+fn create_table_without_key_each_row_unique() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE notes (text TEXT)").unwrap();
+
+    db.execute("INSERT INTO notes (text) VALUES ('First')").unwrap();
+    db.execute("INSERT INTO notes (text) VALUES ('Second')").unwrap();
+
+    let hits = db.query("SELECT _key FROM notes").unwrap().collect();
+    assert_eq!(hits.len(), 2);
+    let k0 = hits[0].payload.as_ref().unwrap()["_key"].as_str().unwrap().to_string();
+    let k1 = hits[1].payload.as_ref().unwrap()["_key"].as_str().unwrap().to_string();
+    assert_ne!(k0, k1, "each row must get a distinct UUID _key");
+}
+
+/// Explicit _key in INSERT overrides the auto-UUID default.
+#[test]
+fn create_table_without_key_explicit_key_wins() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE posts (title TEXT)").unwrap();
+
+    db.execute("INSERT INTO posts (_key, title) VALUES ('hello-world', 'Hello')").unwrap();
+
+    let hits = db.query("SELECT _key FROM posts").unwrap().collect();
+    let key = hits[0].payload.as_ref().unwrap()["_key"].as_str().unwrap();
+    assert_eq!(key, "hello-world", "explicit _key must not be overridden");
+}
+
+/// INSERT without _key and without a schema → MissingField error (no silent UUID).
+#[test]
+fn insert_without_key_no_schema_errors() {
+    let mut db = CoreDB::new();
+    // No CREATE TABLE — no schema registered
+    db.put("items/seed", r#"{"_collection":"items","_key":"seed","name":"Seed"}"#).unwrap();
+
+    let result = db.execute("INSERT INTO items (name) VALUES ('Widget')");
+    assert!(result.is_err(), "INSERT without _key and no schema must fail");
+}

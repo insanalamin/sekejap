@@ -242,6 +242,7 @@ enum Kw {
     Rename,
     To,
     Add,
+    Default,
     // Index rebuild
     Reindex,
     // CASE expression
@@ -315,6 +316,7 @@ fn kw_to_str(kw: &Kw) -> &'static str {
         Kw::Rename => "rename",
         Kw::To => "to",
         Kw::Add => "add",
+        Kw::Default => "default",
         Kw::Reindex => "reindex",
         Kw::Case => "case",
         Kw::When => "when",
@@ -386,6 +388,7 @@ fn keyword(s: &str) -> Option<Kw> {
         "RENAME" => Some(Kw::Rename),
         "TO" => Some(Kw::To),
         "ADD" => Some(Kw::Add),
+        "DEFAULT" => Some(Kw::Default),
         "REINDEX" => Some(Kw::Reindex),
         "CASE" => Some(Kw::Case),
         "WHEN" => Some(Kw::When),
@@ -940,6 +943,12 @@ pub struct FieldDef {
     pub is_primary_key: bool,
     pub is_timestamptz: bool,
     pub default_now: bool,
+    /// If true, auto-fill this field with a random UUIDv4 when absent from INSERT.
+    #[serde(default)]
+    pub default_uuid4: bool,
+    /// If set, auto-fill this field with UUIDV5(namespace, name) when absent from INSERT.
+    #[serde(default)]
+    pub default_uuid5: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1163,6 +1172,17 @@ impl Parser {
     }
 
     fn parse_value(&mut self) -> Result<Value, SqlError> {
+        // NOW() in WHERE: returns current time as Unix milliseconds (i64),
+        // suitable for comparison with _created_unix / _updated_unix fields.
+        if let Tok::Ident(ref name) = self.peek().clone() {
+            if name.to_uppercase() == "NOW" {
+                self.advance(); // consume NOW
+                self.expect_lparen()?;
+                self.expect_rparen()?;
+                let ts = chrono::Utc::now().timestamp_millis();
+                return Ok(serde_json::json!(ts));
+            }
+        }
         // ST_GeomFromGeoJSON('json') — parse a GeoJSON text literal and return
         // it as a JSON object value.  Validates that the string is a GeoJSON
         // geometry (has a "type" field and "coordinates" or "geometries").
@@ -1557,14 +1577,34 @@ impl Parser {
                 self.expect_rparen()?;
                 return Ok(FieldOrBm25::Field("__FUNC__NOW__".to_string()));
             }
-            if matches!(func_upper.as_str(), "YEAR" | "MONTH" | "DAY") {
+            if matches!(
+                func_upper.as_str(),
+                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "DOW" | "QUARTER"
+            ) {
                 self.advance();
                 let arg = self.expect_ident()?;
                 self.expect_rparen()?;
-                return Ok(FieldOrBm25::Field(format!(
-                    "__FUNC__{}__{}",
-                    func_upper, arg
-                )));
+                let expr = format!("__FUNC__{}__{}",  func_upper, arg);
+                let expr = if matches!(self.peek(), Tok::Kw(Kw::As)) {
+                    self.advance();
+                    let alias = self.expect_ident()?;
+                    format!("__AS__{}\x01{}", alias, expr)
+                } else { expr };
+                return Ok(FieldOrBm25::Field(expr));
+            }
+            if func_upper == "DATE_TRUNC" {
+                self.advance(); // consume (
+                let unit = self.expect_str()?;
+                self.expect_comma()?;
+                let arg = self.expect_ident()?;
+                self.expect_rparen()?;
+                let expr = format!("__FUNC__DATE_TRUNC__{}__{}",  unit, arg);
+                let expr = if matches!(self.peek(), Tok::Kw(Kw::As)) {
+                    self.advance();
+                    let alias = self.expect_ident()?;
+                    format!("__AS__{}\x01{}", alias, expr)
+                } else { expr };
+                return Ok(FieldOrBm25::Field(expr));
             }
             if func_upper == "UUIDV4" {
                 self.advance();
@@ -1666,6 +1706,99 @@ impl Parser {
             conds.push(self.parse_condition()?);
         }
         Ok(conds)
+    }
+
+    /// Given an already-resolved `field` string, parse the comparison RHS:
+    /// `= val | != val | > val | < val | >= val | <= val | BETWEEN | IN | NOT IN | LIKE | ILIKE`.
+    fn parse_field_compare(&mut self, field: String) -> Result<CondExpr, SqlError> {
+        match self.peek().clone() {
+            Tok::Eq => {
+                self.advance();
+                let v = self.parse_value()?;
+                Ok(CondExpr::Compare { field, op: CompareOp::Eq, value: v })
+            }
+            Tok::Neq => {
+                self.advance();
+                let v = self.parse_value()?;
+                Ok(CondExpr::Compare { field, op: CompareOp::Neq, value: v })
+            }
+            Tok::Gt => {
+                self.advance();
+                let v = self.parse_value()?;
+                Ok(CondExpr::Compare { field, op: CompareOp::Gt, value: v })
+            }
+            Tok::Lt => {
+                self.advance();
+                let v = self.parse_value()?;
+                Ok(CondExpr::Compare { field, op: CompareOp::Lt, value: v })
+            }
+            Tok::Gte => {
+                self.advance();
+                let v = self.parse_value()?;
+                Ok(CondExpr::Compare { field, op: CompareOp::Gte, value: v })
+            }
+            Tok::Lte => {
+                self.advance();
+                let v = self.parse_value()?;
+                Ok(CondExpr::Compare { field, op: CompareOp::Lte, value: v })
+            }
+            Tok::Kw(Kw::Between) => {
+                self.advance();
+                let lo = self.expect_num()?;
+                self.expect_kw(Kw::And, "AND")?;
+                let hi = self.expect_num()?;
+                Ok(CondExpr::Between { field, lo, hi })
+            }
+            Tok::Kw(Kw::In) => {
+                self.advance();
+                self.expect_lparen()?;
+                let mut values = vec![self.parse_value()?];
+                while matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                    values.push(self.parse_value()?);
+                }
+                self.expect_rparen()?;
+                Ok(CondExpr::In { field, values })
+            }
+            Tok::Kw(Kw::Not) => {
+                self.advance();
+                self.expect_kw(Kw::In, "IN")?;
+                self.expect_lparen()?;
+                let mut values = vec![self.parse_value()?];
+                while matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                    values.push(self.parse_value()?);
+                }
+                self.expect_rparen()?;
+                Ok(CondExpr::Not(Box::new(CondExpr::In { field, values })))
+            }
+            Tok::Kw(Kw::Like) => {
+                self.advance();
+                let pattern = self.expect_str()?;
+                Ok(CondExpr::Like { field, pattern, case_insensitive: false })
+            }
+            Tok::Kw(Kw::ILike) => {
+                self.advance();
+                let pattern = self.expect_str()?;
+                Ok(CondExpr::Like { field, pattern, case_insensitive: true })
+            }
+            Tok::Kw(Kw::Is) => {
+                self.advance();
+                let negated = if matches!(self.peek(), Tok::Kw(Kw::Not)) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                self.expect_kw(Kw::Null, "NULL")?;
+                Ok(CondExpr::IsNull { field, negated })
+            }
+            Tok::Eof => Err(SqlError::UnexpectedEnd { expected: "comparison operator" }),
+            other => Err(SqlError::UnexpectedToken {
+                expected: "comparison operator (=, !=, <>, >, <, >=, <=, BETWEEN, IN, NOT IN, LIKE, ILIKE)",
+                got: format!("{other:?}"),
+            }),
+        }
     }
 
     fn parse_condition(&mut self) -> Result<CondExpr, SqlError> {
@@ -1783,6 +1916,28 @@ impl Parser {
             return self.parse_vector_near_function();
         }
 
+        // Date scalar functions on the LHS: YEAR(field) > 2023, MONTH(created_at) = 4, etc.
+        if matches!(
+            upper.as_str(),
+            "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "DOW" | "QUARTER"
+        ) && matches!(self.peek(), Tok::LParen)
+        {
+            self.advance(); // consume (
+            let arg = self.expect_ident()?;
+            self.expect_rparen()?;
+            let func_field = format!("__FUNC__{}__{}",  upper, arg);
+            return self.parse_field_compare(func_field);
+        }
+        if upper == "DATE_TRUNC" && matches!(self.peek(), Tok::LParen) {
+            self.advance(); // consume (
+            let unit = self.expect_str()?;
+            self.expect_comma()?;
+            let arg = self.expect_ident()?;
+            self.expect_rparen()?;
+            let func_field = format!("__FUNC__DATE_TRUNC__{}__{}",  unit, arg);
+            return self.parse_field_compare(func_field);
+        }
+
         // BM25 full-text search: BM25(field, 'query') > min_score
         if upper == "BM25" {
             let bm25_expr = self.parse_bm25_function()?;
@@ -1822,119 +1977,7 @@ impl Parser {
         } else {
             // Resolve any JSON path operators (-> / ->>) after the field name.
             let field = self.parse_json_path_tail(field);
-
-            match self.peek().clone() {
-                Tok::Eq => {
-                    self.advance();
-                    let v = self.parse_value()?;
-                    Ok(CondExpr::Compare {
-                        field,
-                        op: CompareOp::Eq,
-                        value: v,
-                    })
-                }
-                Tok::Neq => {
-                    self.advance();
-                    let v = self.parse_value()?;
-                    Ok(CondExpr::Compare {
-                        field,
-                        op: CompareOp::Neq,
-                        value: v,
-                    })
-                }
-                Tok::Gt => {
-                    self.advance();
-                    let v = self.parse_value()?;
-                    Ok(CondExpr::Compare {
-                        field,
-                        op: CompareOp::Gt,
-                        value: v,
-                    })
-                }
-                Tok::Lt => {
-                    self.advance();
-                    let v = self.parse_value()?;
-                    Ok(CondExpr::Compare {
-                        field,
-                        op: CompareOp::Lt,
-                        value: v,
-                    })
-                }
-                Tok::Gte => {
-                    self.advance();
-                    let v = self.parse_value()?;
-                    Ok(CondExpr::Compare {
-                        field,
-                        op: CompareOp::Gte,
-                        value: v,
-                    })
-                }
-                Tok::Lte => {
-                    self.advance();
-                    let v = self.parse_value()?;
-                    Ok(CondExpr::Compare {
-                        field,
-                        op: CompareOp::Lte,
-                        value: v,
-                    })
-                }
-                Tok::Kw(Kw::Between) => {
-                    self.advance();
-                    let lo = self.expect_num()?;
-                    self.expect_kw(Kw::And, "AND")?;
-                    let hi = self.expect_num()?;
-                    Ok(CondExpr::Between { field, lo, hi })
-                }
-                Tok::Kw(Kw::In) => {
-                    self.advance();
-                    self.expect_lparen()?;
-                    let mut values = vec![self.parse_value()?];
-                    while matches!(self.peek(), Tok::Comma) {
-                        self.advance();
-                        values.push(self.parse_value()?);
-                    }
-                    self.expect_rparen()?;
-                    Ok(CondExpr::In { field, values })
-                }
-                Tok::Kw(Kw::Not) => {
-                    self.advance(); // consume NOT
-                    self.expect_kw(Kw::In, "IN")?;
-                    self.expect_lparen()?;
-                    let mut values = vec![self.parse_value()?];
-                    while matches!(self.peek(), Tok::Comma) {
-                        self.advance();
-                        values.push(self.parse_value()?);
-                    }
-                    self.expect_rparen()?;
-                    Ok(CondExpr::Not(Box::new(CondExpr::In { field, values })))
-                }
-                Tok::Kw(Kw::Like) => {
-                    self.advance();
-                    let pattern = self.expect_str()?;
-                    Ok(CondExpr::Like {
-                        field,
-                        pattern,
-                        case_insensitive: false,
-                    })
-                }
-                Tok::Kw(Kw::ILike) => {
-                    self.advance();
-                    let pattern = self.expect_str()?;
-                    Ok(CondExpr::Like {
-                        field,
-                        pattern,
-                        case_insensitive: true,
-                    })
-                }
-                Tok::Eof => Err(SqlError::UnexpectedEnd {
-                    expected: "comparison operator",
-                }),
-                other => Err(SqlError::UnexpectedToken {
-                    expected:
-                        "comparison operator (=, !=, <>, >, <, >=, <=, BETWEEN, IN, NOT IN, LIKE, ILIKE)",
-                    got: format!("{other:?}"),
-                }),
-            }
+            self.parse_field_compare(field)
         }
     }
 
@@ -2599,6 +2642,34 @@ impl Parser {
         })
     }
 
+    /// Parse an optional `DEFAULT UUIDV4()` or `DEFAULT UUIDV5('ns', 'name')` clause.
+    /// Returns `(default_uuid4, default_uuid5)`. Consumes tokens only when DEFAULT is present.
+    fn parse_field_default(p: &mut Self) -> Result<(bool, Option<(String, String)>), SqlError> {
+        if !matches!(p.peek(), Tok::Kw(Kw::Default)) {
+            return Ok((false, None));
+        }
+        p.advance(); // consume DEFAULT
+        if let Tok::Ident(ref name) = p.peek().clone() {
+            let upper = name.to_uppercase();
+            if upper == "UUIDV4" {
+                p.advance();
+                p.expect_lparen()?;
+                p.expect_rparen()?;
+                return Ok((true, None));
+            } else if upper == "UUIDV5" {
+                p.advance();
+                p.expect_lparen()?;
+                let ns = p.expect_str()?;
+                p.expect_comma()?;
+                let nm = p.expect_str()?;
+                p.expect_rparen()?;
+                return Ok((false, Some((ns, nm))));
+            }
+        }
+        // DEFAULT followed by something we don't handle — ignore silently
+        Ok((false, None))
+    }
+
     fn parse_create_table(&mut self) -> Result<TableSchema, SqlError> {
         self.expect_kw(Kw::Table, "TABLE")?;
         let collection = self.expect_ident()?;
@@ -2618,12 +2689,15 @@ impl Parser {
                 };
             let is_timestamptz = field_name.ends_with("_at") || field_name.ends_with("_time");
             let default_now = is_timestamptz;
+            let (default_uuid4, default_uuid5) = Self::parse_field_default(self)?;
             fields.push(FieldDef {
                 name: field_name,
                 ty,
                 is_primary_key,
                 is_timestamptz,
                 default_now,
+                default_uuid4,
+                default_uuid5,
             });
             if matches!(self.peek(), Tok::Comma) {
                 self.advance();
@@ -2632,6 +2706,23 @@ impl Parser {
             }
         }
         self.expect_rparen()?;
+
+        // If the user didn't declare _key, inject it with DEFAULT UUIDV4() PRIMARY KEY.
+        // Every collection must have a _key; making it auto-UUID is the safe default.
+        if !fields.iter().any(|f| f.name == "_key") {
+            fields.insert(
+                0,
+                FieldDef {
+                    name: "_key".to_string(),
+                    ty: FieldType::Text,
+                    is_primary_key: true,
+                    is_timestamptz: false,
+                    default_now: false,
+                    default_uuid4: true,
+                    default_uuid5: None,
+                },
+            );
+        }
 
         let mut schema = TableSchema {
             collection,
@@ -2645,6 +2736,8 @@ impl Parser {
             is_primary_key: false,
             is_timestamptz: false,
             default_now: true,
+            default_uuid4: false,
+            default_uuid5: None,
         });
         schema.fields.push(FieldDef {
             name: "_updated_unix".to_string(),
@@ -2652,6 +2745,8 @@ impl Parser {
             is_primary_key: false,
             is_timestamptz: false,
             default_now: true,
+            default_uuid4: false,
+            default_uuid5: None,
         });
 
         Ok(schema)
@@ -2698,12 +2793,15 @@ impl Parser {
                     }
                 }
                 let is_timestamptz = col_name.ends_with("_at") || col_name.ends_with("_time");
+                let (default_uuid4, default_uuid5) = Self::parse_field_default(self)?;
                 let def = FieldDef {
                     name: col_name,
                     ty,
                     is_primary_key,
                     is_timestamptz,
                     default_now: is_timestamptz,
+                    default_uuid4,
+                    default_uuid5,
                 };
                 Ok(CompiledMutation::AlterTable {
                     collection,
@@ -3587,7 +3685,7 @@ impl Parser {
             None
         };
 
-        Ok(MatchAggStmt { start, hops, returns, group_by, order_by, limit })
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit })
     }
 
     /// Parse `SELECT return_list FROM MATCH (start)-[edge]->(node)... [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`
@@ -3758,7 +3856,7 @@ impl Parser {
             None
         };
 
-        Ok(MatchAggStmt { start, hops, returns, group_by, order_by, limit })
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit })
     }
 
     /// Parse `SELECT return_list FROM MATCH SHORTEST (a[:col])-[r*]->(b[:col])
@@ -4072,7 +4170,7 @@ impl Parser {
                             }
                         }
                         FromSource::Match(MatchAggStmt {
-                            start, hops, returns: vec![], group_by: None, order_by: None, limit: None,
+                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, limit: None,
                         })
                     }
                 }
@@ -5206,22 +5304,24 @@ fn compile_insert(stmt: InsertStmt) -> Result<CompiledMutation, SqlError> {
             values: stmt.values.len(),
         });
     }
-    let key_idx = stmt
-        .fields
-        .iter()
-        .position(|f| f == "_key")
-        .ok_or(SqlError::MissingField { field: "_key" })?;
-    let slug = match &stmt.values[key_idx] {
-        Value::String(s) => format!("{}/{}", stmt.collection, s),
-        other => {
-            return Err(SqlError::InvalidValue(format!(
-                "_key must be a string, got {other}"
-            )))
-        }
+    // Empty-string sentinel means "_key absent — defer to schema default in execute()".
+    let slug = match stmt.fields.iter().position(|f| f == "_key") {
+        Some(idx) => match &stmt.values[idx] {
+            Value::String(s) => format!("{}/{}", stmt.collection, s),
+            other => {
+                return Err(SqlError::InvalidValue(format!(
+                    "_key must be a string, got {other}"
+                )))
+            }
+        },
+        None => String::new(), // deferred: execute() will generate via schema UUID default
     };
     let mut obj = serde_json::Map::new();
     obj.insert("_collection".into(), Value::String(stmt.collection.clone()));
-    obj.insert("_id".into(), Value::String(slug.clone()));
+    // _id will be backfilled in execute() when slug is empty
+    if !slug.is_empty() {
+        obj.insert("_id".into(), Value::String(slug.clone()));
+    }
     let mut vectors: Vec<(String, Vec<f32>)> = Vec::new();
     for (field, value) in stmt.fields.into_iter().zip(stmt.values) {
         if let Some(floats) = value_as_f32_vec(&value) {
@@ -5964,9 +6064,16 @@ mod tests {
     }
 
     #[test]
-    fn insert_missing_key_errors() {
-        let err = parse_mutation("INSERT INTO users (name, age) VALUES ('Alice', 30)").unwrap_err();
-        assert!(matches!(err, SqlError::MissingField { field: "_key" }));
+    fn insert_missing_key_deferred() {
+        // Missing _key is no longer an error at parse time — it compiles to an empty-slug
+        // sentinel so execute() can fill it from a schema UUID default.
+        let result = parse_mutation("INSERT INTO users (name, age) VALUES ('Alice', 30)");
+        match result.unwrap() {
+            CompiledMutation::Insert { slug, .. } => {
+                assert!(slug.is_empty(), "empty slug signals deferred _key");
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
     }
 
     #[test]

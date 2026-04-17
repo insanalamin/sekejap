@@ -1113,32 +1113,47 @@ fn values_eq(a: &Value, b: &Value) -> bool {
 
 /// Evaluate a filter step directly against a `Value` payload (no DB lookup).
 /// Used for HAVING conditions evaluated against synthetic per-group payloads.
+/// Resolve a field value from a payload for WHERE/HAVING evaluation.
+///
+/// - `__FUNC__*` sentinels are evaluated via [`eval_field_expr`] (date functions, etc.)
+/// - Everything else (plain fields, `__AGG__*`, JSON-path `__JP_*`, etc.) uses
+///   [`json_path_get`], which preserves the literal key lookup needed for HAVING
+///   on synthetic aggregate payloads.
+#[inline]
+fn resolve_field(field: &str, payload: &Value) -> Option<Value> {
+    if field.starts_with("__FUNC__") {
+        eval_field_expr(field, payload)
+    } else {
+        json_path_get(field, payload)
+    }
+}
+
 fn eval_step_on_payload(step: &Step, payload: &Value) -> bool {
     match step {
-        Step::WhereEq(field, value) => json_path_get(field, payload)
+        Step::WhereEq(field, value) => resolve_field(field, payload)
             .map(|v| values_eq(&v, value))
             .unwrap_or(false),
-        Step::WhereNeq(field, value) => json_path_get(field, payload)
+        Step::WhereNeq(field, value) => resolve_field(field, payload)
             .map(|v| !values_eq(&v, value))
             .unwrap_or(true),
-        Step::WhereGt(field, t) => json_path_get(field, payload)
+        Step::WhereGt(field, t) => resolve_field(field, payload)
             .and_then(|v| v.as_f64())
             .map(|f| f > *t)
             .unwrap_or(false),
-        Step::WhereLt(field, t) => json_path_get(field, payload)
+        Step::WhereLt(field, t) => resolve_field(field, payload)
             .and_then(|v| v.as_f64())
             .map(|f| f < *t)
             .unwrap_or(false),
-        Step::WhereGte(field, t) => json_path_get(field, payload)
+        Step::WhereGte(field, t) => resolve_field(field, payload)
             .and_then(|v| v.as_f64())
             .map(|f| f >= *t)
             .unwrap_or(false),
-        Step::WhereLte(field, t) => json_path_get(field, payload)
+        Step::WhereLte(field, t) => resolve_field(field, payload)
             .and_then(|v| v.as_f64())
             .map(|f| f <= *t)
             .unwrap_or(false),
         Step::WhereIsNull(field, negated) => {
-            let is_null = json_path_get(field, payload)
+            let is_null = resolve_field(field, payload)
                 .map(|v| v.is_null())
                 .unwrap_or(true);
             if *negated { !is_null } else { is_null }
@@ -1158,57 +1173,57 @@ fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool {
     match step {
         Step::WhereEq(field, value) => db
             .node_data(h)
-            .and_then(|n| json_path_get(field, &n.payload))
+            .and_then(|n| resolve_field(field, &n.payload))
             .map(|v| values_eq(&v, value))
             .unwrap_or(false),
         Step::WhereNeq(field, value) => db
             .node_data(h)
-            .and_then(|n| json_path_get(field, &n.payload))
+            .and_then(|n| resolve_field(field, &n.payload))
             .map(|v| !values_eq(&v, value))
             .unwrap_or(true),
         Step::WhereGt(field, t) => db
             .node_data(h)
-            .and_then(|n| json_path_get(field, &n.payload))
+            .and_then(|n| resolve_field(field, &n.payload))
             .and_then(|v| v.as_f64())
             .map(|f| f > *t)
             .unwrap_or(false),
         Step::WhereLt(field, t) => db
             .node_data(h)
-            .and_then(|n| json_path_get(field, &n.payload))
+            .and_then(|n| resolve_field(field, &n.payload))
             .and_then(|v| v.as_f64())
             .map(|f| f < *t)
             .unwrap_or(false),
         Step::WhereGte(field, t) => db
             .node_data(h)
-            .and_then(|n| json_path_get(field, &n.payload))
+            .and_then(|n| resolve_field(field, &n.payload))
             .and_then(|v| v.as_f64())
             .map(|f| f >= *t)
             .unwrap_or(false),
         Step::WhereLte(field, t) => db
             .node_data(h)
-            .and_then(|n| json_path_get(field, &n.payload))
+            .and_then(|n| resolve_field(field, &n.payload))
             .and_then(|v| v.as_f64())
             .map(|f| f <= *t)
             .unwrap_or(false),
         Step::WhereBetween(field, lo, hi) => db
             .node_data(h)
-            .and_then(|n| json_path_get(field, &n.payload))
+            .and_then(|n| resolve_field(field, &n.payload))
             .and_then(|v| v.as_f64())
             .map(|f| f >= *lo && f <= *hi)
             .unwrap_or(false),
         Step::WhereIn(field, values) => db
             .node_data(h)
-            .and_then(|n| json_path_get(field, &n.payload))
+            .and_then(|n| resolve_field(field, &n.payload))
             .map(|v| value_in(&v, values))
             .unwrap_or(false),
         Step::WhereIsNull(field, negated) => {
-            let v = db.node_data(h).and_then(|n| json_path_get(field, &n.payload));
+            let v = db.node_data(h).and_then(|n| resolve_field(field, &n.payload));
             let is_null = v.is_none() || matches!(v, Some(Value::Null));
             if *negated { !is_null } else { is_null }
         }
         Step::Like(field, pattern, case_insensitive) => {
             use crate::text_index::query::ilike_matches;
-            let v = db.node_data(h).and_then(|n| json_path_get(field, &n.payload));
+            let v = db.node_data(h).and_then(|n| resolve_field(field, &n.payload));
             v.as_ref()
                 .and_then(|v| v.as_str())
                 .map(|s| {
@@ -1513,7 +1528,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             Step::WhereEq(field, value) => {
                 candidates.retain(|&h| {
                     db.node_data(h)
-                        .and_then(|n| json_path_get(field, &n.payload))
+                        .and_then(|n| resolve_field(field, &n.payload))
                         .map(|v| values_eq(&v, value))
                         .unwrap_or(false)
                 });
@@ -1521,7 +1536,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             Step::WhereNeq(field, value) => {
                 candidates.retain(|&h| {
                     db.node_data(h)
-                        .and_then(|n| json_path_get(field, &n.payload))
+                        .and_then(|n| resolve_field(field, &n.payload))
                         .map(|v| !values_eq(&v, value))
                         .unwrap_or(true) // field absent → keep
                 });
@@ -1529,7 +1544,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             Step::WhereGt(field, threshold) => {
                 candidates.retain(|&h| {
                     db.node_data(h)
-                        .and_then(|n| json_path_get(field, &n.payload))
+                        .and_then(|n| resolve_field(field, &n.payload))
                         .and_then(|v| v.as_f64())
                         .map(|f| f > *threshold)
                         .unwrap_or(false)
@@ -1538,7 +1553,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             Step::WhereLt(field, threshold) => {
                 candidates.retain(|&h| {
                     db.node_data(h)
-                        .and_then(|n| json_path_get(field, &n.payload))
+                        .and_then(|n| resolve_field(field, &n.payload))
                         .and_then(|v| v.as_f64())
                         .map(|f| f < *threshold)
                         .unwrap_or(false)
@@ -1547,7 +1562,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             Step::WhereGte(field, threshold) => {
                 candidates.retain(|&h| {
                     db.node_data(h)
-                        .and_then(|n| json_path_get(field, &n.payload))
+                        .and_then(|n| resolve_field(field, &n.payload))
                         .and_then(|v| v.as_f64())
                         .map(|f| f >= *threshold)
                         .unwrap_or(false)
@@ -1556,7 +1571,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             Step::WhereLte(field, threshold) => {
                 candidates.retain(|&h| {
                     db.node_data(h)
-                        .and_then(|n| json_path_get(field, &n.payload))
+                        .and_then(|n| resolve_field(field, &n.payload))
                         .and_then(|v| v.as_f64())
                         .map(|f| f <= *threshold)
                         .unwrap_or(false)
@@ -1565,7 +1580,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             Step::WhereBetween(field, lo, hi) => {
                 candidates.retain(|&h| {
                     db.node_data(h)
-                        .and_then(|n| json_path_get(field, &n.payload))
+                        .and_then(|n| resolve_field(field, &n.payload))
                         .and_then(|v| v.as_f64())
                         .map(|f| f >= *lo && f <= *hi)
                         .unwrap_or(false)
@@ -1574,7 +1589,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             Step::WhereIn(field, values) => {
                 candidates.retain(|&h| {
                     db.node_data(h)
-                        .and_then(|n| json_path_get(field, &n.payload))
+                        .and_then(|n| resolve_field(field, &n.payload))
                         .map(|v| value_in(&v, values))
                         .unwrap_or(false)
                 });
@@ -2637,6 +2652,11 @@ pub struct HopSpec {
 pub struct MatchAggStmt {
     /// Where traversal begins.
     pub start: MatchAggStart,
+    /// Variable name bound to the start node (e.g. `"a"` in `MATCH (a:posts)-...`).
+    /// When `Some`, `collect_paths` binds the start node payload under this key in
+    /// every returned [`PathRow`], making `a.title`, `a.id`, etc. available in
+    /// SELECT / GROUP BY / RETURN expressions.
+    pub start_var: Option<String>,
     /// Hop chain.
     pub hops: Vec<HopSpec>,
     /// `RETURN` clause: `(expression, output_alias)`.
@@ -2657,7 +2677,12 @@ pub struct MatchAggStmt {
 ///
 /// If a hop has an `edge_bind`, that binding is a JSON object with path intrinsics:
 /// `_depth`, `_path_keys`, `_path_strength`, `_avg_strength`, `_min_strength`, `_max_strength`.
-pub fn collect_paths(db: &CoreDB, starts: &[u64], hops: &[HopSpec]) -> Vec<PathRow> {
+pub fn collect_paths(
+    db: &CoreDB,
+    starts: &[u64],
+    hops: &[HopSpec],
+    start_var: Option<&str>,
+) -> Vec<PathRow> {
     if hops.is_empty() || starts.is_empty() {
         return vec![];
     }
@@ -2670,8 +2695,15 @@ pub fn collect_paths(db: &CoreDB, starts: &[u64], hops: &[HopSpec]) -> Vec<PathR
     let mut stack: Vec<(u64, usize, Vec<(String, Value)>, Vec<String>, Vec<f32>)> = starts
         .iter()
         .filter_map(|&h| {
-            let start_slug = db.node_data(h).map(|n| n.slug.clone())?;
-            Some((h, 0usize, Vec::new(), vec![start_slug], Vec::new()))
+            let node = db.node_data(h)?;
+            let start_slug = node.slug.clone();
+            // Bind the start node payload if the query names the start variable.
+            let init_bindings = if let Some(sv) = start_var {
+                vec![(sv.to_string(), node.payload.clone())]
+            } else {
+                Vec::new()
+            };
+            Some((h, 0usize, init_bindings, vec![start_slug], Vec::new()))
         })
         .collect();
 
@@ -2744,7 +2776,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     };
 
     // 2. Collect all path rows
-    let paths = collect_paths(db, &starts, &stmt.hops);
+    let paths = collect_paths(db, &starts, &stmt.hops, stmt.start_var.as_deref());
     if paths.is_empty() {
         return vec![];
     }
@@ -3006,7 +3038,7 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
                 MatchAggStart::Collection(h) => db.collection_members(h).cloned().unwrap_or_default(),
                 MatchAggStart::All           => db.all_hashes(),
             };
-            collect_paths(db, &starts, &agg.hops)
+            collect_paths(db, &starts, &agg.hops, agg.start_var.as_deref())
         }
         FromSource::Shortest(s) => {
             match build_shortest_path_row(db, &s) {

@@ -1,6 +1,6 @@
 //! Scalar functions for SQL expressions.
 
-use chrono::Datelike;
+use chrono::{Datelike, Timelike};
 use serde_json::{Number, Value};
 
 pub fn str_length(s: &str) -> u64 {
@@ -182,6 +182,61 @@ pub fn eval_scalar_func(
                 Value::Null
             }
         }
+        "HOUR" => {
+            if let Some(Value::String(s)) = args.get(0) {
+                Value::Number(Number::from(hour(s).unwrap_or(0) as u64))
+            } else {
+                Value::Null
+            }
+        }
+        "MINUTE" => {
+            if let Some(Value::String(s)) = args.get(0) {
+                Value::Number(Number::from(minute(s).unwrap_or(0) as u64))
+            } else {
+                Value::Null
+            }
+        }
+        "SECOND" => {
+            if let Some(Value::String(s)) = args.get(0) {
+                Value::Number(Number::from(second(s).unwrap_or(0) as u64))
+            } else {
+                Value::Null
+            }
+        }
+        "DOW" => {
+            // 0 = Sunday, 6 = Saturday (PostgreSQL convention)
+            if let Some(Value::String(s)) = args.get(0) {
+                Value::Number(Number::from(dow(s).unwrap_or(0) as u64))
+            } else {
+                Value::Null
+            }
+        }
+        "QUARTER" => {
+            if let Some(Value::String(s)) = args.get(0) {
+                Value::Number(Number::from(quarter(s).unwrap_or(0) as u64))
+            } else {
+                Value::Null
+            }
+        }
+        "DATE_TRUNC" => {
+            // args[0] = unit ('year','month','day','hour','minute','second')
+            // args[1] = datetime field value (ISO string from payload)
+            if args.len() >= 2 {
+                let unit = match &args[0] {
+                    Value::String(s) => s.clone(),
+                    _ => return Value::Null,
+                };
+                let date_val = resolve_arg(&args[1], payload);
+                if let Some(Value::String(s)) = date_val {
+                    if let Some(dt) = parse_iso_datetime(&s) {
+                        return Value::String(date_trunc(&unit, dt));
+                    }
+                }
+                Value::Null
+            } else {
+                Value::Null
+            }
+        }
         "UUIDV4" => Value::String(uuid_v4()),
         "UUIDV5" => {
             if args.len() >= 2 {
@@ -220,6 +275,71 @@ fn parse_iso_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+pub fn hour(date_str: &str) -> Option<u32> {
+    parse_iso_datetime(date_str).map(|dt| dt.hour())
+}
+
+pub fn minute(date_str: &str) -> Option<u32> {
+    parse_iso_datetime(date_str).map(|dt| dt.minute())
+}
+
+pub fn second(date_str: &str) -> Option<u32> {
+    parse_iso_datetime(date_str).map(|dt| dt.second())
+}
+
+/// Day of week: 0 = Sunday, 6 = Saturday (PostgreSQL convention).
+pub fn dow(date_str: &str) -> Option<u32> {
+    parse_iso_datetime(date_str).map(|dt| dt.weekday().num_days_from_sunday())
+}
+
+pub fn quarter(date_str: &str) -> Option<u32> {
+    parse_iso_datetime(date_str).map(|dt| (dt.month() - 1) / 3 + 1)
+}
+
+/// Truncate a datetime to the given unit, returning an RFC 3339 string.
+///
+/// Supported units: year, quarter, month, day, hour, minute, second.
+pub fn date_trunc(unit: &str, dt: chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::NaiveDateTime;
+    let naive = dt.naive_utc();
+    let nd = naive.date();
+    let nt = naive.time();
+    let zero = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    let truncated = match unit.to_lowercase().as_str() {
+        "year" => NaiveDateTime::new(
+            chrono::NaiveDate::from_ymd_opt(nd.year(), 1, 1).unwrap_or(nd),
+            zero,
+        ),
+        "quarter" => {
+            let q_month = ((nd.month() - 1) / 3) * 3 + 1;
+            NaiveDateTime::new(
+                chrono::NaiveDate::from_ymd_opt(nd.year(), q_month, 1).unwrap_or(nd),
+                zero,
+            )
+        }
+        "month" => NaiveDateTime::new(
+            chrono::NaiveDate::from_ymd_opt(nd.year(), nd.month(), 1).unwrap_or(nd),
+            zero,
+        ),
+        "day" => NaiveDateTime::new(nd, zero),
+        "hour" => NaiveDateTime::new(
+            nd,
+            chrono::NaiveTime::from_hms_opt(nt.hour(), 0, 0).unwrap(),
+        ),
+        "minute" => NaiveDateTime::new(
+            nd,
+            chrono::NaiveTime::from_hms_opt(nt.hour(), nt.minute(), 0).unwrap(),
+        ),
+        "second" => NaiveDateTime::new(
+            nd,
+            chrono::NaiveTime::from_hms_opt(nt.hour(), nt.minute(), nt.second()).unwrap(),
+        ),
+        _ => naive,
+    };
+    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(truncated, chrono::Utc)
+        .to_rfc3339()
 }
 
 pub fn uuid_v4() -> String {
