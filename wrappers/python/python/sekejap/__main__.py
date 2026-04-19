@@ -13,46 +13,142 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 
 from . import DB, Hit
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _print_hits(hits: list[Hit]) -> None:
+_MAX_COL = 52
+_MIN_COL = 4
+
+
+def _fmt_duration(ns: int) -> str:
+    if ns < 1_000:
+        return f"{ns} ns"
+    elif ns < 1_000_000:
+        return f"{ns / 1_000:.2f} µs"
+    elif ns < 1_000_000_000:
+        return f"{ns / 1_000_000:.2f} ms"
+    else:
+        return f"{ns / 1_000_000_000:.3f} s"
+
+
+def _cell(v: object) -> str:
+    if isinstance(v, str):
+        return v
+    if v is None:
+        return ""
+    return json.dumps(v, ensure_ascii=False)
+
+
+def _trunc(s: str, maxw: int) -> str:
+    if len(s) <= maxw:
+        return s
+    return s[:maxw - 1] + "…"
+
+
+def _print_table(hits: list[Hit], elapsed_ns: int) -> None:
+    timing = _fmt_duration(elapsed_ns)
+    n = len(hits)
+
+    if not hits:
+        print(f"(0 rows)  [{timing}]")
+        return
+
+    # Collect columns from first hit's payload
+    columns: list[str] = []
+    payloads: list[dict] = []
     for hit in hits:
         if hit.payload:
             try:
-                print(json.dumps(json.loads(hit.payload), indent=2))
+                d = json.loads(hit.payload)
+                if isinstance(d, dict):
+                    for k in d:
+                        if k not in columns:
+                            columns.append(k)
+                    payloads.append(d)
+                else:
+                    payloads.append({})
             except Exception:
-                print(hit.payload)
+                payloads.append({})
         else:
-            print(hit.slug)
-    n = len(hits)
-    print(f"── {n} row{'s' if n != 1 else ''} ──")
+            payloads.append({})
+
+    if not columns:
+        # Slug-only fallback
+        slug_w = max((len(h.slug) for h in hits), default=5)
+        slug_w = min(max(slug_w, len("_slug")), _MAX_COL)
+        line = "─" * (slug_w + 2)
+        print(f"┌{line}┐")
+        print(f"│ {'_slug':<{slug_w}} │")
+        print(f"├{line}┤")
+        for hit in hits:
+            print(f"│ {_trunc(hit.slug, _MAX_COL):<{slug_w}} │")
+        print(f"└{line}┘")
+        row_word = "row" if n == 1 else "rows"
+        print(f"{n} {row_word}  [{timing}]")
+        return
+
+    # Column widths
+    widths = [max(len(c), _MIN_COL) for c in columns]
+    for row in payloads:
+        for i, col in enumerate(columns):
+            v = _cell(row.get(col))
+            w = min(len(v), _MAX_COL)
+            if w > widths[i]:
+                widths[i] = w
+
+    top = "┬".join("─" * (w + 2) for w in widths)
+    mid = "┼".join("─" * (w + 2) for w in widths)
+    bot = "┴".join("─" * (w + 2) for w in widths)
+
+    print(f"┌{top}┐")
+    hdr = "│".join(f" {c:<{w}} " for c, w in zip(columns, widths))
+    print(f"│{hdr}│")
+    print(f"├{mid}┤")
+
+    for row in payloads:
+        cells = "│".join(
+            f" {_trunc(_cell(row.get(col)), _MAX_COL):<{w}} "
+            for col, w in zip(columns, widths)
+        )
+        print(f"│{cells}│")
+
+    print(f"└{bot}┘")
+    row_word = "row" if n == 1 else "rows"
+    print(f"{n} {row_word}  [{timing}]")
 
 
 def _run_sql(db: DB, sql: str) -> None:
     first = sql.split()[0].upper() if sql.split() else ""
+    t0 = time.perf_counter_ns()
     if first in ("SELECT", "MATCH"):
         try:
-            _print_hits(db.query(sql))
+            hits = db.query(sql)
+            elapsed = time.perf_counter_ns() - t0
+            _print_table(hits, elapsed)
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
     elif first in ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "REINDEX"):
         try:
             n = db.execute(sql)
+            elapsed = time.perf_counter_ns() - t0
+            timing = _fmt_duration(elapsed)
             if n == 0:
-                print("ok")
+                print(f"ok  [{timing}]")
             elif n == 1:
-                print("ok — 1 row affected")
+                print(f"ok — 1 row affected  [{timing}]")
             else:
-                print(f"ok — {n} rows affected")
+                print(f"ok — {n} rows affected  [{timing}]")
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
     elif first == "SHOW":
         try:
-            _print_hits(db.show(sql))
+            hits = db.show(sql)
+            elapsed = time.perf_counter_ns() - t0
+            _print_table(hits, elapsed)
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
     else:

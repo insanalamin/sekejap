@@ -519,7 +519,7 @@ impl<'db> Set<'db> {
                 let hit = Hit {
                     slug: dest_node.slug.clone(),
                     slug_hash: dest_h,
-                    payload: Some(dest_node.payload.clone()),
+                    payload: db.get_payload(dest_h),
                 };
                 Some((hit, edge))
             })
@@ -832,11 +832,11 @@ impl<'db> Set<'db> {
             let mut groups: HashMap<String, GroupState> = HashMap::new();
 
             for &h in &hashes {
-                if let Some(node) = self.db.node_data(h) {
+                if let Some(payload) = self.db.get_payload(h) {
                     // Build composite group key — one JSON-encoded segment per GROUP BY field.
                     let key = group_fields.iter()
                         .map(|f| serde_json::to_string(
-                            node.payload.get(f).unwrap_or(&Value::Null)
+                            payload.get(f).unwrap_or(&Value::Null)
                         ).unwrap_or_default())
                         .collect::<Vec<_>>()
                         .join("\x00");
@@ -845,14 +845,14 @@ impl<'db> Set<'db> {
                         group_order.push(key.clone());
                         let mut gv = HashMap::new();
                         for gf in group_fields {
-                            if let Some(v) = node.payload.get(gf) {
+                            if let Some(v) = payload.get(gf) {
                                 gv.insert(gf.clone(), v.clone());
                             }
                         }
                         groups.insert(key.clone(), GroupState {
                             accums: HashMap::new(),
                             group_vals: gv,
-                            first_payload: Some(node.payload.clone()),
+                            first_payload: Some(payload.clone()),
                         });
                     }
                     let state = groups.get_mut(&key).unwrap();
@@ -868,7 +868,7 @@ impl<'db> Set<'db> {
                             let acc = state.accums
                                 .entry(out_key)
                                 .or_insert_with(|| AggAccum::new(&func, arg));
-                            acc.push(&node.payload);
+                            acc.push(&payload);
                         }
                     }
                 }
@@ -977,8 +977,31 @@ impl<'db> Set<'db> {
             let mut states: HashMap<String, AggAccum> = HashMap::new();
             // For non-aggregate fields, keep the first non-null value seen.
             let mut non_agg: HashMap<String, Value> = HashMap::new();
+
+            // Fast path: if every selected field is COUNT(*) and there are no
+            // non-aggregate fields, we can skip reading every payload entirely.
+            let all_count_star = !fields.is_empty() && fields.iter().all(|f| {
+                agg_inner(f).map_or(false, |expr| {
+                    let rest = expr.strip_prefix("__AGG__").unwrap_or(expr);
+                    let mut parts = rest.splitn(2, "__");
+                    let func = parts.next().unwrap_or("").to_uppercase();
+                    let arg  = parts.next().unwrap_or("*");
+                    func == "COUNT" && arg == "*"
+                })
+            });
+
+            if all_count_star {
+                // No payload reads needed — just count the candidates.
+                let n = hashes.len() as i64;
+                let mut map = serde_json::Map::new();
+                for f in fields {
+                    map.insert(field_output_key(f), Value::Number(serde_json::Number::from(n)));
+                }
+                return vec![Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }];
+            }
+
             for &hash in &hashes {
-                if let Some(node) = self.db.node_data(hash) {
+                if let Some(payload) = self.db.get_payload(hash) {
                     for f in fields {
                         if let Some(agg_expr) = agg_inner(f) {
                             let key = field_output_key(f);
@@ -987,9 +1010,9 @@ impl<'db> Set<'db> {
                             let func = parts.next().unwrap_or("COUNT").to_uppercase();
                             let arg = parts.next().unwrap_or("*");
                             let state = states.entry(key).or_insert_with(|| AggAccum::new(&func, arg));
-                            state.push(&node.payload);
+                            state.push(&payload);
                         } else if !non_agg.contains_key(&field_output_key(f)) {
-                            if let Some(v) = eval_field_expr(f, &node.payload) {
+                            if let Some(v) = eval_field_expr(f, &payload) {
                                 non_agg.insert(field_output_key(f), v);
                             }
                         }
@@ -1013,23 +1036,85 @@ impl<'db> Set<'db> {
             }];
         }
 
+        // Determine whether the fast raw-byte field extractor can be used.
+        // Requirements: SELECT has fields, no BM25 scoring, and ALL fields are
+        // plain top-level names (no functions, JSON path, or `*`).
+        let can_use_fast_path = bm25_scores.is_none()
+            && select_fields.as_ref().map_or(false, |fs| {
+                !fs.is_empty() && fs.iter().all(|f| is_simple_field(f))
+            });
+
+        // Payload size threshold above which we use the fast raw-byte extraction
+        // path instead of full serde_json deserialization.  Nodes smaller than
+        // this are cheaply deserialized by serde_json, so the extra complexity
+        // of the raw scanner is not worthwhile.  64 KB covers most small records.
+        const FAST_PATH_THRESHOLD: u32 = 64 * 1024;
+
         let mut hits: Vec<Hit> = execute(self.db, &self.steps)
             .into_iter()
             .filter_map(|hash| {
                 let node = self.db.node_data(hash)?;
                 let payload = match (&select_fields, &bm25_scores) {
-                    (None, None) => Some(node.payload.clone()),
+                    (None, None) => {
+                        self.db.get_payload(hash)
+                    }
+                    (Some(fields), None) if can_use_fast_path => {
+                        // Fast path: direct byte-pattern search on head + tail slices.
+                        // For large payloads (e.g. 12 MB GeoJSON polygons) this avoids
+                        // reading the full blob; metadata fields are found in ≤ 16 KB.
+                        if node.payload_len > FAST_PATH_THRESHOLD {
+                            let (head, tail) = self.db.get_payload_head_tail(
+                                hash,
+                                512,        // first 512 bytes — _key, _collection, etc.
+                                16 * 1024,  // last 16 KB — metadata: name, level, etc.
+                            )?;
+                            // Search tail first (metadata fields live at the end).
+                            let mut map = extract_fields_by_search(&tail, fields);
+                            // Any fields not found in tail → search head.
+                            let missing: Vec<String> = fields.iter()
+                                .filter(|f| !map.contains_key(f.as_str()))
+                                .cloned()
+                                .collect();
+                            if !missing.is_empty() {
+                                let head_map = extract_fields_by_search(&head, &missing);
+                                for (k, v) in head_map {
+                                    map.entry(k).or_insert(v);
+                                }
+                            }
+                            // Build output map with correct output key names.
+                            let mut out = serde_json::Map::new();
+                            for f in fields {
+                                let key = field_output_key(f);
+                                if let Some(v) = map.remove(f.as_str()) {
+                                    out.insert(key, v);
+                                }
+                            }
+                            Some(Value::Object(out))
+                        } else {
+                            // Small payload — full parse is cheap.
+                            let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
+                            let mut out = serde_json::Map::new();
+                            for f in fields {
+                                if let Some(v) = eval_field_expr(f, &raw_payload) {
+                                    out.insert(field_output_key(f), v);
+                                }
+                            }
+                            Some(Value::Object(out))
+                        }
+                    }
                     (Some(fields), None) => {
+                        let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
                         let mut map = serde_json::Map::new();
                         for f in fields {
-                            if let Some(v) = eval_field_expr(f, &node.payload) {
+                            if let Some(v) = eval_field_expr(f, &raw_payload) {
                                 map.insert(field_output_key(f), v);
                             }
                         }
                         Some(Value::Object(map))
                     }
                     (None, Some((bm25_field, _bm25_query, scores))) => {
-                        let mut map = node.payload.as_object().cloned().unwrap_or_default();
+                        let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
+                        let mut map = raw_payload.as_object().cloned().unwrap_or_default();
                         let score_key = format!("_bm25_{}_score", bm25_field);
                         if let Some(&s) = scores.get(&hash) {
                             map.insert(score_key, serde_json::json!(s));
@@ -1039,9 +1124,10 @@ impl<'db> Set<'db> {
                         Some(Value::Object(map))
                     }
                     (Some(fields), Some((bm25_field, _bm25_query, scores))) => {
+                        let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
                         let mut map = serde_json::Map::new();
                         for f in fields {
-                            if let Some(v) = eval_field_expr(f, &node.payload) {
+                            if let Some(v) = eval_field_expr(f, &raw_payload) {
                                 map.insert(field_output_key(f), v);
                             }
                         }
@@ -1128,6 +1214,121 @@ fn resolve_field(field: &str, payload: &Value) -> Option<Value> {
     }
 }
 
+// ── Fast raw-byte JSON field extractor ────────────────────────────────────────
+
+/// Advance `i` past the closing `"`, handling `\` escape sequences.
+/// Expects `i` to point to the first byte INSIDE the string (after the opening `"`).
+fn scan_string_end(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"'  => return i + 1,
+            b'\\' => i += 2,
+            _     => i += 1,
+        }
+    }
+    i
+}
+
+/// Find the last occurrence of `needle` in `haystack`.
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let limit = haystack.len() - needle.len();
+    for i in (0..=limit).rev() {
+        if &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Extract a simple JSON value (string, number, boolean, null) from `bytes`
+/// starting at `start`.  Returns `(Value, end_position)` on success.
+/// Returns `None` for complex values (objects/arrays).
+fn extract_simple_value(bytes: &[u8], start: usize) -> Option<(Value, usize)> {
+    match bytes.get(start)? {
+        b'"' => {
+            // String: find closing '"' respecting escapes
+            let mut end = start + 1;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'"'  => { end += 1; break; }
+                    b'\\' => end += 2,
+                    _     => end += 1,
+                }
+            }
+            // Let serde_json decode escape sequences correctly
+            let v = serde_json::from_slice::<Value>(&bytes[start..end]).ok()?;
+            Some((v, end))
+        }
+        b't' if bytes.get(start..start + 4) == Some(b"true") => {
+            Some((Value::Bool(true), start + 4))
+        }
+        b'f' if bytes.get(start..start + 5) == Some(b"false") => {
+            Some((Value::Bool(false), start + 5))
+        }
+        b'n' if bytes.get(start..start + 4) == Some(b"null") => {
+            Some((Value::Null, start + 4))
+        }
+        b'-' | b'0'..=b'9' => {
+            let mut end = start;
+            while end < bytes.len()
+                && !matches!(bytes[end], b',' | b'}' | b']' | b' ' | b'\n' | b'\r' | b'\t')
+            {
+                end += 1;
+            }
+            let v = serde_json::from_slice::<Value>(&bytes[start..end]).ok()?;
+            Some((v, end))
+        }
+        _ => None, // complex value (object/array)
+    }
+}
+
+/// Search `bytes` for each requested field name using a direct byte pattern search
+/// (`"<field>":`) and extract its simple value.
+///
+/// Uses `rfind` so the LAST occurrence of the pattern is returned first — this
+/// means fields that appear near the END of the blob (e.g. metadata after geometry)
+/// are found quickly without scanning from the beginning.
+///
+/// This function does NOT require `bytes` to start at `{`.  It works on any
+/// slice of a JSON payload (head, tail, or full blob).
+fn extract_fields_by_search(
+    bytes: &[u8],
+    fields: &[String],
+) -> serde_json::Map<String, Value> {
+    let mut result = serde_json::Map::new();
+    for field in fields {
+        let needle = format!("\"{}\":", field);
+        // Try rfind first (finds occurrence near the end — fast for tail metadata)
+        if let Some(pos) = rfind_bytes(bytes, needle.as_bytes()) {
+            let val_start_raw = pos + needle.len();
+            // Skip optional whitespace
+            let val_start = bytes[val_start_raw..]
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                .map(|off| val_start_raw + off)
+                .unwrap_or(val_start_raw);
+            if let Some((v, _)) = extract_simple_value(bytes, val_start) {
+                result.insert(field.clone(), v);
+            }
+        }
+    }
+    result
+}
+
+/// Check whether a SELECT field expression is a plain top-level field name
+/// (no `__` prefix, no `->` operators, no `*`).  Only plain fields can use
+/// the raw-byte fast extraction path.
+fn is_simple_field(expr: &str) -> bool {
+    !expr.contains("__")
+        && !expr.contains("->")
+        && !expr.contains('*')
+        && !expr.contains('(')
+        && !expr.contains(')')
+}
+
 fn eval_step_on_payload(step: &Step, payload: &Value) -> bool {
     match step {
         Step::WhereEq(field, value) => resolve_field(field, payload)
@@ -1172,58 +1373,58 @@ fn eval_step_on_payload(step: &Step, payload: &Value) -> bool {
 fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool {
     match step {
         Step::WhereEq(field, value) => db
-            .node_data(h)
-            .and_then(|n| resolve_field(field, &n.payload))
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
             .map(|v| values_eq(&v, value))
             .unwrap_or(false),
         Step::WhereNeq(field, value) => db
-            .node_data(h)
-            .and_then(|n| resolve_field(field, &n.payload))
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
             .map(|v| !values_eq(&v, value))
             .unwrap_or(true),
         Step::WhereGt(field, t) => db
-            .node_data(h)
-            .and_then(|n| resolve_field(field, &n.payload))
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
             .and_then(|v| v.as_f64())
             .map(|f| f > *t)
             .unwrap_or(false),
         Step::WhereLt(field, t) => db
-            .node_data(h)
-            .and_then(|n| resolve_field(field, &n.payload))
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
             .and_then(|v| v.as_f64())
             .map(|f| f < *t)
             .unwrap_or(false),
         Step::WhereGte(field, t) => db
-            .node_data(h)
-            .and_then(|n| resolve_field(field, &n.payload))
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
             .and_then(|v| v.as_f64())
             .map(|f| f >= *t)
             .unwrap_or(false),
         Step::WhereLte(field, t) => db
-            .node_data(h)
-            .and_then(|n| resolve_field(field, &n.payload))
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
             .and_then(|v| v.as_f64())
             .map(|f| f <= *t)
             .unwrap_or(false),
         Step::WhereBetween(field, lo, hi) => db
-            .node_data(h)
-            .and_then(|n| resolve_field(field, &n.payload))
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
             .and_then(|v| v.as_f64())
             .map(|f| f >= *lo && f <= *hi)
             .unwrap_or(false),
         Step::WhereIn(field, values) => db
-            .node_data(h)
-            .and_then(|n| resolve_field(field, &n.payload))
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
             .map(|v| value_in(&v, values))
             .unwrap_or(false),
         Step::WhereIsNull(field, negated) => {
-            let v = db.node_data(h).and_then(|n| resolve_field(field, &n.payload));
+            let v = db.get_payload(h).and_then(|p| resolve_field(field, &p));
             let is_null = v.is_none() || matches!(v, Some(Value::Null));
             if *negated { !is_null } else { is_null }
         }
         Step::Like(field, pattern, case_insensitive) => {
             use crate::text_index::query::ilike_matches;
-            let v = db.node_data(h).and_then(|n| resolve_field(field, &n.payload));
+            let v = db.get_payload(h).and_then(|p| resolve_field(field, &p));
             v.as_ref()
                 .and_then(|v| v.as_str())
                 .map(|s| {
@@ -1349,8 +1550,13 @@ fn eval_score(
 /// Execute the step pipeline and return candidate slug hashes in order.
 fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
     let mut candidates: Vec<u64> = Vec::new();
+    // Steps consumed by btree_seed (already applied as the seed filter)
+    let mut skip_set: HashSet<usize> = HashSet::new();
 
     for (i, step) in steps.iter().enumerate() {
+        if skip_set.contains(&i) {
+            continue;
+        }
         let remaining = &steps[i + 1..];
         match step {
             // ── Starters ────────────────────────────────────────────────────
@@ -1370,8 +1576,10 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::Collection(hash) => {
                 // Priority 1: btree equality/range filter seed (most selective)
-                if let Some(seeded) = db.btree_seed(*hash, remaining) {
+                if let Some((seeded, skip_j)) = db.btree_seed(*hash, remaining) {
                     candidates = seeded;
+                    // skip the step that was consumed by the btree index
+                    skip_set.insert(i + 1 + skip_j);
                 // Priority 2: btree ORDER BY index scan (pre-sorted candidates)
                 } else if let Some(sorted) = db.btree_sorted_seed_from_steps(*hash, remaining) {
                     candidates = sorted;
@@ -1527,24 +1735,24 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             // ── Payload filters ──────────────────────────────────────────────
             Step::WhereEq(field, value) => {
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| resolve_field(field, &n.payload))
+                    db.get_payload(h)
+                        .and_then(|p| resolve_field(field, &p))
                         .map(|v| values_eq(&v, value))
                         .unwrap_or(false)
                 });
             }
             Step::WhereNeq(field, value) => {
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| resolve_field(field, &n.payload))
+                    db.get_payload(h)
+                        .and_then(|p| resolve_field(field, &p))
                         .map(|v| !values_eq(&v, value))
                         .unwrap_or(true) // field absent → keep
                 });
             }
             Step::WhereGt(field, threshold) => {
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| resolve_field(field, &n.payload))
+                    db.get_payload(h)
+                        .and_then(|p| resolve_field(field, &p))
                         .and_then(|v| v.as_f64())
                         .map(|f| f > *threshold)
                         .unwrap_or(false)
@@ -1552,8 +1760,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereLt(field, threshold) => {
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| resolve_field(field, &n.payload))
+                    db.get_payload(h)
+                        .and_then(|p| resolve_field(field, &p))
                         .and_then(|v| v.as_f64())
                         .map(|f| f < *threshold)
                         .unwrap_or(false)
@@ -1561,8 +1769,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereGte(field, threshold) => {
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| resolve_field(field, &n.payload))
+                    db.get_payload(h)
+                        .and_then(|p| resolve_field(field, &p))
                         .and_then(|v| v.as_f64())
                         .map(|f| f >= *threshold)
                         .unwrap_or(false)
@@ -1570,8 +1778,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereLte(field, threshold) => {
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| resolve_field(field, &n.payload))
+                    db.get_payload(h)
+                        .and_then(|p| resolve_field(field, &p))
                         .and_then(|v| v.as_f64())
                         .map(|f| f <= *threshold)
                         .unwrap_or(false)
@@ -1579,8 +1787,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereBetween(field, lo, hi) => {
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| resolve_field(field, &n.payload))
+                    db.get_payload(h)
+                        .and_then(|p| resolve_field(field, &p))
                         .and_then(|v| v.as_f64())
                         .map(|f| f >= *lo && f <= *hi)
                         .unwrap_or(false)
@@ -1588,8 +1796,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereIn(field, values) => {
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| resolve_field(field, &n.payload))
+                    db.get_payload(h)
+                        .and_then(|p| resolve_field(field, &p))
                         .map(|v| value_in(&v, values))
                         .unwrap_or(false)
                 });
@@ -1603,22 +1811,36 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 candidates.retain(|&h| eval_cond(db, h, step));
             }
             Step::Like(field, pattern, case_insensitive) => {
-                use crate::text_index::query::ilike_matches;
-                use memchr::memmem;
+                use crate::text_index::query::{ilike_matches, like_matches};
                 // Look ahead for a Take limit to enable early termination
                 let take_limit = find_take_limit(remaining);
-                // Prefer GIN (exact) over GiST (lossy) when available
+                // Prefer GIN (exact trigram candidates) over GiST (lossy) when available.
+                // GIN may produce false positives after the trigram fix (no space-padding for
+                // interior patterns), so we verify each candidate with ilike_matches/like_matches.
+                // If GIN index exists for this field and returns 0 candidates, the index
+                // is complete (every document trigram was indexed), so 0 means no match.
+                // Skip the expensive brute-force scan entirely.
+                let gin_has_index = db.gin_indexes.contains_key(field.as_str());
                 let gin_results = db.gin_ilike(field, pattern, take_limit);
-                if !gin_results.is_empty() {
-                    // GIN is exact — no verification needed
+                if gin_has_index && gin_results.is_empty() {
+                    candidates.clear();
+                } else if !gin_results.is_empty() {
+                    let verify = |h: u64| -> bool {
+                        db.get_payload(h)
+                            .and_then(|p| json_path_get(field, &p))
+                            .and_then(|v| v.as_str().map(|s| s.to_string()))
+                            .map(|s| if *case_insensitive { ilike_matches(&s, pattern) }
+                                     else { like_matches(&s, pattern) })
+                            .unwrap_or(false)
+                    };
                     if candidates.is_empty() {
-                        // STARTER: use GIN results directly
-                        candidates = gin_results;
+                        // STARTER: verify GIN candidates
+                        candidates = gin_results.into_iter().filter(|&h| verify(h)).collect();
                     } else {
-                        // FILTER: intersect with GIN results
+                        // FILTER: intersect + verify
                         let gin_set: std::collections::HashSet<u64> =
                             gin_results.into_iter().collect();
-                        candidates.retain(|h| gin_set.contains(h));
+                        candidates.retain(|h| gin_set.contains(h) && verify(*h));
                     }
                 } else if let Some(candidates_from_index) =
                     db.text_index_candidates_with_limit(field, pattern, take_limit)
@@ -1633,8 +1855,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             let verified: Vec<u64> = candidates_from_index
                                 .into_iter()
                                 .filter(|&h| {
-                                    let v = db.node_data(h)
-                                        .and_then(|n| json_path_get(field, &n.payload));
+                                    let v = db.get_payload(h)
+                                        .and_then(|p| json_path_get(field, &p));
                                     v.as_ref()
                                         .and_then(|v| v.as_str())
                                         .map(|s| {
@@ -1660,8 +1882,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             candidates = gist.verify(&candidates, pattern, take_limit);
                         } else {
                             candidates.retain(|&h| {
-                                let v = db.node_data(h)
-                                    .and_then(|n| json_path_get(field, &n.payload));
+                                let v = db.get_payload(h)
+                                    .and_then(|p| json_path_get(field, &p));
                                 v.as_ref()
                                     .and_then(|v| v.as_str())
                                     .map(|s| {
@@ -1676,26 +1898,19 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         }
                     }
                 } else {
-                    // No index — fall back to brute-force with SIMD
-                    let needle = if *case_insensitive {
-                        pattern.to_lowercase()
-                    } else {
-                        pattern.to_string()
-                    };
+                    // No index — brute-force payload scan with proper wildcard matching.
+                    // ilike_matches handles % wildcards case-insensitively;
+                    // like_matches does the same but case-sensitively.
                     candidates.retain(|&h| {
-                        let v = db.node_data(h)
-                            .and_then(|n| json_path_get(field, &n.payload));
+                        let v = db.get_payload(h)
+                            .and_then(|p| json_path_get(field, &p));
                         v.as_ref()
                             .and_then(|v| v.as_str())
                             .map(|s| {
                                 if *case_insensitive {
-                                    memmem::Finder::new(needle.as_bytes())
-                                        .find(s.to_lowercase().as_bytes())
-                                        .is_some()
+                                    ilike_matches(s, pattern)
                                 } else {
-                                    memmem::Finder::new(needle.as_bytes())
-                                        .find(s.as_bytes())
-                                        .is_some()
+                                    like_matches(s, pattern)
                                 }
                             })
                             .unwrap_or(false)
@@ -1762,8 +1977,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         candidates = db.all_hashes();
                     }
                     candidates.retain(|&h| {
-                        db.node_data(h)
-                            .and_then(|n| crate::geo::extract_centroid(&n.payload))
+                        db.get_payload(h)
+                            .and_then(|p| crate::geo::extract_centroid(&p))
                             .map(|(clat, clon)| {
                                 crate::geo::haversine_km(clat, clon, *lat, *lon) <= *distance_km
                             })
@@ -1779,10 +1994,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             .candidates_containing_point(*lat, *lon)
                             .into_iter()
                             .filter(|&h| {
-                                db.node_data(h)
-                                    .map(|n| {
-                                        crate::geo::geom_contains_point(&n.payload, *lat, *lon)
-                                    })
+                                db.get_payload(h)
+                                    .map(|p| crate::geo::geom_contains_point(&p, *lat, *lon))
                                     .unwrap_or(false)
                             })
                             .collect();
@@ -1794,8 +2007,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             .collect();
                         candidates.retain(|h| grid_set.contains(h));
                         candidates.retain(|&h| {
-                            db.node_data(h)
-                                .map(|n| crate::geo::geom_contains_point(&n.payload, *lat, *lon))
+                            db.get_payload(h)
+                                .map(|p| crate::geo::geom_contains_point(&p, *lat, *lon))
                                 .unwrap_or(false)
                         });
                     }
@@ -1804,8 +2017,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         candidates = db.all_hashes();
                     }
                     candidates.retain(|&h| {
-                        db.node_data(h)
-                            .map(|n| crate::geo::geom_contains_point(&n.payload, *lat, *lon))
+                        db.get_payload(h)
+                            .map(|p| crate::geo::geom_contains_point(&p, *lat, *lon))
                             .unwrap_or(false)
                     });
                 }
@@ -1836,8 +2049,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                                         return false;
                                     }
                                 }
-                                db.node_data(h)
-                                    .map(|n| crate::geo::geom_within_polygon(&n.payload, ring))
+                                db.get_payload(h)
+                                    .map(|p| crate::geo::geom_within_polygon(&p, ring))
                                     .unwrap_or(false)
                             })
                             .collect();
@@ -1858,8 +2071,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                                     return false;
                                 }
                             }
-                            db.node_data(h)
-                                .map(|n| crate::geo::geom_within_polygon(&n.payload, ring))
+                            db.get_payload(h)
+                                .map(|p| crate::geo::geom_within_polygon(&p, ring))
                                 .unwrap_or(false)
                         });
                     }
@@ -1868,8 +2081,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         candidates = db.all_hashes();
                     }
                     candidates.retain(|&h| {
-                        db.node_data(h)
-                            .map(|n| crate::geo::geom_within_polygon(&n.payload, ring))
+                        db.get_payload(h)
+                            .map(|p| crate::geo::geom_within_polygon(&p, ring))
                             .unwrap_or(false)
                     });
                 }
@@ -1899,8 +2112,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                                         return false;
                                     }
                                 }
-                                db.node_data(h)
-                                    .map(|n| crate::geo::geom_contains_polygon(&n.payload, ring))
+                                db.get_payload(h)
+                                    .map(|p| crate::geo::geom_contains_polygon(&p, ring))
                                     .unwrap_or(false)
                             })
                             .collect();
@@ -1921,8 +2134,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                                     return false;
                                 }
                             }
-                            db.node_data(h)
-                                .map(|n| crate::geo::geom_contains_polygon(&n.payload, ring))
+                            db.get_payload(h)
+                                .map(|p| crate::geo::geom_contains_polygon(&p, ring))
                                 .unwrap_or(false)
                         });
                     }
@@ -1931,8 +2144,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         candidates = db.all_hashes();
                     }
                     candidates.retain(|&h| {
-                        db.node_data(h)
-                            .map(|n| crate::geo::geom_contains_polygon(&n.payload, ring))
+                        db.get_payload(h)
+                            .map(|p| crate::geo::geom_contains_polygon(&p, ring))
                             .unwrap_or(false)
                     });
                 }
@@ -1952,8 +2165,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             .candidates_in_bbox(qmin_lat, qmin_lon, qmax_lat, qmax_lon)
                             .into_iter()
                             .filter(|&h| {
-                                db.node_data(h)
-                                    .map(|n| crate::geo::geom_intersects_polygon(&n.payload, ring))
+                                db.get_payload(h)
+                                    .map(|p| crate::geo::geom_intersects_polygon(&p, ring))
                                     .unwrap_or(false)
                             })
                             .collect();
@@ -1964,8 +2177,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             .collect();
                         candidates.retain(|h| grid_set.contains(h));
                         candidates.retain(|&h| {
-                            db.node_data(h)
-                                .map(|n| crate::geo::geom_intersects_polygon(&n.payload, ring))
+                            db.get_payload(h)
+                                .map(|p| crate::geo::geom_intersects_polygon(&p, ring))
                                 .unwrap_or(false)
                         });
                     }
@@ -1974,8 +2187,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         candidates = db.all_hashes();
                     }
                     candidates.retain(|&h| {
-                        db.node_data(h)
-                            .map(|n| crate::geo::geom_intersects_polygon(&n.payload, ring))
+                        db.get_payload(h)
+                            .map(|p| crate::geo::geom_intersects_polygon(&p, ring))
                             .unwrap_or(false)
                     });
                 }
@@ -1986,11 +2199,11 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     candidates = db.all_hashes();
                 }
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| n.payload.get(&*field))
+                    db.get_payload(h)
+                        .and_then(|p| p.get(&*field).cloned())
                         .and_then(|geom| {
                             crate::geo::distance_km(
-                                geom,
+                                &geom,
                                 &serde_json::json!({
                                     "type": "Point",
                                     "coordinates": [lon, lat]
@@ -2007,9 +2220,9 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     candidates = db.all_hashes();
                 }
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| n.payload.get(&*field))
-                        .and_then(|geom| crate::geo::length_km(geom))
+                    db.get_payload(h)
+                        .and_then(|p| p.get(&*field).cloned())
+                        .and_then(|geom| crate::geo::length_km(&geom))
                         .map(|l| l > *min_km)
                         .unwrap_or(false)
                 });
@@ -2020,9 +2233,9 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     candidates = db.all_hashes();
                 }
                 candidates.retain(|&h| {
-                    db.node_data(h)
-                        .and_then(|n| n.payload.get(&*field))
-                        .and_then(|geom| crate::geo::area_km2(geom))
+                    db.get_payload(h)
+                        .and_then(|p| p.get(&*field).cloned())
+                        .and_then(|geom| crate::geo::area_km2(&geom))
                         .map(|a| a > *min_km2)
                         .unwrap_or(false)
                 });
@@ -2126,19 +2339,52 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
 
             // ── Shaping ──────────────────────────────────────────────────────
             Step::Sort(columns) => {
-                candidates.sort_by(|&a, &b| {
-                    let pa = db.node_data(a).map(|n| &n.payload);
-                    let pb = db.node_data(b).map(|n| &n.payload);
-                    for (field, asc) in columns {
-                        let va = pa.and_then(|p| json_path_get(field, p));
-                        let vb = pb.and_then(|p| json_path_get(field, p));
-                        let ord = cmp_json(va.as_ref(), vb.as_ref());
+                // Pre-compute sort keys once per candidate to avoid calling
+                // get_payload O(n log n) times in the sort comparator.
+                // For large payloads (e.g. GeoJSON polygons), this reduces
+                // redundant disk reads from O(n log n) to O(n).
+                let sort_fields: Vec<String> = columns.iter().map(|(f, _)| f.clone()).collect();
+                let use_fast = sort_fields.iter().all(|f| is_simple_field(f));
+                // Pair each candidate with its pre-computed sort keys, sort, then unzip.
+                let mut keyed: Vec<(u64, Vec<Option<Value>>)> = candidates
+                    .iter()
+                    .map(|&h| {
+                        let vals: Vec<Option<Value>> = if use_fast {
+                            if let Some((head, tail)) = db.get_payload_head_tail(h, 512, 16 * 1024) {
+                                let mut map = extract_fields_by_search(&tail, &sort_fields);
+                                let missing: Vec<String> = sort_fields.iter()
+                                    .filter(|f| !map.contains_key(f.as_str()))
+                                    .cloned()
+                                    .collect();
+                                if !missing.is_empty() {
+                                    for (k, v) in extract_fields_by_search(&head, &missing) {
+                                        map.entry(k).or_insert(v);
+                                    }
+                                }
+                                sort_fields.iter().map(|f| map.remove(f.as_str())).collect()
+                            } else {
+                                sort_fields.iter().map(|_| None).collect()
+                            }
+                        } else if let Some(payload) = db.get_payload(h) {
+                            sort_fields.iter().map(|f| json_path_get(f, &payload)).collect()
+                        } else {
+                            sort_fields.iter().map(|_| None).collect()
+                        };
+                        (h, vals)
+                    })
+                    .collect();
+                keyed.sort_by(|(_, ka), (_, kb)| {
+                    for (i, (_, asc)) in columns.iter().enumerate() {
+                        let va = ka.get(i).and_then(|v| v.as_ref());
+                        let vb = kb.get(i).and_then(|v| v.as_ref());
+                        let ord = cmp_json(va, vb);
                         if ord != std::cmp::Ordering::Equal {
                             return if *asc { ord } else { ord.reverse() };
                         }
                     }
                     std::cmp::Ordering::Equal
                 });
+                candidates = keyed.into_iter().map(|(h, _)| h).collect();
             }
             Step::SortByVector { field, query, metric } => {
                 use crate::vector::{CosineDistance, L2Distance, DotProduct, L1Distance, Distance};
@@ -2204,12 +2450,9 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 let mut scored: Vec<(u64, f64)> = candidates
                     .iter()
                     .map(|&h| {
-                        let payload = db
-                            .node_data(h)
-                            .map(|n| &n.payload)
-                            .unwrap_or(&Value::Null);
+                        let payload_owned = db.get_payload(h).unwrap_or(Value::Null);
                         let s = eval_score(
-                            expr, h, payload, db,
+                            expr, h, &payload_owned, db,
                             &bm25_maps, &vec_maps,
                         );
                         (h, s)
@@ -2699,7 +2942,8 @@ pub fn collect_paths(
             let start_slug = node.slug.clone();
             // Bind the start node payload if the query names the start variable.
             let init_bindings = if let Some(sv) = start_var {
-                vec![(sv.to_string(), node.payload.clone())]
+                let start_payload = db.get_payload(h).unwrap_or(Value::Null);
+                vec![(sv.to_string(), start_payload)]
             } else {
                 Vec::new()
             };
@@ -2744,7 +2988,8 @@ pub fn collect_paths(
                     }
 
                     // Bind the destination node.
-                    new_bindings.push((hop.node_bind.clone(), node.payload.clone()));
+                    let dest_payload = db.get_payload(e.other).unwrap_or(Value::Null);
+                    new_bindings.push((hop.node_bind.clone(), dest_payload));
 
                     let next_hop = hop_idx + 1;
                     if next_hop >= hops.len() {
@@ -2878,13 +3123,13 @@ fn build_shortest_path_row(
     let mut row: PathRow = HashMap::new();
 
     // Bind start node
-    if let Some(node) = db.node_data(start) {
-        row.insert(stmt.start_bind.clone(), node.payload.clone());
+    if let Some(payload) = db.get_payload(start) {
+        row.insert(stmt.start_bind.clone(), payload);
     }
 
     // Bind end node
-    if let Some(node) = db.node_data(end) {
-        row.insert(stmt.end_bind.clone(), node.payload.clone());
+    if let Some(payload) = db.get_payload(end) {
+        row.insert(stmt.end_bind.clone(), payload);
     }
 
     // Bind path object when path_bind is set
@@ -2938,8 +3183,8 @@ fn eval_path_predicate(db: &CoreDB, pred: &PathPredicate, row: &PathRow) -> bool
 
     let matches: Vec<bool> = slugs.iter().map(|slug| {
         let hash = crate::sk_hash(slug);
-        if let Some(node) = db.node_data(hash) {
-            let actual = node.payload.get(&cond.field).cloned().unwrap_or(Value::Null);
+        if let Some(payload) = db.get_payload(hash) {
+            let actual = payload.get(&cond.field).cloned().unwrap_or(Value::Null);
             eval_cmp(&actual, &cond.op, &cond.val)
         } else {
             false
@@ -3052,9 +3297,10 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|h| {
-                    let node = db.node_data(h)?;
+                    // check node exists and get payload
+                    let payload = db.get_payload(h)?;
                     let mut row: PathRow = HashMap::new();
-                    row.insert(alias.clone(), node.payload.clone());
+                    row.insert(alias.clone(), payload);
                     Some(row)
                 })
                 .collect()

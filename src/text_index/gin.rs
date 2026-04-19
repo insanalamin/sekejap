@@ -187,6 +187,119 @@ impl GINIndex {
         }
     }
 
+    /// Reconstruct a GINIndex directly from serialized parts (used by snapshot restore).
+    ///
+    /// * `id_map`   – slot → node hash
+    /// * `postings` – (trigram_hash, sorted slot list) pairs; slot lists are rebuilt
+    ///                into RoaringBitmaps
+    /// * `field`    – field name
+    pub fn from_parts(id_map: Vec<u64>, postings: Vec<(u32, Vec<u32>)>, field: &str) -> Self {
+        let doc_count = id_map.len();
+        let postings_map: HashMap<u32, roaring::RoaringBitmap> = postings
+            .into_iter()
+            .map(|(h, slots)| {
+                let mut bm = roaring::RoaringBitmap::new();
+                bm.extend(slots.into_iter());
+                (h, bm)
+            })
+            .collect();
+        Self {
+            postings: postings_map,
+            id_map,
+            doc_count,
+            field: field.to_string(),
+        }
+    }
+
+    /// Return a copy of the id_map (slot → node hash).
+    pub fn id_map_cloned(&self) -> Vec<u64> {
+        self.id_map.clone()
+    }
+
+    /// Return all postings as (trigram_hash, sorted_slot_list) pairs.
+    pub fn postings_as_vecs(&self) -> Vec<(u32, Vec<u32>)> {
+        self.postings
+            .iter()
+            .map(|(&h, bm)| (h, bm.iter().collect()))
+            .collect()
+    }
+
+    /// Write this GIN index to a binary stream.
+    ///
+    /// Format (all integers little-endian):
+    ///   [u16 field_name_len][field_name_bytes]
+    ///   [u32 GIN_INDEX_VERSION]
+    ///   [u64 id_map_len][u64 × id_map_len]
+    ///   [u32 postings_count]
+    ///   per posting: [u32 trigram_hash][u32 bitmap_byte_len][bitmap_bytes]
+    pub fn write_binary<W: std::io::Write>(&self, w: &mut W, version: u32) -> std::io::Result<()> {
+        let field_bytes = self.field.as_bytes();
+        w.write_all(&(field_bytes.len() as u16).to_le_bytes())?;
+        w.write_all(field_bytes)?;
+        w.write_all(&version.to_le_bytes())?;
+        w.write_all(&(self.id_map.len() as u64).to_le_bytes())?;
+        for &h in &self.id_map {
+            w.write_all(&h.to_le_bytes())?;
+        }
+        w.write_all(&(self.postings.len() as u32).to_le_bytes())?;
+        for (&trigram_hash, bm) in &self.postings {
+            let mut bm_bytes = Vec::new();
+            bm.serialize_into(&mut bm_bytes)?;
+            w.write_all(&trigram_hash.to_le_bytes())?;
+            w.write_all(&(bm_bytes.len() as u32).to_le_bytes())?;
+            w.write_all(&bm_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Read one GIN index from a binary stream (written by `write_binary`).
+    /// Returns `(field_name, index)`. Returns `Err` on any parse/IO failure.
+    pub fn read_binary<R: std::io::Read>(r: &mut R, expected_version: u32) -> std::io::Result<(String, Self)> {
+        use std::io::{Error, ErrorKind};
+        let mut u16buf = [0u8; 2];
+        r.read_exact(&mut u16buf)?;
+        let field_len = u16::from_le_bytes(u16buf) as usize;
+        let mut field_bytes = vec![0u8; field_len];
+        r.read_exact(&mut field_bytes)?;
+        let field = String::from_utf8(field_bytes)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+
+        let mut u32buf = [0u8; 4];
+        r.read_exact(&mut u32buf)?;
+        let version = u32::from_le_bytes(u32buf);
+        if version != expected_version {
+            return Err(Error::new(ErrorKind::InvalidData,
+                format!("gin.bin version {version} != expected {expected_version}")));
+        }
+
+        let mut u64buf = [0u8; 8];
+        r.read_exact(&mut u64buf)?;
+        let id_map_len = u64::from_le_bytes(u64buf) as usize;
+        let mut id_map = Vec::with_capacity(id_map_len);
+        for _ in 0..id_map_len {
+            r.read_exact(&mut u64buf)?;
+            id_map.push(u64::from_le_bytes(u64buf));
+        }
+
+        r.read_exact(&mut u32buf)?;
+        let postings_count = u32::from_le_bytes(u32buf) as usize;
+        let mut postings = HashMap::new();
+        for _ in 0..postings_count {
+            r.read_exact(&mut u32buf)?;
+            let trigram_hash = u32::from_le_bytes(u32buf);
+            r.read_exact(&mut u32buf)?;
+            let bm_len = u32::from_le_bytes(u32buf) as usize;
+            let mut bm_bytes = vec![0u8; bm_len];
+            r.read_exact(&mut bm_bytes)?;
+            let bm = roaring::RoaringBitmap::deserialize_from(&bm_bytes[..])
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+            postings.insert(trigram_hash, bm);
+        }
+
+        let doc_count = id_map.len();
+        Ok((field.clone(), Self { postings, id_map, doc_count, field }))
+    }
+
     /// Get the number of unique trigrams indexed.
     pub fn trigram_count(&self) -> usize {
         self.postings.len()
@@ -218,10 +331,14 @@ mod tests {
 
     #[test]
     fn test_ilike_pattern_extraction() {
+        // %Alpha% — both sides wildcarded: only interior trigrams, no space padding
         let pattern = "%Alpha%";
         let trigrams = extract_pattern_trigrams(pattern);
         assert!(!trigrams.is_empty());
-        assert!(trigrams.contains(&" al".to_string()));
+        assert!(trigrams.contains(&"alp".to_string()));
+        assert!(trigrams.contains(&"lph".to_string()));
+        assert!(trigrams.contains(&"pha".to_string()));
+        assert!(!trigrams.contains(&" al".to_string()), "space padding must not appear with leading %");
     }
 
     #[test]

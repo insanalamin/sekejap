@@ -271,8 +271,8 @@ fn resolve_starts(db: &CoreDB, start: &PipeMatchStart, row: &PipeRow) -> Vec<u64
                 members
                     .into_iter()
                     .filter(|&h| {
-                        db.node_data(h)
-                            .map(|n| filters.iter().all(|f| f.matches(&n.payload, row)))
+                        db.get_payload(h)
+                            .map(|p| filters.iter().all(|f| f.matches(&p, row)))
                             .unwrap_or(false)
                     })
                     .collect()
@@ -292,8 +292,8 @@ fn expand_match(db: &CoreDB, rows: Vec<PipeRow>, stage: &PipeMatchStage) -> Vec<
             let start_bindings: Vec<(String, Value)> =
                 match &stage.start {
                     PipeMatchStart::Collection { bind: Some(b), .. } => {
-                        match db.node_data(start_h) {
-                            Some(n) => vec![(b.clone(), n.payload.clone())],
+                        match db.get_payload(start_h) {
+                            Some(payload) => vec![(b.clone(), payload)],
                             None => continue,
                         }
                     }
@@ -321,8 +321,6 @@ fn expand_match(db: &CoreDB, rows: Vec<PipeRow>, stage: &PipeMatchStage) -> Vec<
                     if e.edge_type != hop.edge_type_hash {
                         continue;
                     }
-                    let Some(node) = db.node_data(e.other) else { continue };
-
                     // Optional collection filter on endpoint node.
                     if let Some(col_h) = hop.col_filter {
                         if !node_in_collection(db, e.other, col_h) {
@@ -330,8 +328,12 @@ fn expand_match(db: &CoreDB, rows: Vec<PipeRow>, stage: &PipeMatchStage) -> Vec<
                         }
                     }
 
+                    let node_payload = match db.get_payload(e.other) {
+                        Some(p) => p,
+                        None => continue,
+                    };
                     let mut new_bindings = bindings.clone();
-                    new_bindings.push((hop.bind.clone(), node.payload.clone()));
+                    new_bindings.push((hop.bind.clone(), node_payload));
 
                     let next_hop = hop_idx + 1;
                     if next_hop >= stage.hops.len() {
@@ -354,9 +356,7 @@ fn expand_match(db: &CoreDB, rows: Vec<PipeRow>, stage: &PipeMatchStage) -> Vec<
 
 fn node_in_collection(db: &CoreDB, hash: u64, col_hash: u64) -> bool {
     db.node_data(hash)
-        .and_then(|n| n.payload.get("_collection"))
-        .and_then(|v| v.as_str())
-        .map(|c| sk_hash(c) == col_hash)
+        .map(|n| !n.collection.is_empty() && sk_hash(&n.collection) == col_hash)
         .unwrap_or(false)
 }
 

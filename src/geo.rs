@@ -125,7 +125,7 @@ pub fn extract_centroid(payload: &Value) -> Option<(f64, f64)> {
 // ── Spatial metadata ─────────────────────────────────────────────────────────
 
 /// Cached spatial metadata for a node: centroid + axis-aligned bounding box.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SpatialMeta {
     pub centroid_lat: f64,
     pub centroid_lon: f64,

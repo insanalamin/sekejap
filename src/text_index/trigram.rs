@@ -94,14 +94,46 @@ pub fn extract_trigrams(text: &str) -> Vec<String> {
 /// // Returns trigrams for "Alpha": [" al", "alp", "lph", "pha", "ha "]
 /// ```
 pub fn extract_pattern_trigrams(pattern: &str) -> Vec<String> {
-    // Remove % and _ wildcards for trigram extraction
-    let cleaned: String = pattern.chars().filter(|c| *c != '%' && *c != '_').collect();
+    // Split pattern on wildcards and collect fixed literal segments.
+    // Each segment separated by % can match at any position in the document,
+    // so we must NOT add space-padding — only interior trigrams are valid.
+    // Space-padding is only appropriate when a segment is anchored to the
+    // start or end of the value (no leading/trailing %).
+    let has_leading_pct  = pattern.starts_with('%');
+    let has_trailing_pct = pattern.ends_with('%');
 
-    if cleaned.is_empty() {
+    // Strip leading/trailing wildcards and split remaining on %
+    let inner = pattern.trim_matches(|c| c == '%' || c == '_');
+    let segments: Vec<&str> = inner.split('%').filter(|s| s.len() >= 3).collect();
+
+    if segments.is_empty() {
         return vec![];
     }
 
-    extract_trigrams(&cleaned)
+    let mut all_trigrams: Vec<String> = Vec::new();
+
+    for (i, seg) in segments.iter().enumerate() {
+        let lower = seg.to_lowercase();
+        let chars: Vec<char> = lower.chars().collect();
+        if chars.len() < 3 { continue; }
+
+        // Decide whether to space-pad this segment's edges:
+        // - pad start only if this is the first segment AND no leading %
+        // - pad end only if this is the last segment AND no trailing %
+        let pad_start = i == 0 && !has_leading_pct;
+        let pad_end   = i == segments.len() - 1 && !has_trailing_pct;
+
+        let mut padded: Vec<char> = Vec::with_capacity(chars.len() + 2);
+        if pad_start { padded.push(' '); }
+        padded.extend_from_slice(&chars);
+        if pad_end   { padded.push(' '); }
+
+        for window in padded.windows(3) {
+            all_trigrams.push(window.iter().collect());
+        }
+    }
+
+    all_trigrams
 }
 
 /// Hash a trigram string to a u32 value using FNV-1a.
@@ -209,9 +241,24 @@ mod tests {
 
     #[test]
     fn test_extract_pattern_trigrams() {
+        // %Alpha% — both sides wildcarded, so only interior trigrams (no space padding)
         let trigrams = extract_pattern_trigrams("%Alpha%");
-        assert!(trigrams.contains(&" al".to_string()));
+        assert!(trigrams.contains(&"alp".to_string()));
+        assert!(trigrams.contains(&"lph".to_string()));
         assert!(trigrams.contains(&"pha".to_string()));
+        // Space-padded boundary trigrams must NOT be present
+        assert!(!trigrams.contains(&" al".to_string()), "leading space should not appear with leading %");
+        assert!(!trigrams.contains(&"ha ".to_string()), "trailing space should not appear with trailing %");
+
+        // Alpha% — no leading wildcard, so leading space IS added
+        let trigrams2 = extract_pattern_trigrams("Alpha%");
+        assert!(trigrams2.contains(&" al".to_string()), "no leading % → leading space expected");
+        assert!(!trigrams2.contains(&"ha ".to_string()), "trailing % → trailing space NOT expected");
+
+        // %Alpha — no trailing wildcard, trailing space IS added
+        let trigrams3 = extract_pattern_trigrams("%Alpha");
+        assert!(!trigrams3.contains(&" al".to_string()), "leading % → leading space NOT expected");
+        assert!(trigrams3.contains(&"ha ".to_string()), "no trailing % → trailing space expected");
     }
 
     #[test]

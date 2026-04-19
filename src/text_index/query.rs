@@ -173,6 +173,40 @@ pub fn ilike_matches(text: &str, pattern: &str) -> bool {
     }
 }
 
+/// Case-sensitive LIKE pattern matching (same wildcard logic as `ilike_matches`, no lowercasing).
+pub fn like_matches(text: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() { return true; }
+    if pattern == "%" { return true; }
+    let leading_pct  = pattern.chars().take_while(|&c| c == '%').count();
+    let trailing_pct = pattern.chars().rev().take_while(|&c| c == '%').count();
+    let stripped = pattern.trim_matches('%');
+    if stripped.is_empty() { return true; }
+    let fixed_parts: Vec<&str> = stripped.split('%').filter(|s| !s.is_empty()).collect();
+    if fixed_parts.is_empty() { return true; }
+    if leading_pct > 0 || trailing_pct > 0 {
+        let mut pos = 0usize;
+        for part in &fixed_parts {
+            if let Some(found) = text[pos..].find(part) {
+                pos += found + part.len();
+            } else {
+                return false;
+            }
+        }
+        true
+    } else {
+        let mut pos = 0usize;
+        for part in &fixed_parts {
+            if let Some(found) = text[pos..].find(part) {
+                pos += found + part.len();
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Execute ILIKE query using GiST index with verification.
 ///
 /// # Arguments
@@ -193,8 +227,8 @@ pub fn ilike_gist(
 
     let mut results = Vec::new();
     for doc_id in candidates {
-        if let Some(node_data) = db.node_data(doc_id) {
-            let text = serde_json::to_string(&node_data.payload).unwrap_or_default();
+        if let Some(payload) = db.get_payload(doc_id) {
+            let text = serde_json::to_string(&payload).unwrap_or_default();
             if ilike_matches(&text, pattern) {
                 results.push(doc_id);
                 if let Some(l) = limit {
@@ -246,10 +280,10 @@ pub fn ilike_gist_with_text(
 
     let mut results = Vec::new();
     for doc_id in candidates {
-        if let Some(node_data) = db.node_data(doc_id) {
-            if let Some(text) = node_data.payload.get(field).and_then(|v| v.as_str()) {
-                if ilike_matches(text, pattern) {
-                    results.push((doc_id, text.to_string()));
+        if let Some(payload) = db.get_payload(doc_id) {
+            if let Some(text) = payload.get(field).and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                if ilike_matches(&text, pattern) {
+                    results.push((doc_id, text));
                     if let Some(l) = limit {
                         if results.len() >= l {
                             break;

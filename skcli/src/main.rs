@@ -14,6 +14,7 @@
 use rustyline::DefaultEditor;
 use sekejap::CoreDB;
 use std::io::{self, IsTerminal, Read};
+use std::time::Instant;
 
 // ── Arg parsing ───────────────────────────────────────────────────────────────
 
@@ -88,67 +89,173 @@ fn open_db(path: &Option<String>) -> (CoreDB, String) {
     }
 }
 
+// ── Table renderer ────────────────────────────────────────────────────────────
+
+const MAX_COL_WIDTH: usize = 52;
+const MIN_COL_WIDTH: usize = 4;
+
+fn format_duration(ns: u128) -> String {
+    if ns < 1_000 {
+        format!("{ns} ns")
+    } else if ns < 1_000_000 {
+        format!("{:.2} µs", ns as f64 / 1_000.0)
+    } else if ns < 1_000_000_000 {
+        format!("{:.2} ms", ns as f64 / 1_000_000.0)
+    } else {
+        format!("{:.3} s", ns as f64 / 1_000_000_000.0)
+    }
+}
+
+fn cell_str(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn truncate_cell(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        let cut: String = chars[..max - 1].iter().collect();
+        format!("{cut}…")
+    }
+}
+
+fn print_table(hits: Vec<sekejap::Hit>, elapsed_ns: u128) {
+    let timing = format_duration(elapsed_ns);
+    let count = hits.len();
+
+    if hits.is_empty() {
+        println!("(0 rows)  [{timing}]");
+        return;
+    }
+
+    // Collect column names from first hit's payload keys
+    let mut columns: Vec<String> = Vec::new();
+    for hit in &hits {
+        if let Some(serde_json::Value::Object(map)) = &hit.payload {
+            for key in map.keys() {
+                if !columns.contains(key) {
+                    columns.push(key.clone());
+                }
+            }
+        }
+    }
+
+    // No structured payload — show slug column
+    if columns.is_empty() {
+        let slug_w = hits.iter()
+            .map(|h| h.slug.chars().count())
+            .max().unwrap_or(5)
+            .min(MAX_COL_WIDTH)
+            .max("_slug".len());
+        let line = "─".repeat(slug_w + 2);
+        println!("┌{line}┐");
+        println!("│ {:<slug_w$} │", "_slug");
+        println!("├{line}┤");
+        for hit in &hits {
+            println!("│ {:<slug_w$} │", truncate_cell(&hit.slug, MAX_COL_WIDTH));
+        }
+        println!("└{line}┘");
+        if count == 1 { println!("1 row  [{timing}]"); } else { println!("{count} rows  [{timing}]"); }
+        return;
+    }
+
+    // Compute column widths
+    let mut widths: Vec<usize> = columns.iter()
+        .map(|c| c.chars().count().max(MIN_COL_WIDTH))
+        .collect();
+    for hit in &hits {
+        if let Some(serde_json::Value::Object(map)) = &hit.payload {
+            for (i, col) in columns.iter().enumerate() {
+                let val = map.get(col).map(cell_str).unwrap_or_default();
+                let display = val.chars().count().min(MAX_COL_WIDTH);
+                if display > widths[i] {
+                    widths[i] = display;
+                }
+            }
+        }
+    }
+
+    let top = widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┬");
+    let mid = widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┼");
+    let bot = widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┴");
+
+    println!("┌{top}┐");
+    let hdr: Vec<String> = columns.iter().zip(&widths)
+        .map(|(c, w)| format!(" {:<w$} ", c))
+        .collect();
+    println!("│{}│", hdr.join("│"));
+    println!("├{mid}┤");
+
+    for hit in &hits {
+        let cells: Vec<String> = columns.iter().zip(&widths).map(|(col, w)| {
+            let val = hit.payload.as_ref()
+                .and_then(|p| p.get(col))
+                .map(cell_str)
+                .unwrap_or_default();
+            format!(" {:<w$} ", truncate_cell(&val, MAX_COL_WIDTH))
+        }).collect();
+        println!("│{}│", cells.join("│"));
+    }
+
+    println!("└{bot}┘");
+    if count == 1 { println!("1 row  [{timing}]"); } else { println!("{count} rows  [{timing}]"); }
+}
+
 // ── SQL execution ─────────────────────────────────────────────────────────────
 
-/// Execute one SQL statement, print results.
 fn run_sql(db: &mut CoreDB, sql: &str) -> bool {
     let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
+    let t0 = Instant::now();
     match first.as_str() {
         "SELECT" => match db.query(sql) {
             Err(e) => eprintln!("error: {e}"),
-            Ok(set) => print_hits(set.collect()),
+            Ok(set) => {
+                let hits = set.collect();
+                print_table(hits, t0.elapsed().as_nanos());
+            }
         },
         "MATCH" => {
             let is_pipeline = sql.split_whitespace().any(|w| w.to_uppercase() == "WITH");
             if is_pipeline {
                 match db.pipeline_query(sql) {
                     Err(e) => eprintln!("error: {e}"),
-                    Ok(hits) => print_hits(hits),
+                    Ok(hits) => print_table(hits, t0.elapsed().as_nanos()),
                 }
             } else {
                 match db.query(sql) {
                     Err(e) => eprintln!("error: {e}"),
-                    Ok(set) => print_hits(set.collect()),
+                    Ok(set) => {
+                        let hits = set.collect();
+                        print_table(hits, t0.elapsed().as_nanos());
+                    }
                 }
             }
         }
-        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" => match db.execute(sql) {
+        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" => match db.execute(sql) {
             Err(e) => eprintln!("error: {e}"),
             Ok(n) => {
+                let timing = format_duration(t0.elapsed().as_nanos());
                 if n == 0 {
-                    println!("ok");
+                    println!("ok  [{timing}]");
                 } else if n == 1 {
-                    println!("ok — 1 row affected");
+                    println!("ok — 1 row affected  [{timing}]");
                 } else {
-                    println!("ok — {} rows affected", n);
+                    println!("ok — {n} rows affected  [{timing}]");
                 }
             }
         },
         "SHOW" => match db.show(sql) {
             Err(e) => eprintln!("error: {e}"),
-            Ok(hits) => print_hits(hits),
+            Ok(hits) => print_table(hits, t0.elapsed().as_nanos()),
         },
-        _ => eprintln!("unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE CREATE DROP"),
+        _ => eprintln!("unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE CREATE DROP ALTER"),
     }
     true
-}
-
-fn print_hits(hits: Vec<sekejap::Hit>) {
-    let count = hits.len();
-    for hit in &hits {
-        match &hit.payload {
-            Some(v) => println!(
-                "{}",
-                serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
-            ),
-            None => println!("{}", hit.slug),
-        }
-    }
-    if count == 1 {
-        println!("── 1 row ──");
-    } else {
-        println!("── {} rows ──", count);
-    }
 }
 
 // ── Dot commands ──────────────────────────────────────────────────────────────
@@ -297,6 +404,10 @@ INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...);
 UPDATE collection SET field = val [WHERE ...];
 DELETE FROM collection [WHERE ...];
 CREATE TABLE collection (_key TEXT PRIMARY KEY, field TYPE, ...);
+ALTER TABLE collection ADD COLUMN field TYPE;
+ALTER TABLE collection DROP COLUMN field;
+ALTER TABLE collection RENAME COLUMN old TO new;
+ALTER TABLE collection RENAME TO new_name;
 
 Graph edges
 ───────────

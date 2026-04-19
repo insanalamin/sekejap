@@ -37,6 +37,7 @@ ENV/
 # maturin develop
 *.so
 *.pyd
+*.dSYM/
 
 # ============================================
 # IDE & Editors

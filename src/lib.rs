@@ -67,7 +67,7 @@ const HNSW_INDEX_VERSION:    u32 = 1;
 // ── Field index key ───────────────────────────────────────────────────────────
 
 /// Totally-ordered wrapper for f64 (NaN sorts last, uses `total_cmp`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct OrdF64(f64);
 impl Eq for OrdF64 {}
 impl PartialOrd for OrdF64 {
@@ -82,7 +82,7 @@ impl Ord for OrdF64 {
 }
 
 /// Ordered key for a field index: null < bool < number < string.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum FieldKey {
     Null,
     Bool(bool),
@@ -112,9 +112,172 @@ pub(crate) fn sk_hash(s: &str) -> u64 {
     seahash::hash(s.as_bytes())
 }
 
+/// Payload storage backend — either an in-memory `Vec<u8>` (ephemeral DB) or
+/// a memory-mapped append file `payloads.bin` (persistent DB).
+///
+/// For persistent databases the file is truncated to zero on every `open()`,
+/// then refilled by snapshot + WAL replay. This keeps all geometry / large-JSON
+/// bytes on disk and out of RAM. Only `NodeData` metadata (≈ 100 B per node)
+/// stays in the `HashMap`.
+pub(crate) struct PayloadStore {
+    inner: PayloadInner,
+}
+
+enum PayloadInner {
+    Memory { data: Vec<u8> },
+    Disk   { file: std::fs::File, total_len: u64 },
+}
+
+impl PayloadStore {
+    fn new() -> Self {
+        Self { inner: PayloadInner::Memory { data: Vec::new() } }
+    }
+
+    /// Open (or create) a disk-backed store, truncating to zero.
+    fn open_file(path: &std::path::Path) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Self { inner: PayloadInner::Disk { file, total_len: 0 } })
+    }
+
+    /// Open an existing disk-backed store without truncating.
+    fn open_existing(path: &std::path::Path, total_len: u64) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        Ok(Self { inner: PayloadInner::Disk { file, total_len } })
+    }
+
+    fn is_disk(&self) -> bool {
+        matches!(self.inner, PayloadInner::Disk { .. })
+    }
+
+    /// Append raw bytes; returns `(offset, len)`.
+    /// Panics on disk write failure (disk-full etc.) — callers do not recover.
+    fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+        match &mut self.inner {
+            PayloadInner::Memory { data } => {
+                let offset = data.len() as u64;
+                data.extend_from_slice(bytes);
+                (offset, bytes.len() as u32)
+            }
+            PayloadInner::Disk { file, total_len } => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    file.write_all_at(bytes, *total_len)
+                        .expect("sekejap: payload disk write failed");
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Seek, SeekFrom, Write};
+                    file.seek(SeekFrom::Start(*total_len))
+                        .expect("sekejap: payload disk seek failed");
+                    file.write_all(bytes)
+                        .expect("sekejap: payload disk write failed");
+                }
+                let offset = *total_len;
+                *total_len += bytes.len() as u64;
+                (offset, bytes.len() as u32)
+            }
+        }
+    }
+
+    /// Parse JSON at the given position. Returns `None` if invalid.
+    fn get(&self, offset: u64, len: u32) -> Option<Value> {
+        self.get_raw(offset, len)
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    /// Return raw JSON bytes at the given position (owned copy).
+    pub(crate) fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
+        match &self.inner {
+            PayloadInner::Memory { data } => {
+                let start = offset as usize;
+                let end = start.checked_add(len as usize)?;
+                data.get(start..end).map(|b| b.to_vec())
+            }
+            PayloadInner::Disk { file, .. } => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = vec![0u8; len as usize];
+                    file.read_exact_at(&mut buf, offset).ok()?;
+                    Some(buf)
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    // Non-unix: need interior mutability for seek — use a thread-local
+                    // or just take &mut self. Since CoreDB is single-threaded we can
+                    // use a workaround: re-open the file for read.
+                    // This is a fallback path; unix is the primary target.
+                    let _ = (file, offset, len); // silence warnings
+                    None // non-unix disk reads not yet implemented
+                }
+            }
+        }
+    }
+
+    /// Read `read_len` bytes starting at an arbitrary absolute byte offset.
+    /// Used for head/tail fast-path field extraction on large payloads.
+    pub(crate) fn get_raw_at(&self, abs_offset: u64, read_len: usize) -> Option<Vec<u8>> {
+        if read_len == 0 {
+            return Some(vec![]);
+        }
+        match &self.inner {
+            PayloadInner::Memory { data } => {
+                let start = abs_offset as usize;
+                let end = start.checked_add(read_len)?;
+                data.get(start..end).map(|b| b.to_vec())
+            }
+            PayloadInner::Disk { file, .. } => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = vec![0u8; read_len];
+                    file.read_exact_at(&mut buf, abs_offset).ok()?;
+                    Some(buf)
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let path = {
+                        // fallback: re-open for reading (non-unix only)
+                        return self.get_raw(abs_offset, read_len as u32);
+                    };
+                    let _ = path;
+                    None
+                }
+            }
+        }
+    }
+
+    /// Reset the slab (in-memory only — used after in-memory compaction).
+    fn reset(&mut self, new_data: Vec<u8>) {
+        if let PayloadInner::Memory { data } = &mut self.inner {
+            *data = new_data;
+        }
+    }
+}
+
 pub struct NodeData {
     pub slug: String,
-    pub payload: Value,
+    /// Cached `_collection` field value (empty string if no collection).
+    /// Avoids parsing JSON for collection-only lookups.
+    pub collection: String,
+    /// Cached spatial bounding-box, computed once in `put_raw()`.
+    /// `rebuild_spatial_grid()` reads from here to avoid disk reads.
+    pub spatial_meta: Option<geo::SpatialMeta>,
+    /// Byte offset of this node's raw JSON payload in `CoreDB.payload_store`.
+    pub payload_offset: u64,
+    /// Byte length of this node's raw JSON payload.
+    pub payload_len: u32,
 }
 
 pub(crate) struct EdgeEntry {
@@ -166,6 +329,8 @@ pub struct CoreDB {
     adj_rev: HashMap<u64, Vec<EdgeEntry>>,
     /// collection_hash → member slug hashes
     collections: HashMap<u64, Vec<u64>>,
+    /// collection_hash → collection name (for O(1) SHOW TABLES without node scan)
+    collection_names_map: HashMap<u64, String>,
     /// edge_type_hash → original name  (needed to rebuild snapshots)
     edge_type_names: HashMap<u64, String>,
     /// WAL writer — `Some` when opened from disk, `None` for in-memory.
@@ -199,6 +364,9 @@ pub struct CoreDB {
     /// Build params for each HNSW index: field → (m, ef_construction).
     /// Populated by build_hnsw_index(); used to auto-rebuild on version mismatch.
     hnsw_params: HashMap<String, (usize, usize)>,
+    /// Append-only byte slab for raw JSON payloads.
+    /// All `NodeData` entries index into this store via `(payload_offset, payload_len)`.
+    payload_store: PayloadStore,
 }
 
 impl Default for CoreDB {
@@ -218,6 +386,7 @@ impl CoreDB {
             adj_fwd: HashMap::new(),
             adj_rev: HashMap::new(),
             collections: HashMap::new(),
+            collection_names_map: HashMap::new(),
             edge_type_names: HashMap::new(),
             wal: None,
             data_dir: None,
@@ -230,6 +399,7 @@ impl CoreDB {
             hnsw_indexes: HashMap::new(),
             field_indexes: HashMap::new(),
             hnsw_params: HashMap::new(),
+            payload_store: PayloadStore::new(),
         }
     }
 
@@ -253,31 +423,87 @@ impl CoreDB {
         let mut db = Self::new();
         db.data_dir = Some(dir.to_path_buf());
 
-        // 1. Load snapshot
+        // 1. Load snapshot (peek before touching payloads.bin).
+        //    Disk-backed snapshots store only metadata — payloads stay in payloads.bin.
+        //    We must NOT truncate payloads.bin in that case.
         let snap_path = dir.join("snapshot.json");
-        if snap_path.exists() {
-            let data = std::fs::read(&snap_path)?;
-            let snap: Snapshot = serde_json::from_slice(&data)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if snap.version > SNAPSHOT_FORMAT_VERSION {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "snapshot version {} requires a newer sekejap (max supported: {})",
-                        snap.version, SNAPSHOT_FORMAT_VERSION
-                    ),
-                ));
+        // Measure size before parsing — used later to detect legacy bloated snapshots.
+        let snap_file_size = if snap_path.exists() {
+            std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
+        let snap: Option<Snapshot> = if snap_path.exists() {
+            // Stream-parse rather than loading the whole file into RAM.
+            // This handles legacy snapshots that embedded gin_indexes (multi-GB).
+            // serde_json::from_reader reads incrementally; IgnoredAny skips gin_indexes
+            // without allocating, so a 2.3GB legacy snapshot costs <1 MB to parse.
+            let file = std::fs::File::open(&snap_path)?;
+            match serde_json::from_reader::<_, Snapshot>(std::io::BufReader::new(file)) {
+                Ok(s) if s.version > SNAPSHOT_FORMAT_VERSION => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "snapshot version {} requires a newer sekejap (max supported: {})",
+                            s.version, SNAPSHOT_FORMAT_VERSION
+                        ),
+                    ));
+                }
+                Ok(s) => Some(s),
+                Err(_) => None, // corrupt snapshot — fall back to full WAL replay
             }
+        } else {
+            None
+        };
+
+        // Open payload store: preserve existing payloads.bin for disk-backed snapshots,
+        // truncate to zero otherwise (WAL replay or legacy snapshot will refill it).
+        let pay_path = dir.join("payloads.bin");
+        let preserve = snap.as_ref().map_or(false, |s| s.is_disk_backed);
+        if preserve && pay_path.exists() {
+            let existing_len = std::fs::metadata(&pay_path)?.len();
+            db.payload_store = PayloadStore::open_existing(&pay_path, existing_len)?;
+        } else {
+            db.payload_store = PayloadStore::open_file(&pay_path)?;
+        }
+
+        if let Some(snap) = snap {
             db.load_snapshot(snap);
         }
 
-        // 2. Replay WAL
-        let wal_path = dir.join("wal.log");
-        if wal_path.exists() {
-            let (entries, corrupted) = WalReader::open(&wal_path)?.read_all();
-            for entry in entries {
-                db.replay(entry);
+        // One-time migration: if the snapshot was large (legacy had embedded gin_indexes),
+        // rewrite it immediately as a clean compact snapshot so subsequent opens are fast.
+        // Threshold: 1 MB. A normal disk-backed snapshot with 500K nodes is ~50-80 MB,
+        // but we only want to rewrite if the file is bloated (2+ GB from gin_indexes).
+        // We use 50 MB as the threshold — anything larger is definitely bloated.
+        if snap_file_size > 50 * 1024 * 1024 {
+            if let Ok(snap_json) = serde_json::to_vec_pretty(&db.build_snapshot()) {
+                let snap_tmp = snap_path.with_extension("json.tmp");
+                if std::fs::write(&snap_tmp, &snap_json).is_ok() {
+                    let _ = std::fs::rename(&snap_tmp, &snap_path);
+                }
             }
+        }
+
+        // 2. Replay WAL — stream one entry at a time to avoid loading all
+        //    payloads into RAM simultaneously (critical for large datasets).
+        //    Track whether any data-mutating entries were present so we know
+        //    if in-memory indexes (GIN, HNSW) need a post-replay rebuild.
+        let wal_path = dir.join("wal.log");
+        let mut wal_had_data = false;
+        if wal_path.exists() {
+            let corrupted = WalReader::open(&wal_path)?.replay_all(|entry| {
+                match &entry {
+                    WalEntry::Put { .. }
+                    | WalEntry::Remove { .. }
+                    | WalEntry::PutVector { .. }
+                    | WalEntry::Link { .. }
+                    | WalEntry::LinkMeta { .. }
+                    | WalEntry::Unlink { .. } => wal_had_data = true,
+                    _ => {}
+                }
+                db.replay(entry);
+            });
             if corrupted {
                 eprintln!(
                     "sekejap: WAL at `{}` had a corrupted frame — \
@@ -293,10 +519,23 @@ impl CoreDB {
         // 4. Build spatial index from loaded data
         db.rebuild_spatial_grid();
 
-        // 5. Rebuild GIN and HNSW from all loaded data so that indexes declared
-        //    before data was written (a common pattern) are always up-to-date.
-        db.rebuild_declared_gin_indexes();
-        db.rebuild_declared_hnsw_indexes();
+        // 5. Rebuild GIN and HNSW when WAL added new data, or load GIN from the
+        //    binary sidecar gin.bin (compact, fast — no JSON parsing overhead).
+        //    HNSW is always rebuilt when WAL had data (small enough to be fast).
+        let gin_bin_path = dir.join("gin.bin");
+        if wal_had_data {
+            // Data changed — rebuild GIN from payloads and refresh gin.bin.
+            db.rebuild_declared_gin_indexes();
+            db.rebuild_declared_hnsw_indexes();
+            let _ = db.save_gin_binary(&gin_bin_path);
+        } else {
+            // WAL was empty (e.g. right after compact). Try loading GIN from
+            // gin.bin. If it is missing or stale, rebuild once and save it.
+            if !db.load_gin_binary(&gin_bin_path) {
+                db.rebuild_declared_gin_indexes();
+                let _ = db.save_gin_binary(&gin_bin_path);
+            }
+        }
 
         Ok(db)
     }
@@ -308,18 +547,21 @@ impl CoreDB {
         let hash = sk_hash(slug);
         let now = chrono::Utc::now().timestamp_millis();
 
+        // Collect old node metadata (separate let to release borrow before mutations)
+        let old_info: Option<(String, u64, u32)> = self.nodes
+            .get(&hash)
+            .map(|n| (n.collection.clone(), n.payload_offset, n.payload_len));
+
         // Auto-timestamps: preserve existing _created_unix, always update _updated_unix
         {
             let obj = payload.as_object_mut().expect("payload must be object");
             let created_unix = if obj.contains_key("_created_unix") {
-                // Use value from new payload if present
                 obj.get("_created_unix").cloned()
             } else {
-                // Check if old node has _created_unix to preserve
-                self.nodes
-                    .get(&hash)
-                    .and_then(|n| n.payload.get("_created_unix"))
-                    .cloned()
+                // Preserve from the old stored payload (if updating)
+                old_info.as_ref()
+                    .and_then(|(_, off, len)| self.payload_store.get(*off, *len))
+                    .and_then(|old_p| old_p.get("_created_unix").cloned())
             };
             if let Some(v) = created_unix {
                 obj.insert("_created_unix".into(), v);
@@ -329,26 +571,33 @@ impl CoreDB {
             obj.insert("_updated_unix".into(), serde_json::json!(now));
         }
 
-        // Extract spatial meta before payload is moved
+        // Extract spatial meta now (while we have the parsed Value in hand).
+        // Stored in NodeData so rebuild_spatial_grid() can reuse it without
+        // re-parsing geometry from disk.
         let spatial_meta = geo::extract_spatial_meta(&payload);
 
         // Remove old collection + field-index entries for this hash (if updating)
-        if let Some(old) = self.nodes.get(&hash) {
-            if let Some(coll) = old.payload.get("_collection").and_then(|v| v.as_str()) {
-                let coll_hash = sk_hash(coll);
+        if let Some((ref old_coll, old_off, old_len)) = old_info {
+            if !old_coll.is_empty() {
+                let coll_hash = sk_hash(old_coll);
                 if let Some(members) = self.collections.get_mut(&coll_hash) {
                     members.retain(|&h| h != hash);
                 }
-                // Remove from all field indexes for this collection
-                let old_payload = old.payload.clone(); // clone to release borrow
-                for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
-                    if *idx_coll == coll_hash {
-                        if let Some(key) = FieldKey::from_json(
-                            old_payload.get(idx_field.as_str()).unwrap_or(&Value::Null)
-                        ) {
-                            if let Some(ids) = btree.get_mut(&key) {
-                                ids.retain(|&id| id != hash);
-                                if ids.is_empty() { btree.remove(&key); }
+                // Remove from all field indexes for this collection.
+                // Only parse old payload when field indexes exist (avoids work for plain nodes).
+                let has_fi = self.field_indexes.keys().any(|(c, _)| *c == coll_hash);
+                if has_fi {
+                    let old_payload = self.payload_store.get(old_off, old_len)
+                        .unwrap_or(Value::Null);
+                    for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
+                        if *idx_coll == coll_hash {
+                            if let Some(key) = FieldKey::from_json(
+                                old_payload.get(idx_field.as_str()).unwrap_or(&Value::Null)
+                            ) {
+                                if let Some(ids) = btree.get_mut(&key) {
+                                    ids.retain(|&id| id != hash);
+                                    if ids.is_empty() { btree.remove(&key); }
+                                }
                             }
                         }
                     }
@@ -362,6 +611,7 @@ impl CoreDB {
             if !members.contains(&hash) {
                 members.push(hash);
             }
+            self.collection_names_map.entry(coll_hash).or_insert_with(|| coll.to_string());
             // Add to all field indexes for this collection
             for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
                 if *idx_coll == coll_hash {
@@ -375,34 +625,42 @@ impl CoreDB {
             }
         }
 
+        // Check BM25 fields before storing (while we still have the local payload Value)
+        let bm25_fields: Vec<String> = if self.bm25_indexes.is_empty() {
+            Vec::new()
+        } else {
+            self.bm25_indexes
+                .keys()
+                .filter(|f| {
+                    payload.get(f.as_str()).and_then(|v| v.as_str()).is_some()
+                })
+                .cloned()
+                .collect()
+        };
+
+        // Serialize updated payload and store bytes in the slab.
+        let serialized = serde_json::to_string(&payload)?;
+        let (offset, len) = self.payload_store.append(serialized.as_bytes());
+
+        let collection_str = payload.get("_collection")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         self.slug_map.insert(slug.to_string(), hash);
-        self.nodes.insert(
-            hash,
-            NodeData {
-                slug: slug.to_string(),
-                payload,
-            },
-        );
+        self.nodes.insert(hash, NodeData {
+            slug: slug.to_string(),
+            collection: collection_str,
+            spatial_meta: spatial_meta.clone(),
+            payload_offset: offset,
+            payload_len: len,
+        });
 
         // Rebuild BM25 indexes for any field present in the new payload.
         // Full rebuild per field is O(N) but necessary since BM25 postings are
-        // compressed; no true incremental-add path exists.  For CMS workloads
-        // (low write throughput, many reads) this is acceptable.
-        if !self.bm25_indexes.is_empty() {
-            let bm25_fields: Vec<String> = self.bm25_indexes
-                .keys()
-                .filter(|f| {
-                    self.nodes
-                        .get(&hash)
-                        .and_then(|n| n.payload.get(f.as_str()))
-                        .and_then(|v| v.as_str())
-                        .is_some()
-                })
-                .cloned()
-                .collect();
-            for field in bm25_fields {
-                self.build_bm25_index(&field);
-            }
+        // compressed; no true incremental-add path exists.
+        for field in bm25_fields {
+            self.build_bm25_index(&field);
         }
 
         // Update spatial grid incrementally
@@ -420,20 +678,29 @@ impl CoreDB {
         let hash = sk_hash(slug);
         if let Some(node) = self.nodes.remove(&hash) {
             self.slug_map.remove(slug);
-            if let Some(coll) = node.payload.get("_collection").and_then(|v| v.as_str()) {
-                let coll_hash = sk_hash(coll);
+            if !node.collection.is_empty() {
+                let coll_hash = sk_hash(&node.collection);
                 if let Some(members) = self.collections.get_mut(&coll_hash) {
                     members.retain(|&h| h != hash);
+                    if members.is_empty() {
+                        self.collection_names_map.remove(&coll_hash);
+                    }
                 }
-                // Remove from field indexes
-                for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
-                    if *idx_coll == coll_hash {
-                        if let Some(key) = FieldKey::from_json(
-                            node.payload.get(idx_field.as_str()).unwrap_or(&Value::Null)
-                        ) {
-                            if let Some(ids) = btree.get_mut(&key) {
-                                ids.retain(|&id| id != hash);
-                                if ids.is_empty() { btree.remove(&key); }
+                // Remove from field indexes (read old payload from slab for key lookup)
+                let has_fi = self.field_indexes.keys().any(|(c, _)| *c == coll_hash);
+                if has_fi {
+                    let old_payload = self.payload_store
+                        .get(node.payload_offset, node.payload_len)
+                        .unwrap_or(Value::Null);
+                    for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
+                        if *idx_coll == coll_hash {
+                            if let Some(key) = FieldKey::from_json(
+                                old_payload.get(idx_field.as_str()).unwrap_or(&Value::Null)
+                            ) {
+                                if let Some(ids) = btree.get_mut(&key) {
+                                    ids.retain(|&id| id != hash);
+                                    if ids.is_empty() { btree.remove(&key); }
+                                }
                             }
                         }
                     }
@@ -579,17 +846,27 @@ impl CoreDB {
                 // Remove field from all nodes in the collection.
                 // This must happen BEFORE rebuilding global indexes so the rebuild
                 // naturally sees the field absent from this collection's nodes.
-                let node_hashes: Vec<u64> =
-                    self.collections.get(&col_hash).cloned().unwrap_or_default();
+                let node_meta: Vec<(u64, u64, u32)> = self.collections
+                    .get(&col_hash).into_iter().flatten()
+                    .filter_map(|&h| self.nodes.get(&h).map(|n| (h, n.payload_offset, n.payload_len)))
+                    .collect();
                 let mut count = 0usize;
-                for h in node_hashes {
-                    if let Some(node) = self.nodes.get_mut(&h) {
-                        if node.payload.as_object_mut()
-                            .map(|o| o.remove(&name).is_some())
-                            .unwrap_or(false)
-                        {
+                let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
+                for (h, off, len) in node_meta {
+                    if let Some(mut p) = self.payload_store.get(off, len) {
+                        if p.as_object_mut().map(|o| o.remove(&name).is_some()).unwrap_or(false) {
+                            let new_json = serde_json::to_string(&p)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            let (new_off, new_len) = self.payload_store.append(new_json.as_bytes());
+                            node_updates.push((h, new_off, new_len));
                             count += 1;
                         }
+                    }
+                }
+                for (h, new_off, new_len) in node_updates {
+                    if let Some(node) = self.nodes.get_mut(&h) {
+                        node.payload_offset = new_off;
+                        node.payload_len = new_len;
                     }
                 }
 
@@ -623,17 +900,30 @@ impl CoreDB {
 
                 // Rename the field key in every node of the collection
                 let col_hash = sk_hash(collection);
-                let node_hashes: Vec<u64> =
-                    self.collections.get(&col_hash).cloned().unwrap_or_default();
+                let node_meta: Vec<(u64, u64, u32)> = self.collections
+                    .get(&col_hash).into_iter().flatten()
+                    .filter_map(|&h| self.nodes.get(&h).map(|n| (h, n.payload_offset, n.payload_len)))
+                    .collect();
                 let mut count = 0usize;
-                for h in node_hashes {
-                    if let Some(node) = self.nodes.get_mut(&h) {
-                        if let Some(obj) = node.payload.as_object_mut() {
+                let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
+                for (h, off, len) in node_meta {
+                    if let Some(mut p) = self.payload_store.get(off, len) {
+                        if let Some(obj) = p.as_object_mut() {
                             if let Some(val) = obj.remove(&old_name) {
                                 obj.insert(new_name.clone(), val);
+                                let new_json = serde_json::to_string(&p)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                let (new_off, new_len) = self.payload_store.append(new_json.as_bytes());
+                                node_updates.push((h, new_off, new_len));
                                 count += 1;
                             }
                         }
+                    }
+                }
+                for (h, new_off, new_len) in node_updates {
+                    if let Some(node) = self.nodes.get_mut(&h) {
+                        node.payload_offset = new_off;
+                        node.payload_len = new_len;
                     }
                 }
 
@@ -686,13 +976,31 @@ impl CoreDB {
                     self.collections.remove(&old_hash).unwrap_or_default();
                 let count = node_hashes.len();
                 self.collections.insert(new_hash, node_hashes.clone());
+                // Update the O(1) name map
+                self.collection_names_map.remove(&old_hash);
+                self.collection_names_map.insert(new_hash, new_name.clone());
 
-                // Update _collection field in every node
-                for h in &node_hashes {
-                    if let Some(node) = self.nodes.get_mut(h) {
-                        if let Some(obj) = node.payload.as_object_mut() {
+                // Update _collection field in every node payload + cached collection field
+                let node_meta: Vec<(u64, u64, u32)> = node_hashes.iter()
+                    .filter_map(|&h| self.nodes.get(&h).map(|n| (h, n.payload_offset, n.payload_len)))
+                    .collect();
+                let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
+                for (h, off, len) in node_meta {
+                    if let Some(mut p) = self.payload_store.get(off, len) {
+                        if let Some(obj) = p.as_object_mut() {
                             obj.insert("_collection".to_string(), serde_json::json!(new_name));
                         }
+                        let new_json = serde_json::to_string(&p)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        let (new_off, new_len) = self.payload_store.append(new_json.as_bytes());
+                        node_updates.push((h, new_off, new_len));
+                    }
+                }
+                for (h, new_off, new_len) in node_updates {
+                    if let Some(node) = self.nodes.get_mut(&h) {
+                        node.collection = new_name.clone();
+                        node.payload_offset = new_off;
+                        node.payload_len = new_len;
                     }
                 }
 
@@ -825,7 +1133,8 @@ impl CoreDB {
             .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
             .filter_map(|hash| {
                 let node = self.nodes.get(&hash)?;
-                node.payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
+                let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+                payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
 
@@ -855,7 +1164,8 @@ impl CoreDB {
             .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
             .filter_map(|hash| {
                 let node = self.nodes.get(&hash)?;
-                node.payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
+                let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+                payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
 
@@ -1180,7 +1490,73 @@ impl CoreDB {
             None => return Ok(()),
         };
 
-        // 1. Write snapshot atomically (tmp → rename)
+        // 1. Compact payload store: rebuild from live nodes only.
+        // Must happen BEFORE build_snapshot() so the snapshot records the
+        // new (post-compaction) offsets, not the pre-compaction ones.
+        // Memory DB: rebuild Vec<u8> in-place.
+        // Disk DB: streaming rewrite to payloads.bin.tmp then atomic rename.
+        // Neither approach loads all payloads into RAM simultaneously.
+        let node_keys: Vec<u64> = self.nodes.keys().copied().collect();
+        if self.payload_store.is_disk() {
+            // Disk-backed: stream each live node's bytes through a temp file.
+            let pay_tmp  = dir.join("payloads.bin.tmp");
+            let pay_path = dir.join("payloads.bin");
+            let mut node_new_offsets: Vec<(u64, u64, u32)> = Vec::new(); // (hash, off, len)
+            let mut write_cursor = 0u64;
+            {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let tmp_file = std::fs::OpenOptions::new()
+                        .read(true).write(true).create(true).truncate(true)
+                        .open(&pay_tmp)?;
+                    for &h in &node_keys {
+                        if let Some(node) = self.nodes.get(&h) {
+                            if let Some(bytes) = self.payload_store.get_raw(
+                                node.payload_offset, node.payload_len)
+                            {
+                                tmp_file.write_all_at(&bytes, write_cursor)?;
+                                node_new_offsets.push((h, write_cursor, bytes.len() as u32));
+                                write_cursor += bytes.len() as u64;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = write_cursor; // non-unix fallback — no-op
+            }
+            // Apply the new offsets now that tmp_file is closed.
+            for &(h, new_off, new_len) in &node_new_offsets {
+                if let Some(node) = self.nodes.get_mut(&h) {
+                    node.payload_offset = new_off;
+                    node.payload_len    = new_len;
+                }
+            }
+            // Atomically replace file, then reopen.
+            std::fs::rename(&pay_tmp, &pay_path)?;
+            self.payload_store = PayloadStore::open_existing(&pay_path, write_cursor)?;
+        } else {
+            // Memory DB: rebuild Vec<u8> without touching disk.
+            let mut new_slab: Vec<u8> = Vec::new();
+            for h in node_keys {
+                if let Some(node) = self.nodes.get(&h) {
+                    let old_off = node.payload_offset;
+                    let old_len = node.payload_len;
+                    if let Some(bytes) = self.payload_store.get_raw(old_off, old_len) {
+                        let new_off = new_slab.len() as u64;
+                        new_slab.extend_from_slice(&bytes);
+                        if let Some(n) = self.nodes.get_mut(&h) {
+                            n.payload_offset = new_off;
+                            n.payload_len    = old_len;
+                        }
+                    }
+                }
+            }
+            self.payload_store.reset(new_slab);
+        }
+
+        // 2. Write snapshot atomically (tmp → rename) — AFTER payload compaction
+        //    so disk-backed SnapNode offsets match the new payloads.bin layout.
         let snap_json = serde_json::to_vec_pretty(&self.build_snapshot())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let snap_tmp = dir.join("snapshot.json.tmp");
@@ -1188,7 +1564,7 @@ impl CoreDB {
         std::fs::write(&snap_tmp, &snap_json)?;
         std::fs::rename(&snap_tmp, &snap_path)?;
 
-        // 2. Truncate WAL: close current writer → rename → open fresh → delete old
+        // 3. Truncate WAL: close current writer → rename → open fresh → delete old
         self.wal = None;
         let wal_path = dir.join("wal.log");
         let wal_old = dir.join("wal.old");
@@ -1200,7 +1576,75 @@ impl CoreDB {
             std::fs::remove_file(&wal_old)?;
         }
 
+        // Regenerate gin.bin so the next open loads GIN instantly.
+        if let Some(ref gin_bin_path) = self.data_dir.as_ref().map(|d| d.join("gin.bin")) {
+            let _ = self.save_gin_binary(gin_bin_path);
+        }
+
         Ok(())
+    }
+
+    /// Save all current GIN indexes to a compact binary sidecar `gin.bin`.
+    ///
+    /// The file format uses RoaringBitmap's native binary serialization, which
+    /// is ~10-50× smaller and faster to load than JSON integer arrays.
+    /// Called automatically after GIN is rebuilt so future opens skip the rebuild.
+    fn save_gin_binary(&self, path: &Path) -> io::Result<()> {
+        use std::io::Write;
+        let tmp = path.with_extension("bin.tmp");
+        let mut f = std::io::BufWriter::new(
+            std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?
+        );
+        // Magic header
+        f.write_all(b"SKGIN001")?;
+        // Number of GIN indexes
+        f.write_all(&(self.gin_indexes.len() as u32).to_le_bytes())?;
+        for gin in self.gin_indexes.values() {
+            gin.write_binary(&mut f, GIN_INDEX_VERSION)?;
+        }
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load GIN indexes from the binary sidecar `gin.bin`.
+    ///
+    /// Returns `true` if the file was successfully loaded (all indexes had
+    /// matching versions), `false` if missing, corrupt, or version-mismatched
+    /// (caller should then call `rebuild_declared_gin_indexes` + `save_gin_binary`).
+    fn load_gin_binary(&mut self, path: &Path) -> bool {
+        use std::io::Read;
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        if data.len() < 12 || &data[..8] != b"SKGIN001" {
+            return false;
+        }
+        let mut cursor = std::io::Cursor::new(&data[8..]);
+        let mut count_buf = [0u8; 4];
+        if cursor.read_exact(&mut count_buf).is_err() { return false; }
+        let count = u32::from_le_bytes(count_buf) as usize;
+        let mut loaded = HashMap::new();
+        for _ in 0..count {
+            match GINIndex::read_binary(&mut cursor, GIN_INDEX_VERSION) {
+                Ok((field, idx)) => { loaded.insert(field, idx); }
+                Err(_) => return false,
+            }
+        }
+        // Only accept if all declared fields are present
+        let declared_ok = self.schemas.values()
+            .flat_map(|s| s.indexes.fulltext.iter())
+            .all(|f| loaded.contains_key(f));
+        if !declared_ok {
+            return false;
+        }
+        for (field, idx) in loaded {
+            self.record_index_version("gin", &field, GIN_INDEX_VERSION);
+            self.gin_indexes.insert(field, idx);
+        }
+        true
     }
 
     /// Force WAL data to reach disk (fsync).
@@ -1217,14 +1661,34 @@ impl CoreDB {
     // ── Snapshot helpers ──────────────────────────────────────────────────────
 
     fn build_snapshot(&self) -> Snapshot {
-        let nodes: Vec<SnapNode> = self
-            .nodes
-            .values()
-            .map(|n| SnapNode {
-                slug: n.slug.clone(),
-                payload: n.payload.clone(),
-            })
-            .collect();
+        let is_disk = self.payload_store.is_disk();
+        let nodes: Vec<SnapNode> = if is_disk {
+            // Disk-backed: payloads live in payloads.bin — only store metadata.
+            self.nodes.values().map(|n| SnapNode {
+                slug:           n.slug.clone(),
+                payload:        None,
+                payload_offset: Some(n.payload_offset),
+                payload_len:    Some(n.payload_len),
+                collection:     Some(n.collection.clone()),
+                spatial_meta:   n.spatial_meta.clone(),
+            }).collect()
+        } else {
+            self.nodes
+                .values()
+                .filter_map(|n| {
+                    self.payload_store
+                        .get(n.payload_offset, n.payload_len)
+                        .map(|payload| SnapNode {
+                            slug: n.slug.clone(),
+                            payload: Some(payload),
+                            payload_offset: None,
+                            payload_len:    None,
+                            collection:     None,
+                            spatial_meta:   None,
+                        })
+                })
+                .collect()
+        };
 
         let mut edges: Vec<SnapEdge> = Vec::new();
         for (&from_h, edge_list) in &self.adj_fwd {
@@ -1283,19 +1747,57 @@ impl CoreDB {
             })
             .collect();
 
+        // Persist btree indexes for disk-backed snapshots (avoids re-scan on reload).
+        let snap_btree: Option<Vec<SnapBtree>> = if is_disk && !self.field_indexes.is_empty() {
+            Some(self.field_indexes.iter().map(|((coll_hash, field), btree)| {
+                SnapBtree {
+                    collection_hash: *coll_hash,
+                    field: field.clone(),
+                    entries: btree.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                }
+            }).collect())
+        } else {
+            None
+        };
+
         Snapshot {
             version: SNAPSHOT_FORMAT_VERSION,
+            is_disk_backed: is_disk,
             nodes,
             edges,
             schemas: Some(self.schemas.values().cloned().collect()),
             vectors: if snap_vectors.is_empty() { None } else { Some(snap_vectors) },
             hnsw_indexes: if snap_hnsw.is_empty() { None } else { Some(snap_hnsw) },
+            btree_indexes: snap_btree,
+            gin_indexes: Ignored,
         }
     }
 
     fn load_snapshot(&mut self, snap: Snapshot) {
         for n in snap.nodes {
-            let _ = self.put_raw(&n.slug, &n.payload.to_string());
+            if snap.is_disk_backed {
+                // Disk-backed: restore NodeData from metadata; payload bytes are
+                // already in payloads.bin at the stored offset.
+                if let (Some(offset), Some(len)) = (n.payload_offset, n.payload_len) {
+                    let hash = sk_hash(&n.slug);
+                    let coll = n.collection.clone().unwrap_or_default();
+                    let coll_hash = if coll.is_empty() { 0 } else { sk_hash(&coll) };
+                    self.nodes.insert(hash, NodeData {
+                        slug:           n.slug.clone(),
+                        collection:     coll.clone(),
+                        spatial_meta:   n.spatial_meta,
+                        payload_offset: offset,
+                        payload_len:    len,
+                    });
+                    if !coll.is_empty() {
+                        self.collections.entry(coll_hash).or_default().push(hash);
+                        self.collection_names_map.entry(coll_hash)
+                            .or_insert_with(|| coll.clone());
+                    }
+                }
+            } else if let Some(payload) = n.payload {
+                let _ = self.put_raw(&n.slug, &payload.to_string());
+            }
         }
         for e in snap.edges {
             if let Some(meta) = e.meta {
@@ -1330,7 +1832,19 @@ impl CoreDB {
                 }
             }
         }
-        // Rebuild btree field indexes — only when stored version mismatches.
+        // Restore persisted btree indexes (disk-backed snapshots only).
+        // This avoids re-scanning payloads.bin to rebuild them.
+        let has_snap_btree = snap.btree_indexes.is_some();
+        if let Some(btrees) = snap.btree_indexes {
+            for sb in btrees {
+                let btmap: std::collections::BTreeMap<FieldKey, Vec<u64>> =
+                    sb.entries.into_iter().collect();
+                self.field_indexes.insert((sb.collection_hash, sb.field), btmap);
+            }
+        }
+
+        // Rebuild btree field indexes — only when stored version mismatches,
+        // or when no btree snapshot was present (legacy snapshot or new index).
         let btree_rebuild: Vec<(String, String)> = self
             .schemas
             .values()
@@ -1338,7 +1852,16 @@ impl CoreDB {
                 let v = s.indexes.build_versions.get(&format!("btree:{f}")).copied().unwrap_or(0);
                 (s.collection.clone(), f.clone(), v)
             }))
-            .filter(|(.., v)| *v != BTREE_INDEX_VERSION)
+            .filter(|(c, f, v)| {
+                if has_snap_btree {
+                    // Already restored from snapshot — only rebuild on version mismatch
+                    *v != BTREE_INDEX_VERSION
+                } else {
+                    // No btree snapshot — rebuild everything
+                    let _ = (c, f);
+                    true
+                }
+            })
             .map(|(c, f, _)| (c, f))
             .collect();
         for (coll, field) in btree_rebuild {
@@ -1376,9 +1899,49 @@ impl CoreDB {
 
     /// Get raw JSON payload for a slug. Returns `None` if not found.
     pub fn get(&self, slug: &str) -> Option<String> {
-        self.nodes
-            .get(&sk_hash(slug))
-            .map(|n| n.payload.to_string())
+        let node = self.nodes.get(&sk_hash(slug))?;
+        self.payload_store
+            .get_raw(node.payload_offset, node.payload_len)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// Parse and return the JSON payload for a node hash. Returns `None` if
+    /// the node does not exist or the payload cannot be parsed.
+    pub(crate) fn get_payload(&self, hash: u64) -> Option<Value> {
+        let node = self.nodes.get(&hash)?;
+        self.payload_store.get(node.payload_offset, node.payload_len)
+    }
+
+    /// Return the raw JSON bytes for a node's payload, along with (offset, len).
+    /// Used by the fast field-extraction path in collect() to avoid full JSON parsing.
+    pub(crate) fn get_payload_raw(&self, hash: u64) -> Option<(Vec<u8>, u64, u32)> {
+        let node = self.nodes.get(&hash)?;
+        let bytes = self.payload_store.get_raw(node.payload_offset, node.payload_len)?;
+        Some((bytes, node.payload_offset, node.payload_len))
+    }
+
+    /// For large payloads, read just a head slice and a tail slice to extract fields
+    /// without loading the full payload (e.g. avoids reading a 12 MB geometry blob).
+    pub(crate) fn get_payload_head_tail(
+        &self,
+        hash: u64,
+        head_bytes: usize,
+        tail_bytes: usize,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let node = self.nodes.get(&hash)?;
+        let len = node.payload_len as usize;
+        let off = node.payload_offset;
+        let head_size = head_bytes.min(len);
+        let tail_size = tail_bytes.min(len);
+        // If the ranges overlap (small payload), just read the full thing once.
+        if head_size + tail_size >= len {
+            let full = self.payload_store.get_raw(off, len as u32)?;
+            return Some((full.clone(), full));
+        }
+        let head = self.payload_store.get_raw_at(off, head_size)?;
+        let tail_off = off + (len - tail_size) as u64;
+        let tail = self.payload_store.get_raw_at(tail_off, tail_size)?;
+        Some((head, tail))
     }
 
     /// Check if a node exists.
@@ -1402,8 +1965,8 @@ impl CoreDB {
     pub fn collection_names(&self) -> Vec<String> {
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for node in self.nodes.values() {
-            if let Some(c) = node.payload.get("_collection").and_then(|v| v.as_str()) {
-                names.insert(c.to_string());
+            if !node.collection.is_empty() {
+                names.insert(node.collection.clone());
             }
         }
         names.into_iter().collect()
@@ -1482,11 +2045,7 @@ impl CoreDB {
         let col_h = sk_hash(from_collection);
         let mut result = Vec::new();
         for (&node_h, node) in &self.nodes {
-            let in_col = node.payload.get("_collection")
-                .and_then(|v| v.as_str())
-                .map(|c| sk_hash(c) == col_h)
-                .unwrap_or(false);
-            if !in_col { continue; }
+            if node.collection.is_empty() || sk_hash(&node.collection) != col_h { continue; }
             if let Some(edges) = self.adj_fwd.get(&node_h) {
                 for e in edges {
                     result.push(EdgeHit {
@@ -1512,9 +2071,7 @@ impl CoreDB {
                 e.to_slug.as_deref()
                     .and_then(|s| self.slug_map.get(s))
                     .and_then(|h| self.nodes.get(h))
-                    .and_then(|n| n.payload.get("_collection"))
-                    .and_then(|v| v.as_str())
-                    .map(|c| sk_hash(c) == to_col_h)
+                    .map(|n| !n.collection.is_empty() && sk_hash(&n.collection) == to_col_h)
                     .unwrap_or(false)
             })
             .collect()
@@ -1564,11 +2121,7 @@ impl CoreDB {
         let mut seen = std::collections::HashSet::new();
         let mut types = Vec::new();
         for (&node_h, node) in &self.nodes {
-            let in_col = node.payload.get("_collection")
-                .and_then(|v| v.as_str())
-                .map(|c| sk_hash(c) == col_h)
-                .unwrap_or(false);
-            if !in_col { continue; }
+            if node.collection.is_empty() || sk_hash(&node.collection) != col_h { continue; }
             if let Some(edges) = self.adj_fwd.get(&node_h) {
                 for e in edges {
                     if let Some(label) = self.edge_type_names.get(&e.edge_type) {
@@ -1600,22 +2153,17 @@ impl CoreDB {
         let mut seen = std::collections::HashSet::new();
         let mut triples = Vec::new();
         for (&from_h, node) in &self.nodes {
-            let from_col = match node.payload.get("_collection").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => continue,
-            };
+            if node.collection.is_empty() { continue; }
+            let from_col = node.collection.clone();
             if let Some(edges) = self.adj_fwd.get(&from_h) {
                 for e in edges {
                     let edge_label = match self.edge_type_names.get(&e.edge_type) {
                         Some(l) => l.clone(),
                         None => continue,
                     };
-                    let to_col = match self.nodes.get(&e.other)
-                        .and_then(|n| n.payload.get("_collection"))
-                        .and_then(|v| v.as_str())
-                    {
-                        Some(c) => c.to_string(),
-                        None => continue,
+                    let to_col = match self.nodes.get(&e.other) {
+                        Some(n) if !n.collection.is_empty() => n.collection.clone(),
+                        _ => continue,
                     };
                     let key = (from_col.clone(), edge_label.clone(), to_col.clone());
                     if seen.insert(key.clone()) {
@@ -1756,7 +2304,7 @@ impl CoreDB {
                 let hit = query::Hit {
                     slug: node.slug.clone(),
                     slug_hash: start,
-                    payload: Some(node.payload.clone()),
+                    payload: self.payload_store.get(node.payload_offset, node.payload_len),
                 };
                 return Some(BfsPath { nodes: vec![hit], edges: vec![], length: 0 });
             } else {
@@ -1801,7 +2349,7 @@ impl CoreDB {
                                 self.nodes.get(&h).map(|n| query::Hit {
                                     slug: n.slug.clone(),
                                     slug_hash: h,
-                                    payload: Some(n.payload.clone()),
+                                    payload: self.payload_store.get(n.payload_offset, n.payload_len),
                                 })
                             })
                             .collect();
@@ -1869,16 +2417,16 @@ impl CoreDB {
         match stmt {
             // ── SHOW TABLES ───────────────────────────────────────────────────
             sql::ShowStmt::Tables => {
-                // Seed with declared schemas so empty tables appear with count 0
+                // Use collection_names_map (O(1) per collection) — no node scan needed.
+                // Insert actual counts first, then seed declared-but-empty schemas with 0.
                 let mut counts: std::collections::BTreeMap<String, usize> =
                     std::collections::BTreeMap::new();
+                for (hash, name) in &self.collection_names_map {
+                    let count = self.collections.get(hash).map(|v| v.len()).unwrap_or(0);
+                    counts.insert(name.clone(), count);
+                }
                 for name in self.schemas.keys() {
                     counts.entry(name.clone()).or_insert(0);
-                }
-                for node in self.nodes.values() {
-                    if let Some(col) = node.payload.get("_collection").and_then(|v| v.as_str()) {
-                        *counts.entry(col.to_string()).or_insert(0) += 1;
-                    }
                 }
                 Ok(counts.into_iter()
                     .map(|(name, count)| make_hit(serde_json::json!({ "name": name, "count": count })))
@@ -1893,9 +2441,10 @@ impl CoreDB {
                         let mut counts: std::collections::HashMap<(String, String, String), usize> =
                             std::collections::HashMap::new();
                         for (&from_h, node) in &self.nodes {
-                            let from_col = match node.payload.get("_collection").and_then(|v| v.as_str()) {
-                                Some(c) => c.to_string(),
-                                None => continue,
+                            let from_col = if node.collection.is_empty() {
+                                continue;
+                            } else {
+                                node.collection.clone()
                             };
                             if let Some(edges) = self.adj_fwd.get(&from_h) {
                                 for edge in edges {
@@ -1904,11 +2453,10 @@ impl CoreDB {
                                         None => continue,
                                     };
                                     let to_col = match self.nodes.get(&edge.other)
-                                        .and_then(|n| n.payload.get("_collection"))
-                                        .and_then(|v| v.as_str())
+                                        .map(|n| &n.collection)
                                     {
-                                        Some(c) => c.to_string(),
-                                        None => continue,
+                                        Some(c) if !c.is_empty() => c.clone(),
+                                        _ => continue,
                                     };
                                     *counts.entry((from_col.clone(), label, to_col)).or_insert(0) += 1;
                                 }
@@ -1932,9 +2480,7 @@ impl CoreDB {
                         let mut counts: std::collections::HashMap<String, usize> =
                             std::collections::HashMap::new();
                         for (&node_h, node) in &self.nodes {
-                            if node.payload.get("_collection").and_then(|v| v.as_str())
-                                .map(|c| sk_hash(c) == col_h).unwrap_or(false)
-                            {
+                            if !node.collection.is_empty() && sk_hash(&node.collection) == col_h {
                                 if let Some(edges) = self.adj_fwd.get(&node_h) {
                                     for edge in edges {
                                         if let Some(label) = self.edge_type_names.get(&edge.edge_type) {
@@ -1963,15 +2509,11 @@ impl CoreDB {
                         let mut counts: std::collections::HashMap<String, usize> =
                             std::collections::HashMap::new();
                         for (&node_h, node) in &self.nodes {
-                            if node.payload.get("_collection").and_then(|v| v.as_str())
-                                .map(|c| sk_hash(c) == from_h).unwrap_or(false)
-                            {
+                            if !node.collection.is_empty() && sk_hash(&node.collection) == from_h {
                                 if let Some(edges) = self.adj_fwd.get(&node_h) {
                                     for edge in edges {
                                         let in_to = self.nodes.get(&edge.other)
-                                            .and_then(|n| n.payload.get("_collection"))
-                                            .and_then(|v| v.as_str())
-                                            .map(|c| sk_hash(c) == to_col_h)
+                                            .map(|n| !n.collection.is_empty() && sk_hash(&n.collection) == to_col_h)
                                             .unwrap_or(false);
                                         if in_to {
                                             if let Some(label) = self.edge_type_names.get(&edge.edge_type) {
@@ -2036,25 +2578,25 @@ impl CoreDB {
                     std::collections::BTreeMap::new();
 
                 for node in self.nodes.values() {
-                    if node.payload.get("_collection").and_then(|v| v.as_str())
-                        .map(|c| sk_hash(c) == col_h).unwrap_or(false)
-                    {
-                        if let serde_json::Value::Object(map) = &node.payload {
-                            for (k, v) in map {
-                                if SKIP.contains(&k.as_str()) { continue; }
-                                let inferred = match v {
-                                    serde_json::Value::String(_) => "TEXT",
-                                    serde_json::Value::Number(n)
-                                        if n.is_i64() || n.is_u64() => "INTEGER",
-                                    serde_json::Value::Number(_) => "REAL",
-                                    serde_json::Value::Bool(_) => "BOOLEAN",
-                                    serde_json::Value::Array(a)
-                                        if a.iter().all(|x| x.is_number()) => "VECTOR",
-                                    serde_json::Value::Array(_)
-                                    | serde_json::Value::Object(_) => "JSON",
-                                    serde_json::Value::Null => continue,
-                                };
-                                field_types.entry(k.clone()).or_insert(inferred);
+                    if !node.collection.is_empty() && sk_hash(&node.collection) == col_h {
+                        if let Some(payload) = self.payload_store.get(node.payload_offset, node.payload_len) {
+                            if let serde_json::Value::Object(map) = payload {
+                                for (k, v) in &map {
+                                    if SKIP.contains(&k.as_str()) { continue; }
+                                    let inferred = match v {
+                                        serde_json::Value::String(_) => "TEXT",
+                                        serde_json::Value::Number(n)
+                                            if n.is_i64() || n.is_u64() => "INTEGER",
+                                        serde_json::Value::Number(_) => "REAL",
+                                        serde_json::Value::Bool(_) => "BOOLEAN",
+                                        serde_json::Value::Array(a)
+                                            if a.iter().all(|x| x.is_number()) => "VECTOR",
+                                        serde_json::Value::Array(_)
+                                        | serde_json::Value::Object(_) => "JSON",
+                                        serde_json::Value::Null => continue,
+                                    };
+                                    field_types.entry(k.clone()).or_insert(inferred);
+                                }
                             }
                         }
                     }
@@ -2200,9 +2742,9 @@ impl CoreDB {
                     .collect()
                     .into_iter()
                     .filter_map(|h| {
-                        self.nodes
-                            .get(&h.slug_hash)
-                            .map(|n| (n.slug.clone(), n.payload.clone()))
+                        let n = self.nodes.get(&h.slug_hash)?;
+                        let payload = self.payload_store.get(n.payload_offset, n.payload_len)?;
+                        Some((n.slug.clone(), payload))
                     })
                     .collect();
                 let count = hits.len();
@@ -2345,10 +2887,10 @@ impl CoreDB {
     }
 
     fn rebuild_spatial_grid(&mut self) {
-        let items = self.nodes.iter().filter_map(|(&hash, node)| {
-            geo::extract_spatial_meta(&node.payload).map(|m| (hash, m))
-        });
-        self.spatial_grid = Some(geo::SpatialGrid::build(items));
+        let items: Vec<(u64, geo::SpatialMeta)> = self.nodes.iter()
+            .filter_map(|(&hash, node)| node.spatial_meta.clone().map(|m| (hash, m)))
+            .collect();
+        self.spatial_grid = Some(geo::SpatialGrid::build(items.into_iter()));
     }
 
     // ── Text index ─────────────────────────────────────────────────────────────
@@ -2370,7 +2912,9 @@ impl CoreDB {
         let mut field_values: HashMap<String, Vec<(u64, String)>> = HashMap::new();
 
         for (&hash, node) in &self.nodes {
-            extract_string_fields(&node.payload, "", &mut field_values, hash);
+            if let Some(payload) = self.payload_store.get(node.payload_offset, node.payload_len) {
+                extract_string_fields(&payload, "", &mut field_values, hash);
+            }
         }
 
         // Build into a fresh map first, then replace atomically.
@@ -2425,8 +2969,8 @@ impl CoreDB {
         use text_index::query::ilike_matches;
         let mut results = Vec::new();
         for &hash in candidates {
-            if let Some(node_data) = self.node_data(hash) {
-                if let Some(text) = node_data.payload.get(field).and_then(|v| v.as_str()) {
+            if let Some(payload) = self.get_payload(hash) {
+                if let Some(text) = payload.get(field).and_then(|v| v.as_str()) {
                     if ilike_matches(text, pattern) {
                         results.push(hash);
                     }
@@ -2503,19 +3047,17 @@ impl CoreDB {
     /// assert_eq!(matches.len(), 1);
     /// ```
     pub fn build_gin_index(&mut self, field: &str) {
-        let values: Vec<(u64, &str)> = self
+        let owned: Vec<(u64, String)> = self
             .nodes
             .iter()
             .filter_map(|(&hash, node)| {
-                node.payload
-                    .get(field)
-                    .and_then(|v| v.as_str())
-                    .map(|s| (hash, s))
+                let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+                payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
-
-        if !values.is_empty() {
-            let index = GINIndex::build(values.into_iter(), field);
+        if !owned.is_empty() {
+            let refs: Vec<(u64, &str)> = owned.iter().map(|(h, s)| (*h, s.as_str())).collect();
+            let index = GINIndex::build(refs.into_iter(), field);
             self.gin_indexes.insert(field.to_string(), index);
         }
         self.record_index_version("gin", field, GIN_INDEX_VERSION);
@@ -2563,19 +3105,17 @@ impl CoreDB {
     /// // The top result should be the doc that best matches all query terms.
     /// ```
     pub fn build_bm25_index(&mut self, field: &str) {
-        let values: Vec<(u64, &str)> = self
+        let owned: Vec<(u64, String)> = self
             .nodes
             .iter()
             .filter_map(|(&hash, node)| {
-                node.payload
-                    .get(field)
-                    .and_then(|v| v.as_str())
-                    .map(|s| (hash, s))
+                let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+                payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
-
-        if !values.is_empty() {
-            let index = bm25::Bm25Index::build(field, values.into_iter());
+        if !owned.is_empty() {
+            let refs: Vec<(u64, &str)> = owned.iter().map(|(h, s)| (*h, s.as_str())).collect();
+            let index = bm25::Bm25Index::build(field, refs.into_iter());
             self.bm25_indexes.insert(field.to_string(), index);
         }
         self.record_index_version("bm25", field, BM25_INDEX_VERSION);
@@ -2694,9 +3234,9 @@ impl CoreDB {
         let mut btree: BTreeMap<FieldKey, Vec<u64>> = BTreeMap::new();
         for hash in members {
             if let Some(node) = self.nodes.get(&hash) {
-                if let Some(fk) =
-                    FieldKey::from_json(node.payload.get(field).unwrap_or(&Value::Null))
-                {
+                let payload = self.payload_store.get(node.payload_offset, node.payload_len)
+                    .unwrap_or(Value::Null);
+                if let Some(fk) = FieldKey::from_json(payload.get(field).unwrap_or(&Value::Null)) {
                     btree.entry(fk).or_default().push(hash);
                 }
             }
@@ -2726,68 +3266,75 @@ impl CoreDB {
     /// Try to seed the candidate list for a `Collection` step from a btree index.
     ///
     /// Looks ahead in `remaining` for the first filter step that has a btree
-    /// index on this collection. Returns a pre-filtered `Vec<u64>` on a hit so
-    /// the Collection step can skip the full member scan, or `None` to fall back.
-    pub(crate) fn btree_seed(&self, coll_hash: u64, remaining: &[Step]) -> Option<Vec<u64>> {
+    /// index on this collection. Returns `(candidates, skip_idx)` on a hit,
+    /// where `skip_idx` is the index in `remaining` of the step that was consumed
+    /// (so the caller can skip it in the main pipeline loop). Returns `None` to
+    /// fall back to a full collection scan.
+    pub(crate) fn btree_seed(&self, coll_hash: u64, remaining: &[Step]) -> Option<(Vec<u64>, usize)> {
         use std::ops::Bound;
-        for step in remaining {
+        for (j, step) in remaining.iter().enumerate() {
             match step {
                 Step::WhereEq(field, value) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
                         if let Some(fk) = FieldKey::from_json(value) {
-                            return Some(idx.get(&fk).cloned().unwrap_or_default());
+                            return Some((idx.get(&fk).cloned().unwrap_or_default(), j));
                         }
                     }
                 }
                 Step::WhereGt(field, t) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
                         let fk = FieldKey::from_f64(*t);
-                        return Some(
+                        return Some((
                             idx.range((Bound::Excluded(fk), Bound::Unbounded))
                                 .flat_map(|(_, ids)| ids.iter().copied())
                                 .collect(),
-                        );
+                            j,
+                        ));
                     }
                 }
                 Step::WhereLt(field, t) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
                         let fk = FieldKey::from_f64(*t);
-                        return Some(
+                        return Some((
                             idx.range(..fk)
                                 .flat_map(|(_, ids)| ids.iter().copied())
                                 .collect(),
-                        );
+                            j,
+                        ));
                     }
                 }
                 Step::WhereGte(field, t) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
                         let fk = FieldKey::from_f64(*t);
-                        return Some(
+                        return Some((
                             idx.range(fk..)
                                 .flat_map(|(_, ids)| ids.iter().copied())
                                 .collect(),
-                        );
+                            j,
+                        ));
                     }
                 }
                 Step::WhereLte(field, t) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
                         let fk = FieldKey::from_f64(*t);
-                        return Some(
+                        return Some((
                             idx.range(..=fk)
                                 .flat_map(|(_, ids)| ids.iter().copied())
                                 .collect(),
-                        );
+                            j,
+                        ));
                     }
                 }
                 Step::WhereBetween(field, lo, hi) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
                         let fk_lo = FieldKey::from_f64(*lo);
                         let fk_hi = FieldKey::from_f64(*hi);
-                        return Some(
+                        return Some((
                             idx.range(fk_lo..=fk_hi)
                                 .flat_map(|(_, ids)| ids.iter().copied())
                                 .collect(),
-                        );
+                            j,
+                        ));
                     }
                 }
                 _ => {}
@@ -3296,7 +3843,8 @@ impl CoreDB {
     pub fn centroid(&self, slug: &str) -> Option<(f64, f64)> {
         let hash = *self.slug_map.get(slug)?;
         let node = self.nodes.get(&hash)?;
-        geo::extract_centroid(&node.payload)
+        let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+        geo::extract_centroid(&payload)
     }
 }
 
@@ -3316,9 +3864,25 @@ fn value_as_f32_vec(v: &Value) -> Option<Vec<f32>> {
 
 // ── Snapshot format ───────────────────────────────────────────────────────────
 
+/// Serde visitor that tokenizes and discards any JSON value without allocating.
+/// Used to skip legacy fields (e.g. `gin_indexes`) that were written by older
+/// binaries but are no longer needed.
+#[derive(Default)]
+struct Ignored;
+impl<'de> serde::Deserialize<'de> for Ignored {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(d)?;
+        Ok(Ignored)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     version: u32,
+    /// true = disk-backed snapshot: payloads are in payloads.bin, SnapNode has
+    /// offset/len/collection/spatial_meta but no payload field.
+    #[serde(default)]
+    is_disk_backed: bool,
     nodes: Vec<SnapNode>,
     edges: Vec<SnapEdge>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3330,6 +3894,14 @@ struct Snapshot {
     /// HNSW graphs — persisted so they don't need rebuilding on startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     hnsw_indexes: Option<Vec<SnapHnsw>>,
+    /// Btree field indexes — stored in disk-backed snapshots so they don't need
+    /// to be rebuilt by scanning payloads.bin on every open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    btree_indexes: Option<Vec<SnapBtree>>,
+    /// Legacy field written by older builds — never serialised, silently consumed
+    /// during deserialisation to avoid allocating a multi-GB serde_json Value.
+    #[serde(default, skip_serializing)]
+    gin_indexes: Ignored,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3349,7 +3921,18 @@ fn default_hnsw_ef() -> usize { 200 }
 #[derive(Serialize, Deserialize)]
 struct SnapNode {
     slug: String,
-    payload: Value,
+    /// Full payload — used by in-memory (non-disk-backed) snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<Value>,
+    /// Disk-backed snapshot fields — offset/len into payloads.bin plus cached metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_len: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spatial_meta: Option<geo::SpatialMeta>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3367,6 +3950,15 @@ struct SnapVector {
     slug: String,
     field: String,
     data: Vec<f32>,
+}
+
+/// Persisted btree field index for fast disk-backed snapshot reload.
+#[derive(Serialize, Deserialize)]
+struct SnapBtree {
+    collection_hash: u64,
+    field: String,
+    /// Sorted (key, Vec<node_hash>) pairs — reconstructs the BTreeMap directly.
+    entries: Vec<(FieldKey, Vec<u64>)>,
 }
 
 #[cfg(test)]
@@ -3469,8 +4061,7 @@ mod hybrid_query_tests {
 
         // Verify timestamps were auto-added
         let hash = *db.slug_map.get("users/alice").unwrap();
-        let node = db.node_data(hash).unwrap();
-        let payload = &node.payload;
+        let payload = db.get_payload(hash).unwrap();
 
         // _created_unix and _updated_unix should exist
         assert!(
@@ -3498,8 +4089,7 @@ mod hybrid_query_tests {
         .unwrap();
 
         let hash = *db.slug_map.get("users/alice").unwrap();
-        let node = db.node_data(hash).unwrap();
-        let payload = &node.payload;
+        let payload = db.get_payload(hash).unwrap();
 
         // _created_unix should be preserved, _updated_unix should change
         let created2 = payload.get("_created_unix").unwrap().as_i64().unwrap();

@@ -30,45 +30,45 @@ class DB(_NativeDB):
 
     Graph aggregate::
 
-        hits = db.query("""
+        hits = db.query('''
             SELECT b._key AS venue, COUNT(a) AS performances
             FROM MATCH (a:bands)-[r:played_at]->(b:venues)
             GROUP BY b._key ORDER BY performances DESC LIMIT 10
-        """)
+        ''')
 
     PATH_* aggregates (operate on path intrinsic arrays)::
 
-        hits = db.query("""
+        hits = db.query('''
             SELECT b._key AS dest, PATH_PRODUCT(r._path_strength) AS reliability
             FROM MATCH (a:venues)-[r:route_to*1..3]->(b:venues)
             WHERE a._key = 'melbourne_cbd'
-        """)
+        ''')
 
     CASE WHEN::
 
-        hits = db.query("""
+        hits = db.query('''
             SELECT b._key AS venue,
                    CASE WHEN r._depth = 1 THEN 'direct' ELSE 'multi-hop' END AS tier
             FROM MATCH (a:bands)-[r:played_at]->(b:venues)
-        """)
+        ''')
 
     Shortest path (returns a row with path fields, 0 rows if unreachable)::
 
-        hits = db.query("""
+        hits = db.query('''
             SELECT a.suburb AS from_name, b.suburb AS to_name, r.length AS hops
             FROM MATCH SHORTEST (a)-[r*]->(b)
             WHERE a._key = 'venues/fitzroy_town_hall'
               AND b._key = 'venues/melbourne_cbd'
-        """)
+        ''')
         if hits:
             print(f"hops: {json.loads(hits[0].payload)['hops']}")
 
     Multi-FROM cross-join::
 
-        hits = db.query("""
+        hits = db.query('''
             SELECT b._key AS venue, e._key AS event
             FROM MATCH ('bands/the_vines')-[:played_at]->(b), events AS e
-        """)
+        ''')
 
     Introspection::
 

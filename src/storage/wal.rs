@@ -149,64 +149,59 @@ impl WalReader {
         })
     }
 
-    /// Read every valid frame from the WAL.
+    /// Replay every valid frame from the WAL, calling `cb` for each entry.
     ///
+    /// Processes one frame at a time — no buffering of all entries into RAM.
     /// Stops at the first bad CRC, truncated frame, or oversized payload.
-    /// Returns `(entries, had_corruption)` — if `had_corruption` is true
-    /// the last frame was incomplete or corrupted (everything before it is fine).
-    pub fn read_all(mut self) -> (Vec<WalEntry>, bool) {
-        let mut entries = Vec::new();
+    /// Returns `true` if corruption was detected.
+    ///
+    /// This is the preferred method for `open()` — use it instead of
+    /// `read_all()` to avoid loading all payloads into RAM simultaneously.
+    pub fn replay_all<F: FnMut(WalEntry)>(mut self, mut cb: F) -> bool {
         let mut corrupted = false;
-
         loop {
-            // Read the 8-byte frame header [crc32(4) | length(4)]
             let mut header = [0u8; 8];
             match self.inner.read_exact(&mut header) {
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break, // clean end
-                Err(_) => {
-                    corrupted = true;
-                    break;
-                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(_) => { corrupted = true; break; }
                 Ok(_) => {}
             }
 
             let stored_crc = u32::from_le_bytes(header[..4].try_into().unwrap());
             let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
 
-            // Guard against corrupted length causing OOM
-            if len > 64 << 20 {
-                corrupted = true;
-                break;
-            }
+            if len > 64 << 20 { corrupted = true; break; }
 
             let mut payload = vec![0u8; len];
             match self.inner.read_exact(&mut payload) {
-                Err(_) => {
-                    corrupted = true;
-                    break;
-                }
+                Err(_) => { corrupted = true; break; }
                 Ok(_) => {}
             }
 
-            // Verify CRC over [length_bytes || payload]
             let mut crc_input = Vec::with_capacity(4 + len);
             crc_input.extend_from_slice(&(len as u32).to_le_bytes());
             crc_input.extend_from_slice(&payload);
-            if crc32(&crc_input) != stored_crc {
-                corrupted = true;
-                break;
-            }
+            if crc32(&crc_input) != stored_crc { corrupted = true; break; }
 
             match serde_json::from_slice::<WalEntry>(&payload) {
                 Ok(WalEntry::Unknown) => { /* forward-compat: skip silently */ }
-                Ok(entry)             => entries.push(entry),
-                Err(_) => {
-                    corrupted = true;
-                    break;
-                }
+                Ok(entry)             => cb(entry),
+                Err(_)                => { corrupted = true; break; }
             }
         }
+        corrupted
+    }
 
+    /// Read every valid frame from the WAL into a Vec.
+    ///
+    /// Stops at the first bad CRC, truncated frame, or oversized payload.
+    /// Returns `(entries, had_corruption)`.
+    ///
+    /// Prefer `replay_all` when processing large WALs — this method buffers
+    /// all payloads in RAM simultaneously.
+    pub fn read_all(mut self) -> (Vec<WalEntry>, bool) {
+        let mut entries = Vec::new();
+        let corrupted = self.replay_all(|e| entries.push(e));
         (entries, corrupted)
     }
 }
