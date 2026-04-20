@@ -3879,7 +3879,9 @@ impl Parser {
         // (start_bind[:col])
         self.expect_lparen()?;
         let start_bind = self.expect_ident()?;
-        if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+        let start_col: Option<String> = if matches!(self.peek(), Tok::Colon) {
+            self.advance(); Some(self.expect_ident()?)
+        } else { None };
         self.expect_rparen()?;
 
         // -[path_bind*]->
@@ -3912,7 +3914,9 @@ impl Parser {
         // (end_bind[:col])
         self.expect_lparen()?;
         let end_bind = self.expect_ident()?;
-        if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+        let end_col: Option<String> = if matches!(self.peek(), Tok::Colon) {
+            self.advance(); Some(self.expect_ident()?)
+        } else { None };
         self.expect_rparen()?;
 
         // WHERE — parse _key conditions for start/end, and optional path predicates
@@ -3973,11 +3977,17 @@ impl Parser {
                     }
                     self.advance();
                     let value = self.parse_value()?;
-                    let slug_val = value.as_str().unwrap_or("").to_string();
+                    let key_val = value.as_str().unwrap_or("").to_string();
                     if binding == start_bind && field == "_key" {
-                        from_slug = Some(slug_val);
+                        from_slug = Some(match &start_col {
+                            Some(col) => format!("{}/{}", col, key_val),
+                            None      => key_val,
+                        });
                     } else if binding == end_bind && field == "_key" {
-                        to_slug = Some(slug_val);
+                        to_slug = Some(match &end_col {
+                            Some(col) => format!("{}/{}", col, key_val),
+                            None      => key_val,
+                        });
                     }
                     // Other conditions (e.g. _collection) are parsed but not acted on
                 }
@@ -4045,7 +4055,9 @@ impl Parser {
                         self.advance(); // consume SHORTEST
                         self.expect_lparen()?;
                         let start_bind = self.expect_ident()?;
-                        if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+                        let start_col: Option<String> = if matches!(self.peek(), Tok::Colon) {
+                            self.advance(); Some(self.expect_ident()?)
+                        } else { None };
                         self.expect_rparen()?;
                         self.advance(); // consume '-'
                         self.expect_lbracket()?;
@@ -4063,7 +4075,9 @@ impl Parser {
                         self.advance(); // consume ->
                         self.expect_lparen()?;
                         let end_bind = self.expect_ident()?;
-                        if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+                        let end_col: Option<String> = if matches!(self.peek(), Tok::Colon) {
+                            self.advance(); Some(self.expect_ident()?)
+                        } else { None };
                         self.expect_rparen()?;
 
                         self.expect_kw(Kw::Where, "WHERE")?;
@@ -4078,9 +4092,18 @@ impl Parser {
                             }
                             self.advance();
                             let value = self.parse_value()?;
-                            let slug_val = value.as_str().unwrap_or("").to_string();
-                            if binding == start_bind && field == "_key" { from_slug = Some(slug_val); }
-                            else if binding == end_bind && field == "_key" { to_slug = Some(slug_val); }
+                            let key_val = value.as_str().unwrap_or("").to_string();
+                            if binding == start_bind && field == "_key" {
+                                from_slug = Some(match &start_col {
+                                    Some(col) => format!("{}/{}", col, key_val),
+                                    None      => key_val,
+                                });
+                            } else if binding == end_bind && field == "_key" {
+                                to_slug = Some(match &end_col {
+                                    Some(col) => format!("{}/{}", col, key_val),
+                                    None      => key_val,
+                                });
+                            }
                             if matches!(self.peek(), Tok::Kw(Kw::And)) {
                                 // Check if next is another _key condition (not a predicate)
                                 if matches!(self.peek(), Tok::Kw(Kw::And)) {

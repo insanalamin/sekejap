@@ -44,7 +44,7 @@ name = "sql_vs_atomic"
 harness = false
 
 [[bench]]
-name = "core_vs_sekejap_vs_sqlite"
+name = "sekejap_vs_sqlite"
 harness = false
 
 [[bench]]
@@ -65,4 +65,8 @@ harness = false
 
 [[bench]]
 name = "hybrid_query"
+harness = false
+
+[[bench]]
+name = "mega_benchmark"
 harness = false

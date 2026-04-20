@@ -108,7 +108,7 @@ fn bench_flat_scan(c: &mut Criterion) {
         let (db, query) = setup_core(n);
         let (conn, sq_query) = setup_sqlite(n);
 
-        group.bench_with_input(BenchmarkId::new("core", n), &n, |b, _| {
+        group.bench_with_input(BenchmarkId::new("sekejap_memory", n), &n, |b, _| {
             b.iter(|| {
                 db.collection("vecs")
                     .vector_near("emb", black_box(query.clone()), K)
@@ -130,7 +130,7 @@ fn bench_put_vector(c: &mut Criterion) {
     let mut group = c.benchmark_group("put_vector");
 
     for &n in &[1_000usize, 10_000] {
-        group.bench_with_input(BenchmarkId::new("core", n), &n, |b, &n| {
+        group.bench_with_input(BenchmarkId::new("sekejap_memory", n), &n, |b, &n| {
             b.iter(|| {
                 let mut db = CoreDB::new();
                 for i in 0..n {

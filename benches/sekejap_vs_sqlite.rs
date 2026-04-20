@@ -1,4 +1,8 @@
-//! Benchmark: sekejap (in-memory) vs sekejap (persistent) vs SQLite
+//! Benchmark: sekejap_memory vs sekejap_disk vs SQLite
+//!
+//! sekejap_memory = CoreDB::new()   — in-RAM, ephemeral (best-case sekejap)
+//! sekejap_disk   = CoreDB::open()  — WAL-backed, persistent (production sekejap)
+//! Both are sekejap. Two modes, one product.
 //!
 //! Dataset: 10,000 nodes (products), 250 linear edges, 10 categories.
 //! Scenarios: simple_filter, range_filter, sort_limit, forward_1hop, multihop_bfs
@@ -128,14 +132,14 @@ fn bench_simple_filter(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("simple_filter");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query("SELECT * FROM products WHERE category = 'cat3'")
                 .unwrap().count()
         ))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query("SELECT * FROM products WHERE category = 'cat3'")
                 .unwrap().count()
@@ -162,14 +166,14 @@ fn bench_range_filter(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("range_filter");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query("SELECT * FROM products WHERE price > 50 AND price <= 150")
                 .unwrap().count()
         ))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query("SELECT * FROM products WHERE price > 50 AND price <= 150")
                 .unwrap().count()
@@ -196,14 +200,14 @@ fn bench_sort_limit(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("sort_limit");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query("SELECT * FROM products WHERE category = 'cat5' ORDER BY price ASC LIMIT 20")
                 .unwrap().collect()
         ))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query("SELECT * FROM products WHERE category = 'cat5' ORDER BY price ASC LIMIT 20")
                 .unwrap().count()
@@ -326,14 +330,14 @@ fn bench_point_lookup(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("point_lookup");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query("SELECT * FROM products WHERE _key = 'p5000'")
                 .unwrap().count()
         ))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query("SELECT * FROM products WHERE _key = 'p5000'")
                 .unwrap().count()
@@ -358,7 +362,7 @@ fn bench_point_lookup(c: &mut Criterion) {
 fn bench_single_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_insert");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         let mut db = sekejap::CoreDB::new();
         let counter = std::cell::Cell::new(0u64);
         b.iter(|| {
@@ -399,7 +403,7 @@ fn bench_single_insert(c: &mut Criterion) {
 fn bench_bulk_insert_1k(c: &mut Criterion) {
     let mut group = c.benchmark_group("bulk_insert_1k");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter_batched(
             sekejap::CoreDB::new,
             |mut db| {
@@ -463,7 +467,7 @@ fn bench_bulk_insert_1k(c: &mut Criterion) {
 fn bench_update(c: &mut Criterion) {
     let mut group = c.benchmark_group("update");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         let mut db = setup_core();
         b.iter(|| {
             black_box(
@@ -493,7 +497,7 @@ fn bench_update(c: &mut Criterion) {
 fn bench_delete(c: &mut Criterion) {
     let mut group = c.benchmark_group("delete");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter_batched(
             setup_core,
             |mut db| {

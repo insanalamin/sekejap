@@ -128,7 +128,7 @@ fn bench_hybrid_spatial_vector(c: &mut Criterion) {
     let mut group = c.benchmark_group("hybrid_spatial_vector");
 
     // sekejap: spatial index → HNSW re-rank, fused pipeline
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| {
             black_box(
                 sk_db
@@ -292,7 +292,7 @@ fn bench_hybrid_spatial_graph(c: &mut Criterion) {
     let mut group = c.benchmark_group("hybrid_spatial_graph");
 
     // sekejap: spatial index → forward edge hop
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| {
             black_box(
                 sk_db
@@ -446,7 +446,7 @@ fn bench_root_cause_analysis(c: &mut Criterion) {
     let mut group = c.benchmark_group("root_cause_analysis");
 
     // sekejap: typed BFS from leaf → Leaves (nodes with no depends_on edges out)
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| {
             black_box(
                 sk_db
@@ -573,7 +573,7 @@ fn bench_hybrid_rag(c: &mut Criterion) {
     let mut group = c.benchmark_group("hybrid_rag");
 
     // sekejap: GIN keyword candidates → HNSW re-rank in one fused pipeline
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| {
             black_box(
                 sk_db

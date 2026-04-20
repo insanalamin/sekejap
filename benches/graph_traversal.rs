@@ -182,11 +182,11 @@ fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("graph_insert");
     group.sample_size(10);
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(populate_core(&dataset)))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(populate_sekejap(&dataset)))
     });
 
@@ -207,24 +207,24 @@ fn bench_query(c: &mut Criterion) {
     let sqlite          = populate_sqlite(&dataset);
 
     // Sanity: all engines must return the same count.
-    let core_sql_n  = run_core_sql(&core_db, source_id);
-    let core_atom_n = run_core_atom(&core_db, &source.slug);
+    let sk_mem_sql_n  = run_core_sql(&core_db, source_id);
+    let sk_mem_atom_n = run_core_atom(&core_db, &source.slug);
     let sk_n        = run_sekejap_sql(&sekejap_db, source_id);
     let sq_n        = run_sqlite(&sqlite, source_id);
-    assert_eq!(core_sql_n, core_atom_n, "core_sql vs core_atom mismatch");
-    assert_eq!(core_sql_n, sk_n,  "core_sql vs sekejap mismatch");
-    assert_eq!(core_sql_n, sq_n,  "core_sql vs sqlite mismatch");
+    assert_eq!(sk_mem_sql_n, sk_mem_atom_n, "sekejap_memory_sql vs sekejap_memory_atom mismatch");
+    assert_eq!(sk_mem_sql_n, sk_n,  "sekejap_memory_sql vs sekejap_disk mismatch");
+    assert_eq!(sk_mem_sql_n, sq_n,  "sekejap_memory_sql vs sqlite mismatch");
 
     let mut group = c.benchmark_group(format!("graph_query_{HOPS}hop_{TOTAL_NODES}n"));
 
     group.bench_with_input(
-        BenchmarkId::new("core_sql", source_id),
+        BenchmarkId::new("sekejap_memory_sql", source_id),
         source_id,
         |b, sid| b.iter(|| black_box(run_core_sql(&core_db, sid))),
     );
 
     group.bench_with_input(
-        BenchmarkId::new("core_atom", source_id),
+        BenchmarkId::new("sekejap_memory_atom", source_id),
         source_id,
         |b, sid| {
             let slug = format!("memories/{sid}");
@@ -233,7 +233,7 @@ fn bench_query(c: &mut Criterion) {
     );
 
     group.bench_with_input(
-        BenchmarkId::new("sekejap_sql", source_id),
+        BenchmarkId::new("sekejap_disk_sql", source_id),
         source_id,
         |b, sid| b.iter(|| black_box(run_sekejap_sql(&sekejap_db, sid))),
     );

@@ -224,7 +224,7 @@ fn bench_st_dwithin(c: &mut Criterion) {
     let mut group = c.benchmark_group("st_dwithin_10k");
 
     // core: Haversine 5km
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query(
                 "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 5.0)"
@@ -233,7 +233,7 @@ fn bench_st_dwithin(c: &mut Criterion) {
     });
 
     // sekejap: degree-based distance (~0.045 ≈ 5km at Melbourne lat)
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query(
                 "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 0.045)"
@@ -271,7 +271,7 @@ fn bench_st_within(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("st_within_polygon");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query(
                 "SELECT * FROM places WHERE ST_Within(geometry, POLYGON((144.95 -37.80, 144.98 -37.80, 144.98 -37.83, 144.95 -37.83, 144.95 -37.80)))"
@@ -279,7 +279,7 @@ fn bench_st_within(c: &mut Criterion) {
         ))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query(
                 "SELECT * FROM places WHERE ST_Within(geometry, POLYGON((144.95 -37.80, 144.98 -37.80, 144.98 -37.83, 144.95 -37.83, 144.95 -37.80)))"
@@ -313,7 +313,7 @@ fn bench_st_contains_point(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("st_contains_point");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query(
                 "SELECT * FROM zones WHERE ST_Contains(geometry, POINT(144.85 -37.75))"
@@ -321,7 +321,7 @@ fn bench_st_contains_point(c: &mut Criterion) {
         ))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query(
                 "SELECT * FROM zones WHERE ST_Contains(geometry, POINT(144.85 -37.75))"
@@ -358,7 +358,7 @@ fn bench_st_intersects(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("st_intersects_zones");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query(
                 "SELECT * FROM zones WHERE ST_Intersects(geometry, POLYGON((144.82 -37.72, 144.88 -37.72, 144.88 -37.78, 144.82 -37.78, 144.82 -37.72)))"
@@ -366,7 +366,7 @@ fn bench_st_intersects(c: &mut Criterion) {
         ))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query(
                 "SELECT * FROM zones WHERE ST_Intersects(geometry, POLYGON((144.82 -37.72, 144.88 -37.72, 144.88 -37.78, 144.82 -37.78, 144.82 -37.72)))"
@@ -399,7 +399,7 @@ fn bench_combined(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("spatial_plus_filter");
 
-    group.bench_function("core", |b| {
+    group.bench_function("sekejap_memory", |b| {
         b.iter(|| black_box(
             core_db.query(
                 "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 5.0) AND category = 'landmark'"
@@ -407,7 +407,7 @@ fn bench_combined(c: &mut Criterion) {
         ))
     });
 
-    group.bench_function("sekejap", |b| {
+    group.bench_function("sekejap_disk", |b| {
         b.iter(|| black_box(
             sk_db.query(
                 "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 0.045) AND category = 'landmark'"

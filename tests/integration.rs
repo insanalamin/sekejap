@@ -3650,6 +3650,22 @@ fn shortest_path_returns_correct_route() {
 }
 
 #[test]
+fn shortest_path_collection_in_pattern() {
+    // Same query but using (a:characters) pattern + bare _key instead of full slug.
+    let db = setup_path_db();
+    let hits = db.query(
+        "SELECT a.name AS from_name, b.name AS to_name, r.length AS hops \
+         FROM MATCH SHORTEST (a:characters)-[r*]->(b:characters) \
+         WHERE a._key = 'coby' AND b._key = 'sabo'"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1, "collection-in-pattern should find path");
+    let p = hits[0].payload.as_ref().unwrap();
+    assert_eq!(p["hops"].as_i64().unwrap(), 2);
+    assert_eq!(p["from_name"].as_str().unwrap(), "Coby");
+    assert_eq!(p["to_name"].as_str().unwrap(), "Sabo");
+}
+
+#[test]
 fn shortest_path_no_path_returns_none() {
     let db = setup_path_db();
 
