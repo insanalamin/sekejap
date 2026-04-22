@@ -191,6 +191,11 @@ impl HnswGraph {
         self.nodes.is_empty()
     }
 
+    /// Returns the node ID of the current entry point, if any.
+    pub fn entry_point_id(&self) -> Option<u64> {
+        self.entry_point.map(|(id, _)| id)
+    }
+
     // ── Construction internals ────────────────────────────────────────────────
 
     fn insert_node<D: Distance>(

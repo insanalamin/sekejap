@@ -1,6 +1,6 @@
 //! Chainable query builder and executor.
 
-use crate::{sk_hash, CoreDB};
+use crate::{sk_hash, CoreDB, FieldKey};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -769,6 +769,149 @@ impl AggAccum {
 }
 
 impl<'db> Set<'db> {
+    /// Attempt an index-only GROUP BY scan.
+    ///
+    /// Returns `Some(hits)` when the entire query can be answered from the btree
+    /// without reading any payload bytes.  Returns `None` to fall through to the
+    /// normal payload-scan path.
+    ///
+    /// Preconditions checked here (all must hold):
+    /// - Exactly one GROUP BY field.
+    /// - Every SELECT expression is either that field or `COUNT(*)`.
+    /// - No HAVING, no SKIP, no additional filter steps after Collection.
+    /// - The step chain is `[Collection(hash)]` (possibly preceded by nothing).
+    /// - A btree index exists for `(collection_hash, field)`.
+    fn try_index_only_group_by(
+        &self,
+        group_fields: &[String],
+        select_fields: &Option<Vec<String>>,
+    ) -> Option<Vec<Hit>> {
+        // Only single-field GROUP BY for now.
+        if group_fields.len() != 1 {
+            return None;
+        }
+        let gf = &group_fields[0];
+
+        // Verify SELECT: every column is either the group field or COUNT(*).
+        // If no SELECT clause, fall through (SELECT * needs payloads).
+        let fields = select_fields.as_deref()?;
+        if fields.is_empty() {
+            return None;
+        }
+        let mut has_count = false;
+        for f in fields {
+            let out = field_inner_name(f);
+            if let Some(agg) = agg_inner(f) {
+                let rest = agg.strip_prefix("__AGG__").unwrap_or(agg);
+                let func = rest.splitn(2, "__").next().unwrap_or("").to_uppercase();
+                if func == "COUNT" {
+                    has_count = true;
+                } else {
+                    return None; // SUM/AVG/MIN/MAX need payloads
+                }
+            } else if out != gf.as_str() {
+                return None; // Non-agg field that isn't the GROUP BY key
+            }
+        }
+        if !has_count {
+            return None; // No aggregation — pure GROUP BY without count makes no sense here
+        }
+
+        // No HAVING, no SKIP — these require payload evaluation.
+        let has_having = self.steps.iter().any(|s| matches!(s, Step::Having(_)));
+        let has_skip   = self.steps.iter().any(|s| matches!(s, Step::Skip(_)));
+        if has_having || has_skip {
+            return None;
+        }
+
+        // Step chain must be exactly: [Collection(hash)] with no payload-filter steps.
+        // Allow Sort/Take/Distinct/Select/GroupBy after Collection — those are handled here.
+        // Reject any filter step (WhereEq, WhereBetween, Like, etc.) because those
+        // would change which hashes are included and the btree has all of them.
+        let collection_hash = {
+            let mut ch: Option<u64> = None;
+            for s in &self.steps {
+                match s {
+                    Step::Collection(h) => {
+                        if ch.is_some() { return None; } // two collections — give up
+                        ch = Some(*h);
+                    }
+                    // Projection/shaping steps are fine — we apply them ourselves.
+                    Step::Select(_) | Step::GroupBy(_) | Step::Sort(_)
+                    | Step::Take(_) | Step::Distinct => {}
+                    // Any filter or traversal means the hash set is not the full collection.
+                    _ => return None,
+                }
+            }
+            ch?
+        };
+
+        // Look up the btree for this (collection, field) pair.
+        let btree = self.db.field_index(collection_hash, gf)?;
+
+        // Build result rows from btree entries — zero disk reads.
+        let sort_step: Option<&Vec<(String, bool)>> = self.steps.iter().find_map(|s| {
+            if let Step::Sort(cols) = s { Some(cols) } else { None }
+        });
+        let take_n = self.steps.iter().find_map(|s| if let Step::Take(n) = s { Some(*n) } else { None });
+
+        // Collect (group_value, count) pairs from the btree.
+        let mut rows: Vec<(Value, u64)> = btree
+            .iter()
+            .map(|(key, hashes)| (CoreDB::field_key_to_value(key), hashes.len() as u64))
+            .collect();
+
+        // Apply ORDER BY if present (sort by count alias or group field).
+        if let Some(sort_cols) = sort_step {
+            // Find the COUNT alias in the select fields.
+            let count_alias = fields.iter().find_map(|f| {
+                if agg_inner(f).is_some() { Some(field_output_key(f)) } else { None }
+            });
+            rows.sort_by(|(av, ac), (bv, bc)| {
+                let mut ord = std::cmp::Ordering::Equal;
+                for (col, asc) in sort_cols {
+                    ord = if Some(col.as_str()) == count_alias.as_deref() {
+                        ac.cmp(bc)
+                    } else {
+                        // Sort by group field value.
+                        let sa = serde_json::to_string(av).unwrap_or_default();
+                        let sb = serde_json::to_string(bv).unwrap_or_default();
+                        sa.cmp(&sb)
+                    };
+                    if !asc { ord = ord.reverse(); }
+                    if ord != std::cmp::Ordering::Equal { break; }
+                }
+                ord
+            });
+        }
+
+        // Apply LIMIT.
+        if let Some(n) = take_n {
+            rows.truncate(n);
+        }
+
+        // Build Hit payloads.
+        let count_alias = fields.iter().find_map(|f| {
+            if agg_inner(f).is_some() { Some(field_output_key(f)) } else { None }
+        });
+        let group_alias = fields.iter().find_map(|f| {
+            if agg_inner(f).is_none() { Some((field_inner_name(f).to_string(), field_output_key(f))) } else { None }
+        });
+
+        let hits = rows.into_iter().map(|(val, cnt)| {
+            let mut map = serde_json::Map::new();
+            if let Some(ref alias) = count_alias {
+                map.insert(alias.clone(), serde_json::json!(cnt));
+            }
+            if let Some((ref _inner, ref alias)) = group_alias {
+                map.insert(alias.clone(), val);
+            }
+            Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }
+        }).collect();
+
+        Some(hits)
+    }
+
     pub fn collect(self) -> Vec<Hit> {
         // Short-circuit for pre-computed aggregate results.
         if let Some(hits) = self.precomputed {
@@ -806,6 +949,17 @@ impl<'db> Set<'db> {
         });
 
         if let Some(ref group_fields) = group_by_fields {
+            // ── Index-only scan fast path ──────────────────────────────────────
+            // Conditions: single GROUP BY field + all SELECT exprs are that field
+            // or COUNT(*) + a btree index exists + no HAVING/SKIP + source is a
+            // single named collection (not All / Many / complex filter chain).
+            //
+            // When true, the btree already holds `value → Vec<hashes>` — we just
+            // iterate its entries and take `len()` as the count. Zero disk reads.
+            if let Some(hits) = self.try_index_only_group_by(group_fields, &select_fields) {
+                return hits;
+            }
+
             let hashes = execute(self.db, &self.steps);
             let fields = select_fields.as_deref().unwrap_or(&[]);
             let having_steps: Vec<&[Step]> = self.steps.iter().filter_map(|s| {
@@ -1049,6 +1203,91 @@ impl<'db> Set<'db> {
         // this are cheaply deserialized by serde_json, so the extra complexity
         // of the raw scanner is not worthwhile.  64 KB covers most small records.
         const FAST_PATH_THRESHOLD: u32 = 64 * 1024;
+
+        // ── Batch collect path ─────────────────────────────────────────────────
+        // When SELECT uses only simple fields (no functions, JSON paths, BM25)
+        // and there are ≥ 2 results, batch-read all small payloads in one or a
+        // few sequential pread() calls (sorted by offset) rather than N
+        // individual syscalls.  Large payloads fall back to the head+tail path.
+        // This eliminates the N-syscall cost for typical point-attribute queries.
+        if can_use_fast_path && bm25_scores.is_none() {
+            let fields = select_fields.as_ref().unwrap(); // safe: can_use_fast_path requires Some
+            let hashes = execute(self.db, &self.steps);
+            // Collect which hashes need a full payload and which can be batched.
+            let raw_map: HashMap<u64, Vec<u8>> = {
+                let small: Vec<u64> = hashes.iter().copied().filter(|&h| {
+                    self.db.node_data(h)
+                        .map_or(true, |nd| nd.payload_len <= FAST_PATH_THRESHOLD)
+                }).collect();
+                if small.len() >= 2 {
+                    self.db.read_raw_payloads_batched(&small)
+                } else {
+                    HashMap::new()
+                }
+            };
+            let mut hits: Vec<Hit> = hashes.into_iter().filter_map(|hash| {
+                let node = self.db.node_data(hash)?;
+                let out = if node.payload_len > FAST_PATH_THRESHOLD {
+                    // Large payload: head + tail read (avoids loading e.g. 12 MB GeoJSON).
+                    let (head, tail) = self.db.get_payload_head_tail(
+                        hash, 512, 16 * 1024,
+                    )?;
+                    let mut map = extract_fields_by_search(&tail, fields);
+                    let missing: Vec<String> = fields.iter()
+                        .filter(|f| !map.contains_key(f.as_str()))
+                        .cloned()
+                        .collect();
+                    if !missing.is_empty() {
+                        for (k, v) in extract_fields_by_search(&head, &missing) {
+                            map.entry(k).or_insert(v);
+                        }
+                    }
+                    let mut out = serde_json::Map::new();
+                    for f in fields {
+                        if let Some(v) = map.remove(f.as_str()) {
+                            out.insert(field_output_key(f), v);
+                        }
+                    }
+                    out
+                } else if let Some(bytes) = raw_map.get(&hash) {
+                    // Small payload from batch buffer — byte-search, no full JSON parse.
+                    let mut found = extract_fields_by_search(bytes, fields);
+                    let mut out = serde_json::Map::new();
+                    for f in fields {
+                        if let Some(v) = found.remove(f.as_str()) {
+                            out.insert(field_output_key(f), v);
+                        }
+                    }
+                    out
+                } else {
+                    // Fallback: individual pread + full parse.
+                    let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
+                    let mut out = serde_json::Map::new();
+                    for f in fields {
+                        if let Some(v) = eval_field_expr(f, &raw_payload) {
+                            out.insert(field_output_key(f), v);
+                        }
+                    }
+                    out
+                };
+                Some(Hit {
+                    slug: node.slug.clone(),
+                    slug_hash: hash,
+                    payload: Some(Value::Object(out)),
+                })
+            }).collect();
+            let distinct = self.steps.iter().any(|s| matches!(s, Step::Distinct));
+            if distinct {
+                let mut seen: HashSet<String> = HashSet::new();
+                hits.retain(|hit| {
+                    let key = serde_json::to_string(
+                        hit.payload.as_ref().unwrap_or(&Value::Null),
+                    ).unwrap_or_default();
+                    seen.insert(key)
+                });
+            }
+            return hits;
+        }
 
         let mut hits: Vec<Hit> = execute(self.db, &self.steps)
             .into_iter()
@@ -1552,6 +1791,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
     let mut candidates: Vec<u64> = Vec::new();
     // Steps consumed by btree_seed (already applied as the seed filter)
     let mut skip_set: HashSet<usize> = HashSet::new();
+    // Track the active collection hash so post-seed filters can use btree indexes.
+    let mut current_coll_hash: Option<u64> = None;
 
     for (i, step) in steps.iter().enumerate() {
         if skip_set.contains(&i) {
@@ -1575,14 +1816,20 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     .collect();
             }
             Step::Collection(hash) => {
+                current_coll_hash = Some(*hash);
                 // Priority 1: btree equality/range filter seed (most selective)
-                if let Some((seeded, skip_j)) = db.btree_seed(*hash, remaining) {
+                if let Some((seeded, skip_j, opt_skip_j2)) = db.btree_seed(*hash, remaining) {
                     candidates = seeded;
-                    // skip the step that was consumed by the btree index
+                    // skip the step(s) consumed by the btree index
                     skip_set.insert(i + 1 + skip_j);
+                    if let Some(j2) = opt_skip_j2 {
+                        skip_set.insert(i + 1 + j2);
+                    }
                 // Priority 2: btree ORDER BY index scan (pre-sorted candidates)
-                } else if let Some(sorted) = db.btree_sorted_seed_from_steps(*hash, remaining) {
+                // Also skip the Sort step — data is already in index order.
+                } else if let Some((sorted, sort_j)) = db.btree_sorted_seed_from_steps(*hash, remaining) {
                     candidates = sorted;
+                    skip_set.insert(i + 1 + sort_j);
                 } else {
                     candidates = db.collection_members(*hash).cloned().unwrap_or_default();
                 }
@@ -1733,66 +1980,215 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
 
             // ── Payload filters ──────────────────────────────────────────────
+            //
+            // WhereEq: try btree intersection first (zero payload reads).
+            // Falls back to batch pread + byte-search, then individual pread.
             Step::WhereEq(field, value) => {
-                candidates.retain(|&h| {
-                    db.get_payload(h)
-                        .and_then(|p| resolve_field(field, &p))
-                        .map(|v| values_eq(&v, value))
-                        .unwrap_or(false)
-                });
+                // Btree intersection: O(|btree_set|) HashSet build + O(|candidates|) retain.
+                // Zero payload reads — the index already maps value → [hash, …].
+                if let (Some(coll), Some(fk)) = (
+                    current_coll_hash,
+                    FieldKey::from_json(value),
+                ) {
+                    if let Some(idx) = db.field_index(coll, field) {
+                        let btree_set: HashSet<u64> = idx
+                            .get(&fk)
+                            .into_iter()
+                            .flat_map(|ids| ids.iter().copied())
+                            .collect();
+                        candidates.retain(|h| btree_set.contains(h));
+                        // Skip payload reads entirely — done.
+                    } else {
+                        // No index: batch read + byte-search.
+                        const FILTER_BATCH_MIN: usize = 64;
+                        if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
+                            let raw_map = db.read_raw_payloads_batched(&candidates);
+                            let fq = vec![field.clone()];
+                            candidates.retain(|&h| {
+                                raw_map.get(&h)
+                                    .and_then(|bytes| {
+                                        extract_fields_by_search(bytes, &fq).remove(field.as_str())
+                                    })
+                                    .map(|v| values_eq(&v, value))
+                                    .unwrap_or(false)
+                            });
+                        } else {
+                            candidates.retain(|&h| {
+                                db.get_payload(h)
+                                    .and_then(|p| resolve_field(field, &p))
+                                    .map(|v| values_eq(&v, value))
+                                    .unwrap_or(false)
+                            });
+                        }
+                    }
+                } else {
+                    // No collection context or non-indexable value: batch read + byte-search.
+                    const FILTER_BATCH_MIN: usize = 64;
+                    if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
+                        let raw_map = db.read_raw_payloads_batched(&candidates);
+                        let fq = vec![field.clone()];
+                        candidates.retain(|&h| {
+                            raw_map.get(&h)
+                                .and_then(|bytes| {
+                                    extract_fields_by_search(bytes, &fq).remove(field.as_str())
+                                })
+                                .map(|v| values_eq(&v, value))
+                                .unwrap_or(false)
+                        });
+                    } else {
+                        candidates.retain(|&h| {
+                            db.get_payload(h)
+                                .and_then(|p| resolve_field(field, &p))
+                                .map(|v| values_eq(&v, value))
+                                .unwrap_or(false)
+                        });
+                    }
+                }
             }
             Step::WhereNeq(field, value) => {
-                candidates.retain(|&h| {
-                    db.get_payload(h)
-                        .and_then(|p| resolve_field(field, &p))
-                        .map(|v| !values_eq(&v, value))
-                        .unwrap_or(true) // field absent → keep
-                });
+                const FILTER_BATCH_MIN: usize = 64;
+                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
+                    let raw_map = db.read_raw_payloads_batched(&candidates);
+                    let fq = vec![field.clone()];
+                    candidates.retain(|&h| {
+                        // field absent → keep (same semantics as individual path)
+                        raw_map.get(&h)
+                            .map(|bytes| {
+                                extract_fields_by_search(bytes, &fq)
+                                    .remove(field.as_str())
+                                    .map(|v| !values_eq(&v, value))
+                                    .unwrap_or(true)
+                            })
+                            .unwrap_or(true)
+                    });
+                } else {
+                    candidates.retain(|&h| {
+                        db.get_payload(h)
+                            .and_then(|p| resolve_field(field, &p))
+                            .map(|v| !values_eq(&v, value))
+                            .unwrap_or(true) // field absent → keep
+                    });
+                }
             }
             Step::WhereGt(field, threshold) => {
-                candidates.retain(|&h| {
-                    db.get_payload(h)
-                        .and_then(|p| resolve_field(field, &p))
-                        .and_then(|v| v.as_f64())
-                        .map(|f| f > *threshold)
-                        .unwrap_or(false)
-                });
+                const FILTER_BATCH_MIN: usize = 64;
+                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
+                    let raw_map = db.read_raw_payloads_batched(&candidates);
+                    let fq = vec![field.clone()];
+                    candidates.retain(|&h| {
+                        raw_map.get(&h)
+                            .and_then(|bytes| {
+                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
+                            })
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f > *threshold)
+                            .unwrap_or(false)
+                    });
+                } else {
+                    candidates.retain(|&h| {
+                        db.get_payload(h)
+                            .and_then(|p| resolve_field(field, &p))
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f > *threshold)
+                            .unwrap_or(false)
+                    });
+                }
             }
             Step::WhereLt(field, threshold) => {
-                candidates.retain(|&h| {
-                    db.get_payload(h)
-                        .and_then(|p| resolve_field(field, &p))
-                        .and_then(|v| v.as_f64())
-                        .map(|f| f < *threshold)
-                        .unwrap_or(false)
-                });
+                const FILTER_BATCH_MIN: usize = 64;
+                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
+                    let raw_map = db.read_raw_payloads_batched(&candidates);
+                    let fq = vec![field.clone()];
+                    candidates.retain(|&h| {
+                        raw_map.get(&h)
+                            .and_then(|bytes| {
+                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
+                            })
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f < *threshold)
+                            .unwrap_or(false)
+                    });
+                } else {
+                    candidates.retain(|&h| {
+                        db.get_payload(h)
+                            .and_then(|p| resolve_field(field, &p))
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f < *threshold)
+                            .unwrap_or(false)
+                    });
+                }
             }
             Step::WhereGte(field, threshold) => {
-                candidates.retain(|&h| {
-                    db.get_payload(h)
-                        .and_then(|p| resolve_field(field, &p))
-                        .and_then(|v| v.as_f64())
-                        .map(|f| f >= *threshold)
-                        .unwrap_or(false)
-                });
+                const FILTER_BATCH_MIN: usize = 64;
+                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
+                    let raw_map = db.read_raw_payloads_batched(&candidates);
+                    let fq = vec![field.clone()];
+                    candidates.retain(|&h| {
+                        raw_map.get(&h)
+                            .and_then(|bytes| {
+                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
+                            })
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f >= *threshold)
+                            .unwrap_or(false)
+                    });
+                } else {
+                    candidates.retain(|&h| {
+                        db.get_payload(h)
+                            .and_then(|p| resolve_field(field, &p))
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f >= *threshold)
+                            .unwrap_or(false)
+                    });
+                }
             }
             Step::WhereLte(field, threshold) => {
-                candidates.retain(|&h| {
-                    db.get_payload(h)
-                        .and_then(|p| resolve_field(field, &p))
-                        .and_then(|v| v.as_f64())
-                        .map(|f| f <= *threshold)
-                        .unwrap_or(false)
-                });
+                const FILTER_BATCH_MIN: usize = 64;
+                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
+                    let raw_map = db.read_raw_payloads_batched(&candidates);
+                    let fq = vec![field.clone()];
+                    candidates.retain(|&h| {
+                        raw_map.get(&h)
+                            .and_then(|bytes| {
+                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
+                            })
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f <= *threshold)
+                            .unwrap_or(false)
+                    });
+                } else {
+                    candidates.retain(|&h| {
+                        db.get_payload(h)
+                            .and_then(|p| resolve_field(field, &p))
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f <= *threshold)
+                            .unwrap_or(false)
+                    });
+                }
             }
             Step::WhereBetween(field, lo, hi) => {
-                candidates.retain(|&h| {
-                    db.get_payload(h)
-                        .and_then(|p| resolve_field(field, &p))
-                        .and_then(|v| v.as_f64())
-                        .map(|f| f >= *lo && f <= *hi)
-                        .unwrap_or(false)
-                });
+                const FILTER_BATCH_MIN: usize = 64;
+                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
+                    let raw_map = db.read_raw_payloads_batched(&candidates);
+                    let fq = vec![field.clone()];
+                    candidates.retain(|&h| {
+                        raw_map.get(&h)
+                            .and_then(|bytes| {
+                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
+                            })
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f >= *lo && f <= *hi)
+                            .unwrap_or(false)
+                    });
+                } else {
+                    candidates.retain(|&h| {
+                        db.get_payload(h)
+                            .and_then(|p| resolve_field(field, &p))
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f >= *lo && f <= *hi)
+                            .unwrap_or(false)
+                    });
+                }
             }
             Step::WhereIn(field, values) => {
                 candidates.retain(|&h| {
@@ -2339,17 +2735,82 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
 
             // ── Shaping ──────────────────────────────────────────────────────
             Step::Sort(columns) => {
+                // ── Btree-assisted sort (zero payload reads) ────────────────
+                // When a btree index exists for the sort field, iterate it in
+                // order and filter by the current candidate set.  Zero payload
+                // reads; cost = HashSet<candidates> build + btree scan.
+                // Applies only to single-column sorts.
+                if columns.len() == 1 {
+                    let (sort_field, asc) = &columns[0];
+                    if let Some(coll) = current_coll_hash {
+                        if let Some(idx) = db.field_index(coll, sort_field) {
+                            let candidate_set: HashSet<u64> =
+                                candidates.iter().copied().collect();
+                            let limit = find_take_limit(remaining).unwrap_or(usize::MAX);
+                            let mut sorted_result: Vec<u64> =
+                                Vec::with_capacity(limit.min(candidate_set.len()));
+                            if *asc {
+                                'asc: for ids in idx.values() {
+                                    for &h in ids {
+                                        if candidate_set.contains(&h) {
+                                            sorted_result.push(h);
+                                            if sorted_result.len() >= limit {
+                                                break 'asc;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                'desc: for ids in idx.values().rev() {
+                                    for &h in ids {
+                                        if candidate_set.contains(&h) {
+                                            sorted_result.push(h);
+                                            if sorted_result.len() >= limit {
+                                                break 'desc;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            candidates = sorted_result;
+                            continue; // Sort done — skip payload-read fallback below.
+                        }
+                    }
+                }
+                // ── Pre-compute sort keys (fallback when no btree index) ────
                 // Pre-compute sort keys once per candidate to avoid calling
                 // get_payload O(n log n) times in the sort comparator.
                 // For large payloads (e.g. GeoJSON polygons), this reduces
                 // redundant disk reads from O(n log n) to O(n).
+                //
+                // Batch-read path: when there are many candidates and all sort
+                // fields are simple top-level names, sort by payload_offset and
+                // read in sequential groups — often just ONE pread instead of
+                // O(N) individual preads.
                 let sort_fields: Vec<String> = columns.iter().map(|(f, _)| f.clone()).collect();
                 let use_fast = sort_fields.iter().all(|f| is_simple_field(f));
+                // Threshold: only batch-read when the candidate set is large enough
+                // that the sort/HashMap overhead is worth paying.
+                const BATCH_THRESHOLD: usize = 64;
+                let raw_map: Option<HashMap<u64, Vec<u8>>> =
+                    if use_fast && candidates.len() >= BATCH_THRESHOLD {
+                        Some(db.read_raw_payloads_batched(&candidates))
+                    } else {
+                        None
+                    };
                 // Pair each candidate with its pre-computed sort keys, sort, then unzip.
                 let mut keyed: Vec<(u64, Vec<Option<Value>>)> = candidates
                     .iter()
                     .map(|&h| {
-                        let vals: Vec<Option<Value>> = if use_fast {
+                        let vals: Vec<Option<Value>> = if let Some(ref rm) = raw_map {
+                            // Batch path: slice bytes from the pre-fetched map.
+                            if let Some(bytes) = rm.get(&h) {
+                                let mut map = extract_fields_by_search(bytes, &sort_fields);
+                                sort_fields.iter().map(|f| map.remove(f.as_str())).collect()
+                            } else {
+                                sort_fields.iter().map(|_| None).collect()
+                            }
+                        } else if use_fast {
                             if let Some((head, tail)) = db.get_payload_head_tail(h, 512, 16 * 1024) {
                                 let mut map = extract_fields_by_search(&tail, &sort_fields);
                                 let missing: Vec<String> = sort_fields.iter()
@@ -2523,6 +2984,17 @@ pub enum MathExpr {
 }
 
 impl MathExpr {
+    pub fn references_var(&self, var: &str) -> bool {
+        match self {
+            MathExpr::VarField { var: v, .. } => v == var,
+            MathExpr::Literal(_) => false,
+            MathExpr::Mul(a, b) | MathExpr::Add(a, b)
+            | MathExpr::Sub(a, b) | MathExpr::Div(a, b) => {
+                a.references_var(var) || b.references_var(var)
+            }
+        }
+    }
+
     pub fn eval(&self, row: &PathRow) -> f64 {
         match self {
             MathExpr::VarField { var, field } => row
@@ -2560,6 +3032,12 @@ pub struct CaseCond {
     pub field: String,
     pub op: CmpOp,
     pub val: Value,
+}
+
+impl CaseCond {
+    pub fn references_var(&self, var: &str) -> bool {
+        self.var == var
+    }
 }
 
 /// A simple field comparison condition used in path predicates.
@@ -2668,6 +3146,31 @@ pub enum MatchAggReturn {
 }
 
 impl MatchAggReturn {
+    /// Returns true if this expression reads any field from the given variable binding.
+    /// Used to decide whether to materialise the start node's payload.
+    pub fn references_var(&self, var: &str) -> bool {
+        match self {
+            MatchAggReturn::Field       { var: v, .. }
+            | MatchAggReturn::PathAvg   { var: v, .. }
+            | MatchAggReturn::PathSum   { var: v, .. }
+            | MatchAggReturn::PathMin   { var: v, .. }
+            | MatchAggReturn::PathMax   { var: v, .. }
+            | MatchAggReturn::PathProduct { var: v, .. }
+            | MatchAggReturn::PathFirst { var: v, .. }
+            | MatchAggReturn::PathLast  { var: v, .. }
+            | MatchAggReturn::AgeDays   { var: v, .. }
+            | MatchAggReturn::AgeHours  { var: v, .. }
+            | MatchAggReturn::JsonArrayLen { var: v, .. } => v == var,
+            // MathExpr-based aggregates may reference the var inside their expression.
+            MatchAggReturn::Sum(e) | MatchAggReturn::Avg(e)
+            | MatchAggReturn::Min(e) | MatchAggReturn::Max(e) => e.references_var(var),
+            MatchAggReturn::Case { branches, .. } => {
+                branches.iter().any(|(cond, _)| cond.references_var(var))
+            }
+            MatchAggReturn::Count | MatchAggReturn::Now => false,
+        }
+    }
+
     /// Evaluate this expression over a group of [`PathRow`]s.
     pub fn eval_group(&self, rows: &[PathRow]) -> Value {
         match self {
@@ -2888,6 +3391,11 @@ pub struct HopSpec {
     /// object exposing path intrinsics: `_depth`, `_path_keys`, `_path_strength`,
     /// `_avg_strength`, `_min_strength`, `_max_strength`.
     pub edge_bind: Option<String>,
+    /// Minimum traversal depth (inclusive). 1 for a plain single-hop `-[:e]->`.
+    pub min_depth: u32,
+    /// Maximum traversal depth (inclusive). 1 for a plain single-hop `-[:e]->`.
+    /// When `max_depth > 1`, `collect_paths` uses batch BFS instead of per-node DFS.
+    pub max_depth: u32,
 }
 
 /// A fully parsed and compiled MATCH aggregate statement.
@@ -2911,98 +3419,416 @@ pub struct MatchAggStmt {
     pub order_by: Option<(String, bool)>,
     /// `LIMIT n`.
     pub limit: Option<usize>,
+    /// Post-traversal equality filters on hop-bound variables.
+    /// `WHERE b.level = 1` → `[("b", "level", Value::Number(1))]`.
+    /// Applied after topology traversal, before grouping.
+    pub dest_where: Vec<(String, String, serde_json::Value)>,
+}
+
+/// Topology-only path skeleton returned by [`collect_raw_paths`].
+/// Contains node hashes and slugs — no payload bytes are loaded.
+pub(crate) struct RawPath {
+    pub start_hash:        u64,
+    pub dest_per_hop:      Vec<u64>,
+    pub slugs_per_hop:     Vec<String>,
+    pub strengths_per_hop: Vec<f32>,
+}
+
+/// Phase 1 of [`collect_paths`]: traverse the graph and return topology skeletons only.
+/// No payload bytes are read — only node hash + slug lookups from the in-memory index.
+///
+/// Used by the GROUP BY fast path in [`execute_match_agg`] to avoid materialising
+/// one full payload clone per result row (which OOMs on large collections).
+pub(crate) fn collect_raw_paths(
+    db: &CoreDB,
+    starts: &[u64],
+    hops: &[HopSpec],
+    limit: Option<usize>,
+) -> Vec<RawPath> {
+    if hops.is_empty() || starts.is_empty() {
+        return vec![];
+    }
+
+    struct Partial {
+        start_hash:       u64,
+        current_hash:     u64,
+        dest_so_far:      Vec<u64>,
+        slugs_so_far:     Vec<String>,
+        strengths_so_far: Vec<f32>,
+    }
+
+    let mut in_flight: Vec<Partial> = starts
+        .iter()
+        .filter_map(|&h| {
+            let node = db.node_data(h)?;
+            Some(Partial {
+                start_hash:       h,
+                current_hash:     h,
+                dest_so_far:      Vec::new(),
+                slugs_so_far:     vec![node.slug.clone()],
+                strengths_so_far: Vec::new(),
+            })
+        })
+        .collect();
+
+    for hop in hops {
+        let mut next_in_flight: Vec<Partial> = Vec::new();
+
+        if hop.max_depth == 1 {
+            'single: for partial in in_flight {
+                if let Some(edges) = db.fwd_edges(partial.current_hash) {
+                    for e in edges {
+                        if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                            continue;
+                        }
+                        if let Some(node) = db.node_data(e.other) {
+                            let mut d = partial.dest_so_far.clone();
+                            let mut s = partial.slugs_so_far.clone();
+                            let mut st = partial.strengths_so_far.clone();
+                            d.push(e.other);
+                            s.push(node.slug.clone());
+                            st.push(e.strength);
+                            next_in_flight.push(Partial {
+                                start_hash:       partial.start_hash,
+                                current_hash:     e.other,
+                                dest_so_far:      d,
+                                slugs_so_far:     s,
+                                strengths_so_far: st,
+                            });
+                            if limit.map_or(false, |l| next_in_flight.len() >= l) {
+                                break 'single;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Multi-depth flat pair propagation.
+            // Propagate ALL partials simultaneously as (partial_idx, current_hash) pairs.
+            // No per-start visited set; no String cloning until result materialisation.
+            let mut pairs: Vec<(usize, u64)> = in_flight
+                .iter()
+                .enumerate()
+                .map(|(idx, p)| (idx, p.current_hash))
+                .collect();
+
+            let mut result_pairs: Vec<(usize, u64)> = Vec::new();
+
+            for depth in 1..=hop.max_depth {
+                let mut next_pairs: Vec<(usize, u64)> = Vec::new();
+                for &(pidx, current_h) in &pairs {
+                    if let Some(edges) = db.fwd_edges(current_h) {
+                        for e in edges {
+                            if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                                continue;
+                            }
+                            if db.node_data(e.other).is_some() {
+                                next_pairs.push((pidx, e.other));
+                            }
+                        }
+                    }
+                }
+                if depth >= hop.min_depth {
+                    result_pairs.extend_from_slice(&next_pairs);
+                    if limit.map_or(false, |l| result_pairs.len() >= l) {
+                        result_pairs.truncate(limit.unwrap());
+                        break;
+                    }
+                }
+                pairs = next_pairs;
+                if pairs.is_empty() {
+                    break;
+                }
+            }
+
+            for (pidx, dest_h) in result_pairs {
+                let prior = &in_flight[pidx];
+                let mut d = prior.dest_so_far.clone();
+                d.push(dest_h);
+                let dest_slug = db.node_data(dest_h)
+                    .map(|nd| nd.slug.clone())
+                    .unwrap_or_default();
+                let mut s = prior.slugs_so_far.clone();
+                s.push(dest_slug);
+                let mut st = prior.strengths_so_far.clone();
+                st.push(1.0);
+                next_in_flight.push(Partial {
+                    start_hash:       prior.start_hash,
+                    current_hash:     dest_h,
+                    dest_so_far:      d,
+                    slugs_so_far:     s,
+                    strengths_so_far: st,
+                });
+            }
+        }
+
+        in_flight = next_in_flight;
+    }
+
+    in_flight
+        .into_iter()
+        .filter(|p| p.dest_so_far.len() == hops.len())
+        .map(|p| RawPath {
+            start_hash:        p.start_hash,
+            dest_per_hop:      p.dest_so_far,
+            slugs_per_hop:     p.slugs_so_far,
+            strengths_per_hop: p.strengths_so_far,
+        })
+        .collect()
+}
+
+/// Pure-topology BFS for GROUP BY COUNT(*) — returns `final_dest_hash → path_count`.
+///
+/// Merges the traversal frontier at every level so memory is O(unique_nodes_at_level)
+/// rather than O(total_paths).  For 81,912 villages through `child_of*3` this
+/// produces a 34-entry map (one entry per province) instead of 81,912 RawPath
+/// structs — zero Vec/String allocation per individual path.
+///
+/// For multi-hop chains the output of each hop becomes the weighted frontier for
+/// the next hop, so counts propagate correctly through any number of hops.
+///
+/// Used by [`execute_match_agg`] when all GROUP-BY keys and non-COUNT return
+/// expressions reference only the final hop variable (and all dest_where conditions
+/// do the same), making intermediate path data irrelevant.
+fn collect_final_dest_counts(
+    db: &CoreDB,
+    starts: &[u64],
+    hops: &[HopSpec],
+) -> HashMap<u64, usize> {
+    if hops.is_empty() || starts.is_empty() {
+        return HashMap::new();
+    }
+
+    // Initial frontier: each valid start node contributes weight = 1.
+    let mut frontier: HashMap<u64, usize> = starts
+        .iter()
+        .copied()
+        .filter(|&h| db.node_data(h).is_some())
+        .map(|h| (h, 1usize))
+        .collect();
+
+    let last_hop_idx = hops.len() - 1;
+
+    for (hop_idx, hop) in hops.iter().enumerate() {
+        // BFS through this hop's depth range, merging node weights at each level.
+        let mut depth_frontier: HashMap<u64, usize> = frontier.clone();
+        let mut hop_results: HashMap<u64, usize> = HashMap::new();
+
+        for depth in 1u32..=hop.max_depth {
+            let mut next: HashMap<u64, usize> = HashMap::new();
+            for (&current_h, &count) in &depth_frontier {
+                if let Some(edges) = db.fwd_edges(current_h) {
+                    for e in edges {
+                        if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                            continue;
+                        }
+                        if db.node_data(e.other).is_some() {
+                            *next.entry(e.other).or_insert(0) += count;
+                        }
+                    }
+                }
+            }
+            // Accumulate results at every depth in [min_depth, max_depth].
+            if depth >= hop.min_depth {
+                for (&h, &c) in &next {
+                    *hop_results.entry(h).or_insert(0) += c;
+                }
+            }
+            depth_frontier = next;
+            if depth_frontier.is_empty() {
+                break;
+            }
+        }
+
+        if hop_idx == last_hop_idx {
+            return hop_results;
+        }
+        // Next hop's frontier = all nodes reachable via any valid depth of this hop.
+        frontier = hop_results;
+    }
+
+    HashMap::new() // unreachable: loop always returns on last hop
 }
 
 /// Collect all complete paths from `starts` through the hop chain.
 ///
-/// Returns one [`PathRow`] per complete source → endpoint path.
-/// Each row maps each bind name to the node payload at that hop.
+/// Build [`PathRow`]s from pre-collected raw paths.
 ///
-/// If a hop has an `edge_bind`, that binding is a JSON object with path intrinsics:
-/// `_depth`, `_path_keys`, `_path_strength`, `_avg_strength`, `_min_strength`, `_max_strength`.
+/// Reads each unique payload exactly once (sorted by offset for sequential I/O),
+/// then assembles PathRows from the shared cache.  Only reads start-node payloads
+/// when `start_var` is `Some`.
+///
+/// Separated from [`collect_raw_paths`] so callers can filter / truncate raw paths
+/// before paying the cost of payload reads.
+pub(crate) fn build_path_rows_from_raw(
+    db: &CoreDB,
+    raw_paths: &[RawPath],
+    hops: &[HopSpec],
+    start_var: Option<&str>,
+) -> Vec<PathRow> {
+    if raw_paths.is_empty() { return vec![]; }
+
+    // Collect unique hashes, sort by payload offset for sequential I/O.
+    let mut needed: Vec<u64> = {
+        let mut set: HashSet<u64> = HashSet::new();
+        if start_var.is_some() {
+            for rp in raw_paths { set.insert(rp.start_hash); }
+        }
+        for rp in raw_paths {
+            for &h in &rp.dest_per_hop { set.insert(h); }
+        }
+        let mut v: Vec<u64> = set.into_iter().collect();
+        v.sort_unstable_by_key(|&h| db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0));
+        v
+    };
+
+    let payload_cache: HashMap<u64, Value> = needed
+        .into_iter()
+        .filter_map(|h| db.get_payload(h).map(|p| (h, p)))
+        .collect();
+
+    let null = Value::Null;
+    raw_paths
+        .iter()
+        .map(|rp| {
+            let mut row: PathRow = HashMap::new();
+
+            if let Some(sv) = start_var {
+                let p = payload_cache.get(&rp.start_hash).unwrap_or(&null);
+                row.insert(sv.to_string(), p.clone());
+            }
+
+            for (hop_idx, hop) in hops.iter().enumerate() {
+                let dest_h = rp.dest_per_hop[hop_idx];
+                let dest_payload = payload_cache.get(&dest_h).unwrap_or(&null).clone();
+
+                if let Some(ref edge_bind) = hop.edge_bind {
+                    let path_slugs: Vec<&str> = rp.slugs_per_hop
+                        .iter()
+                        .take(hop_idx + 2)
+                        .map(|s| s.as_str())
+                        .collect();
+                    let path_strengths: &[f32] = &rp.strengths_per_hop[..=hop_idx];
+                    let n = path_strengths.len() as f64;
+                    let sum: f64 = path_strengths.iter().map(|&s| s as f64).sum();
+                    let avg = if n > 0.0 { sum / n } else { 0.0 };
+                    let min_s = path_strengths.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max_s = path_strengths.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    row.insert(edge_bind.clone(), serde_json::json!({
+                        "_depth":         hop_idx + 1,
+                        "_path_keys":     path_slugs,
+                        "_path_strength": path_strengths,
+                        "_avg_strength":  avg,
+                        "_min_strength":  if min_s.is_infinite() { 0.0_f32 } else { min_s },
+                        "_max_strength":  if max_s.is_infinite() { 0.0_f32 } else { max_s },
+                    }));
+                }
+
+                row.insert(hop.node_bind.clone(), dest_payload);
+            }
+
+            row
+        })
+        .collect()
+}
+
+/// Filter raw paths by equality conditions on hop-bound variables.
+///
+/// Only loads payloads for *unique* destination hashes (sorted by offset for
+/// sequential I/O), and uses head+tail extraction for large payloads (> 64 KB)
+/// to avoid parsing multi-MB GeoJSON blobs.
+///
+/// Conditions referencing variables not in `var_to_hop` (e.g. start variable)
+/// are skipped here — callers must filter those separately on PathRows.
+fn filter_raw_by_dest_where(
+    db: &CoreDB,
+    raw: Vec<RawPath>,
+    conditions: &[(String, String, serde_json::Value)],
+    var_to_hop: &HashMap<&str, usize>,
+) -> Vec<RawPath> {
+    const FAST_PATH_THRESHOLD: u32 = 64 * 1024;
+
+    // Fields required by conditions on hop variables.
+    let where_fields: Vec<String> = conditions.iter()
+        .filter(|(v, _, _)| var_to_hop.contains_key(v.as_str()))
+        .map(|(_, f, _)| f.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    if where_fields.is_empty() { return raw; } // all conditions are on start var
+
+    // Unique dest hashes referenced by hop conditions, sorted by payload offset.
+    let mut unique_dests: Vec<u64> = {
+        let mut seen: HashSet<u64> = HashSet::new();
+        for rp in &raw {
+            for (cond_var, _, _) in conditions {
+                if let Some(&hi) = var_to_hop.get(cond_var.as_str()) {
+                    if let Some(&h) = rp.dest_per_hop.get(hi) {
+                        seen.insert(h);
+                    }
+                }
+            }
+        }
+        let mut v: Vec<u64> = seen.into_iter().collect();
+        v.sort_unstable_by_key(|&h| db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0));
+        v
+    };
+
+    // Load each unique dest payload once — head+tail for large payloads.
+    let payload_cache: HashMap<u64, Value> = unique_dests
+        .into_iter()
+        .filter_map(|h| {
+            let p = if let Some(node) = db.node_data(h) {
+                if node.payload_len > FAST_PATH_THRESHOLD {
+                    if let Some((head, tail)) = db.get_payload_head_tail(h, 512, 16384) {
+                        let combined = [head.as_slice(), tail.as_slice()].concat();
+                        let extracted = extract_fields_by_search(&combined, &where_fields);
+                        let all_found = where_fields.iter().all(|f| extracted.contains_key(f.as_str()));
+                        if all_found && !extracted.is_empty() {
+                            return Some((h, Value::Object(extracted)));
+                        }
+                    }
+                }
+                db.get_payload(h)?
+            } else {
+                db.get_payload(h)?
+            };
+            Some((h, p))
+        })
+        .collect();
+
+    // Retain only raw paths whose hop-variable payloads satisfy all conditions.
+    raw.into_iter().filter(|rp| {
+        conditions.iter().all(|(cond_var, cond_field, cond_val)| {
+            match var_to_hop.get(cond_var.as_str()) {
+                None => true, // start var or unknown — not our responsibility here
+                Some(&hi) => {
+                    let h = rp.dest_per_hop.get(hi).copied().unwrap_or(0);
+                    payload_cache.get(&h)
+                        .and_then(|p| p.get(cond_field.as_str()))
+                        .map_or(false, |v| values_eq(v, cond_val))
+                }
+            }
+        })
+    }).collect()
+}
+
+/// Collect all complete paths from `starts` through the hop chain as [`PathRow`]s.
+///
+/// Thin wrapper: topology via [`collect_raw_paths`] then payload materialisation
+/// via [`build_path_rows_from_raw`].  Pass `limit` to short-circuit traversal when
+/// you know no ordering or post-traversal filtering is needed.
 pub fn collect_paths(
     db: &CoreDB,
     starts: &[u64],
     hops: &[HopSpec],
     start_var: Option<&str>,
+    limit: Option<usize>,
 ) -> Vec<PathRow> {
-    if hops.is_empty() || starts.is_empty() {
-        return vec![];
-    }
-
-    let mut result = Vec::new();
-
-    // Stack entries: (current_hash, hop_idx, bindings, path_slugs, path_strengths)
-    // path_slugs   — node slugs visited so far, starting with the start node
-    // path_strengths — edge strengths traversed so far
-    let mut stack: Vec<(u64, usize, Vec<(String, Value)>, Vec<String>, Vec<f32>)> = starts
-        .iter()
-        .filter_map(|&h| {
-            let node = db.node_data(h)?;
-            let start_slug = node.slug.clone();
-            // Bind the start node payload if the query names the start variable.
-            let init_bindings = if let Some(sv) = start_var {
-                let start_payload = db.get_payload(h).unwrap_or(Value::Null);
-                vec![(sv.to_string(), start_payload)]
-            } else {
-                Vec::new()
-            };
-            Some((h, 0usize, init_bindings, vec![start_slug], Vec::new()))
-        })
-        .collect();
-
-    while let Some((current_h, hop_idx, bindings, path_slugs, path_strengths)) = stack.pop() {
-        let hop = &hops[hop_idx];
-
-        if let Some(edges) = db.fwd_edges(current_h) {
-            for e in edges {
-                // edge_type_hash == 0 means "any type"
-                if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
-                    continue;
-                }
-                if let Some(node) = db.node_data(e.other) {
-                    let mut new_bindings = bindings.clone();
-                    let mut new_path_slugs = path_slugs.clone();
-                    let mut new_path_strengths = path_strengths.clone();
-
-                    new_path_slugs.push(node.slug.clone());
-                    new_path_strengths.push(e.strength);
-
-                    // Bind edge intrinsics if the hop has an edge variable.
-                    if let Some(ref edge_bind) = hop.edge_bind {
-                        let depth = hop_idx + 1;
-                        let n = new_path_strengths.len() as f64;
-                        let sum: f64 = new_path_strengths.iter().map(|&s| s as f64).sum();
-                        let avg = if n > 0.0 { sum / n } else { 0.0 };
-                        let min = new_path_strengths.iter().cloned().fold(f32::INFINITY, f32::min);
-                        let max = new_path_strengths.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let edge_obj = serde_json::json!({
-                            "_depth":          depth,
-                            "_path_keys":      &new_path_slugs,
-                            "_path_strength":  &new_path_strengths,
-                            "_avg_strength":   avg,
-                            "_min_strength":   if min.is_infinite() { 0.0_f32 } else { min },
-                            "_max_strength":   if max.is_infinite() { 0.0_f32 } else { max },
-                        });
-                        new_bindings.push((edge_bind.clone(), edge_obj));
-                    }
-
-                    // Bind the destination node.
-                    let dest_payload = db.get_payload(e.other).unwrap_or(Value::Null);
-                    new_bindings.push((hop.node_bind.clone(), dest_payload));
-
-                    let next_hop = hop_idx + 1;
-                    if next_hop >= hops.len() {
-                        result.push(new_bindings.into_iter().collect());
-                    } else {
-                        stack.push((e.other, next_hop, new_bindings, new_path_slugs, new_path_strengths));
-                    }
-                }
-            }
-        }
-    }
-
-    result
+    if hops.is_empty() || starts.is_empty() { return vec![]; }
+    let raw = collect_raw_paths(db, starts, hops, limit);
+    build_path_rows_from_raw(db, &raw, hops, start_var)
 }
 
 /// Execute a [`MatchAggStmt`] and return synthetic result [`Hit`]s.
@@ -3020,11 +3846,457 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
         MatchAggStart::All => db.all_hashes(),
     };
 
-    // 2. Collect all path rows
-    let paths = collect_paths(db, &starts, &stmt.hops, stmt.start_var.as_deref());
-    if paths.is_empty() {
-        return vec![];
+    // 2. Collect all path rows.
+    //
+    // Only pass start_var when the start variable is actually referenced in a
+    // RETURN expression or GROUP BY clause — otherwise the materialiser would
+    // eagerly read every start-node payload even though the query doesn't need it.
+    // For "SELECT b.x, COUNT(*) FROM MATCH (a:col)-[:e]->(b:col) GROUP BY b.x"
+    // the variable `a` is declared but never used → skip ~N payload reads.
+    let effective_start_var: Option<&str> = stmt.start_var.as_deref().filter(|sv| {
+        let in_returns = stmt.returns.iter().any(|(expr, _)| expr.references_var(sv));
+        let in_group   = stmt.group_by.as_ref().map_or(false, |gk| {
+            gk.iter().any(|(var, _)| var.as_str() == *sv)
+        });
+        in_returns || in_group
+    });
+    // Hop-variable → hop index (used by both fast and slow paths for dest_where).
+    let var_to_hop: HashMap<&str, usize> = stmt.hops.iter()
+        .enumerate()
+        .map(|(i, h)| (h.node_bind.as_str(), i))
+        .collect();
+
+    // ── GROUP BY fast path ─────────────────────────────────────────────────────
+    // For queries with COUNT(*) / Field / scalar-first-row accesses only,
+    // bypass full PathRow materialisation.  Uses three-phase approach:
+    //
+    //   Phase 1 — hash-keyed grouping (ZERO payload reads)
+    //   Phase 2 — dest_where filter using unique dest payloads only
+    //   Phase 3 — field-value grouping from payload_cache
+    //
+    // Example: 81,912 villages -[:child_of*3]-> 34 province destinations.
+    //   Old: load 34 × 2 MB province GeoJSON → full serde_json parse → 146 s cold.
+    //   New: group by hash (free) → load 34 × 16 KB head+tail → extract 3 fields → 5 ms.
+    //
+    // Large-payload fast path: for payloads > FAST_PATH_THRESHOLD and simple returns
+    // (Field/Count/Now), uses get_payload_head_tail + extract_fields_by_search instead
+    // of loading and parsing the full JSON blob.
+    if let Some(ref group_keys) = stmt.group_by {
+        let needs_row_scan = stmt.returns.iter().any(|(e, _)| matches!(e,
+            MatchAggReturn::Sum(_) | MatchAggReturn::Avg(_) |
+            MatchAggReturn::Min(_) | MatchAggReturn::Max(_)));
+        let start_in_group = stmt.start_var.as_ref()
+            .map_or(false, |sv| group_keys.iter().any(|(gvar, _)| gvar == sv));
+
+        if !needs_row_scan && !start_in_group {
+            // ── Shared: field list + payload loader (used by both fast paths) ──
+            // Compute before path collection so the ultra-fast path can reuse them.
+            let all_returns_simple = stmt.returns.iter().all(|(ret, _)|
+                matches!(ret, MatchAggReturn::Count | MatchAggReturn::Field { .. }
+                             | MatchAggReturn::Now));
+            let needed_fields: Vec<String> = {
+                let mut v: Vec<String> = Vec::new();
+                let mut add = |f: &String| {
+                    if !v.iter().any(|x| x == f) { v.push(f.clone()); }
+                };
+                for (_, f, _) in &stmt.dest_where { add(f); }
+                for (gvar, gfield) in group_keys.iter() {
+                    if var_to_hop.contains_key(gvar.as_str()) { add(gfield); }
+                }
+                for (ret, _) in &stmt.returns {
+                    if let MatchAggReturn::Field { var, field } = ret {
+                        if var_to_hop.contains_key(var.as_str()) { add(field); }
+                    }
+                }
+                v
+            };
+            // Payload size threshold above which we use head+tail extraction to avoid
+            // parsing multi-megabyte GeoJSON blobs for 3 scalar metadata fields.
+            const FAST_PATH_THRESHOLD: u32 = 64 * 1024;
+            let where_fields: Vec<&str> = stmt.dest_where.iter()
+                .map(|(_, f, _)| f.as_str())
+                .collect();
+            let load_for_fields = |h: u64| -> Option<Value> {
+                if all_returns_simple && !needed_fields.is_empty() {
+                    if let Some(node) = db.node_data(h) {
+                        if node.payload_len > FAST_PATH_THRESHOLD {
+                            if let Some((head, tail)) = db.get_payload_head_tail(h, 512, 16384) {
+                                let combined: Vec<u8> =
+                                    [head.as_slice(), tail.as_slice()].concat();
+                                let extracted =
+                                    extract_fields_by_search(&combined, &needed_fields);
+                                let where_ok = where_fields.iter()
+                                    .all(|f| extracted.contains_key(*f));
+                                if where_ok && !extracted.is_empty() {
+                                    return Some(Value::Object(extracted));
+                                }
+                            }
+                        }
+                    }
+                }
+                db.get_payload(h)
+            };
+
+            // ── Ultra-fast path: GROUP BY on final hop variable only ───────────
+            //
+            // When every GROUP-BY key and every non-COUNT return expression
+            // references *only* the last hop variable (e.g. `b` in `->[:e*3]->(b)`),
+            // AND all dest_where conditions reference the same variable, we skip
+            // per-path materialisation entirely and use collect_final_dest_counts:
+            //
+            //   - propagates a merged frontier HashMap<hash, weight> through hops
+            //   - O(unique_nodes_at_each_level) space instead of O(total_paths)
+            //   - for 81,912 villages → 3 hops → 34 provinces: 34 HashMap entries
+            //     instead of 81,912 RawPath structs + 7,626 hash_groups entries
+            let last_hop_idx = stmt.hops.len().saturating_sub(1);
+            let last_bind = stmt.hops.last().map(|h| h.node_bind.as_str()).unwrap_or("");
+            let only_final_var = !stmt.hops.is_empty()
+                && group_keys.iter().all(|(gvar, _)| gvar.as_str() == last_bind)
+                && stmt.returns.iter().all(|(ret, _)| match ret {
+                    MatchAggReturn::Count | MatchAggReturn::Now => true,
+                    MatchAggReturn::Field { var, .. } => var.as_str() == last_bind,
+                    _ => false,
+                })
+                && stmt.hops.iter().all(|h| h.edge_bind.is_none())
+                && stmt.dest_where.iter().all(|(cond_var, _, _)| {
+                    // Only allow conditions on the start var (checked elsewhere) or
+                    // the final hop var.  Conditions on intermediate hops require the
+                    // full per-path data that collect_raw_paths provides.
+                    var_to_hop.get(cond_var.as_str())
+                        .map_or(true, |&hi| hi == last_hop_idx)
+                });
+
+            if only_final_var {
+                let mut dest_counts =
+                    collect_final_dest_counts(db, &starts, &stmt.hops);
+                if dest_counts.is_empty() { return vec![]; }
+
+                let null = Value::Null;
+                let mut payload_cache: HashMap<u64, Value> = HashMap::new();
+
+                // dest_where: load unique dest payloads (offset-sorted), filter.
+                if !stmt.dest_where.is_empty() {
+                    let mut unique_dests: Vec<u64> = dest_counts.keys().copied().collect();
+                    unique_dests.sort_unstable_by_key(|&h| {
+                        db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0)
+                    });
+                    for h in unique_dests {
+                        if let Some(p) = load_for_fields(h) {
+                            payload_cache.insert(h, p);
+                        }
+                    }
+                    dest_counts.retain(|dest_h, _| {
+                        stmt.dest_where.iter().all(|(cond_var, cond_field, cond_val)| {
+                            match var_to_hop.get(cond_var.as_str()) {
+                                None => true, // start var — skip (no start_in_group)
+                                Some(_) => payload_cache.get(dest_h)
+                                    .and_then(|p| p.get(cond_field.as_str()))
+                                    .map_or(false, |v| values_eq(v, cond_val)),
+                            }
+                        })
+                    });
+                    if dest_counts.is_empty() { return vec![]; }
+                }
+
+                // Load payloads for dests not yet in cache (offset-sorted I/O).
+                {
+                    let mut remaining: Vec<u64> = dest_counts.keys()
+                        .copied()
+                        .filter(|h| !payload_cache.contains_key(h))
+                        .collect();
+                    remaining.sort_unstable_by_key(|&h| {
+                        db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0)
+                    });
+                    for h in remaining {
+                        if let Some(p) = load_for_fields(h) {
+                            payload_cache.insert(h, p);
+                        }
+                    }
+                }
+
+                // Group by GROUP-BY field values, merging counts for same-value dests.
+                let mut group_order: Vec<String> = Vec::new();
+                let mut groups: HashMap<String, (usize, u64)> = HashMap::new();
+                for (&dest_h, &count) in &dest_counts {
+                    let key: String = group_keys.iter()
+                        .map(|(_, gfield)| {
+                            serde_json::to_string(
+                                payload_cache.get(&dest_h)
+                                    .and_then(|p| p.get(gfield.as_str()))
+                                    .unwrap_or(&null)
+                            ).unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\x00");
+                    match groups.entry(key.clone()) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            group_order.push(key);
+                            e.insert((count, dest_h));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            e.get_mut().0 += count;
+                        }
+                    }
+                }
+
+                // Build result rows from groups.
+                let mut result_rows: Vec<Value> = group_order.iter().map(|key| {
+                    let (count, rep_h) = groups[key];
+                    let mut repr: PathRow = HashMap::new();
+                    repr.insert(last_bind.to_string(),
+                        payload_cache.get(&rep_h).cloned().unwrap_or_else(|| null.clone()));
+                    let mut map = serde_json::Map::new();
+                    for (ret_expr, alias) in &stmt.returns {
+                        let val = if matches!(ret_expr, MatchAggReturn::Count) {
+                            serde_json::json!(count as i64)
+                        } else {
+                            ret_expr.eval_group(std::slice::from_ref(&repr))
+                        };
+                        map.insert(alias.clone(), val);
+                    }
+                    Value::Object(map)
+                }).collect();
+
+                if let Some((ref order_field, ascending)) = stmt.order_by {
+                    result_rows.sort_by(|a, b| {
+                        let va = a.get(order_field.as_str()).and_then(|v| v.as_f64());
+                        let vb = b.get(order_field.as_str()).and_then(|v| v.as_f64());
+                        let ord = match (va, vb) {
+                            (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                            (None, Some(_)) => std::cmp::Ordering::Less,
+                            (Some(_), None) => std::cmp::Ordering::Greater,
+                            (None, None) => {
+                                let sa = a.get(order_field.as_str()).map(|v| v.to_string()).unwrap_or_default();
+                                let sb = b.get(order_field.as_str()).map(|v| v.to_string()).unwrap_or_default();
+                                sa.cmp(&sb)
+                            }
+                        };
+                        if ascending { ord } else { ord.reverse() }
+                    });
+                }
+                if let Some(n) = stmt.limit { result_rows.truncate(n); }
+                return result_rows
+                    .into_iter()
+                    .map(|v| Hit { slug: String::new(), slug_hash: 0, payload: Some(v) })
+                    .collect();
+            }
+
+            // ── Standard fast path (GROUP BY with intermediate vars or edge binds) ─
+            let raw = collect_raw_paths(db, &starts, &stmt.hops, None);
+            if raw.is_empty() { return vec![]; }
+
+            // ── Phase 1: hash-keyed grouping (zero payload reads) ──────────────
+            // Group raw paths by their dest_per_hop tuple (just hashes).
+            // Key  = Vec<u64> of destination hashes at each hop.
+            // Value = (path_count, representative_rp_index).
+            //
+            // For 81,912 village→province paths ending at 34 unique provinces this
+            // produces 34 groups of ~2,400 paths each — no payload read needed.
+            let mut hash_groups: HashMap<Vec<u64>, (usize, usize)> = HashMap::new();
+            for (rp_idx, rp) in raw.iter().enumerate() {
+                hash_groups.entry(rp.dest_per_hop.clone())
+                    .and_modify(|(cnt, _)| *cnt += 1)
+                    .or_insert((1, rp_idx));
+            }
+            // ── Phase 2: dest_where filtering ─────────────────────────────────
+            // Load payloads only for UNIQUE dest tuples (not per raw path).
+            // Reads are sorted by payload_offset for sequential I/O (better OS prefetch).
+            let null = Value::Null;
+            let mut payload_cache: HashMap<u64, Value> = HashMap::new();
+
+            if !stmt.dest_where.is_empty() {
+                // Collect all unique dest hashes across remaining groups, sorted by offset.
+                let mut unique_dests: Vec<u64> = hash_groups.keys()
+                    .flat_map(|dp| dp.iter().copied())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                unique_dests.sort_unstable_by_key(|&h| {
+                    db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0)
+                });
+                for h in unique_dests {
+                    if let Some(p) = load_for_fields(h) {
+                        payload_cache.insert(h, p);
+                    }
+                }
+
+                // Apply dest_where: remove groups whose destination fails the condition.
+                hash_groups.retain(|dest_per_hop, _| {
+                    stmt.dest_where.iter().all(|(cond_var, cond_field, cond_val)| {
+                        match var_to_hop.get(cond_var.as_str()) {
+                            None => true, // start var or unknown — skip
+                            Some(&hi) => {
+                                let h = dest_per_hop.get(hi).copied().unwrap_or(0);
+                                payload_cache.get(&h)
+                                    .and_then(|p| p.get(cond_field.as_str()))
+                                    .map_or(false, |v| values_eq(v, cond_val))
+                            }
+                        }
+                    })
+                });
+                if hash_groups.is_empty() { return vec![]; }
+            }
+
+            // ── Phase 3: load payloads for remaining unique dests ──────────────
+            // Any dests not already in payload_cache (those not loaded during dest_where)
+            // are loaded now, sorted by offset for sequential I/O.
+            {
+                let mut remaining: Vec<u64> = hash_groups.keys()
+                    .flat_map(|dp| dp.iter().copied())
+                    .filter(|h| !payload_cache.contains_key(h))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                remaining.sort_unstable_by_key(|&h| {
+                    db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0)
+                });
+                for h in remaining {
+                    if let Some(p) = load_for_fields(h) {
+                        payload_cache.insert(h, p);
+                    }
+                }
+            }
+
+            // ── Phase 4: group by field values (merge same-field-value groups) ──
+            // Two different dest hashes with identical GROUP BY field values are merged.
+            // e.g. two districts named "North Melbourne" → same group, summed counts.
+            let mut group_order: Vec<String> = Vec::new();
+            let mut groups: HashMap<String, (usize, usize)> = HashMap::new();
+
+            for (dest_per_hop, &(count, rep_rp_idx)) in &hash_groups {
+                let key: String = group_keys.iter()
+                    .map(|(gvar, gfield)| {
+                        let hi = var_to_hop.get(gvar.as_str()).copied().unwrap_or(0);
+                        let h = dest_per_hop.get(hi).copied().unwrap_or(0);
+                        serde_json::to_string(
+                            payload_cache.get(&h)
+                                .and_then(|p| p.get(gfield.as_str()))
+                                .unwrap_or(&null)
+                        ).unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\x00");
+                match groups.entry(key.clone()) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        group_order.push(key);
+                        e.insert((count, rep_rp_idx));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        e.get_mut().0 += count; // merge counts for same field values
+                    }
+                }
+            }
+
+            // ── Phase 5: build result rows → ORDER BY → LIMIT ─────────────────
+            let mut result_rows: Vec<Value> = group_order.iter().map(|key| {
+                let (count, rep_idx) = groups[key];
+                let rp = &raw[rep_idx];
+                let mut repr: PathRow = HashMap::new();
+                for (hop_idx, hop) in stmt.hops.iter().enumerate() {
+                    if hop_idx < rp.dest_per_hop.len() {
+                        let h = rp.dest_per_hop[hop_idx];
+                        repr.insert(hop.node_bind.clone(),
+                            payload_cache.get(&h).cloned().unwrap_or_else(|| null.clone()));
+                    }
+                }
+                let mut map = serde_json::Map::new();
+                for (ret_expr, alias) in &stmt.returns {
+                    let val = if matches!(ret_expr, MatchAggReturn::Count) {
+                        serde_json::json!(count as i64)
+                    } else {
+                        ret_expr.eval_group(std::slice::from_ref(&repr))
+                    };
+                    map.insert(alias.clone(), val);
+                }
+                Value::Object(map)
+            }).collect();
+
+            // ORDER BY
+            if let Some((ref order_field, ascending)) = stmt.order_by {
+                result_rows.sort_by(|a, b| {
+                    let va = a.get(order_field.as_str()).and_then(|v| v.as_f64());
+                    let vb = b.get(order_field.as_str()).and_then(|v| v.as_f64());
+                    let ord = match (va, vb) {
+                        (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (None, None) => {
+                            let sa = a.get(order_field.as_str()).map(|v| v.to_string()).unwrap_or_default();
+                            let sb = b.get(order_field.as_str()).map(|v| v.to_string()).unwrap_or_default();
+                            sa.cmp(&sb)
+                        }
+                    };
+                    if ascending { ord } else { ord.reverse() }
+                });
+            }
+            if let Some(n) = stmt.limit { result_rows.truncate(n); }
+            return result_rows
+                .into_iter()
+                .map(|v| Hit { slug: String::new(), slug_hash: 0, payload: Some(v) })
+                .collect();
+        }
     }
+
+    // Slow path: SUM/AVG/MIN/MAX or start_var in GROUP BY.
+    //
+    // Topology-first, same principle as the GROUP BY fast path:
+    //   Phase 1 — topology only (collect_raw_paths, no payload reads)
+    //   Phase 2 — filter hop-variable conditions via filter_raw_by_dest_where
+    //             (reads only unique dest payloads, head+tail for large blobs)
+    //   Phase 3 — truncate to LIMIT before payload reads (when safe)
+    //   Phase 4 — read payloads only for survivors → build PathRows
+    //   Phase 5 — filter start-variable conditions (requires PathRow)
+
+    // Push LIMIT into the traversal only when there is nothing that requires
+    // seeing all results (no dest_where filter, no ordering, no aggregation).
+    let traversal_limit = if stmt.dest_where.is_empty()
+        && stmt.order_by.is_none()
+        && stmt.group_by.is_none()
+    {
+        stmt.limit
+    } else {
+        None
+    };
+
+    // Phase 1: topology.
+    let mut raw = collect_raw_paths(db, &starts, &stmt.hops, traversal_limit);
+    if raw.is_empty() { return vec![]; }
+
+    // Phase 2: filter by hop-variable conditions (topology-first, efficient).
+    // Conditions on the start variable are skipped here and applied in Phase 5.
+    if !stmt.dest_where.is_empty() {
+        raw = filter_raw_by_dest_where(db, raw, &stmt.dest_where, &var_to_hop);
+        if raw.is_empty() { return vec![]; }
+    }
+
+    // Phase 3: truncate to LIMIT before paying for payload reads.
+    // Safe when: no ORDER BY (order would change which rows survive) and no GROUP BY.
+    // start_where conditions are post-filter, so only skip truncation if they exist.
+    let has_start_conditions = stmt.dest_where.iter()
+        .any(|(v, _, _)| !var_to_hop.contains_key(v.as_str()));
+    if stmt.group_by.is_none() && stmt.order_by.is_none() && !has_start_conditions {
+        if let Some(n) = stmt.limit { raw.truncate(n); }
+    }
+
+    // Phase 4: read payloads only for the surviving raw paths.
+    let all_paths = build_path_rows_from_raw(db, &raw, &stmt.hops, effective_start_var);
+    if all_paths.is_empty() { return vec![]; }
+
+    // Phase 5: filter start-variable conditions (requires PathRow payload).
+    let paths: Vec<PathRow> = if !has_start_conditions {
+        all_paths
+    } else {
+        all_paths.into_iter().filter(|row| {
+            stmt.dest_where.iter()
+                .filter(|(v, _, _)| !var_to_hop.contains_key(v.as_str()))
+                .all(|(cond_var, cond_field, cond_val)| {
+                    row.get(cond_var.as_str())
+                        .and_then(|v| v.get(cond_field.as_str()))
+                        .map_or(false, |v| values_eq(v, cond_val))
+                })
+        }).collect()
+    };
+    if paths.is_empty() { return vec![]; }
 
     // 3. GROUP BY or flat pass-through
     let mut result_rows: Vec<Value> = if let Some(ref group_keys) = stmt.group_by {
@@ -3118,6 +4390,25 @@ fn build_shortest_path_row(
 
     let start = sk_hash(&stmt.from_slug);
     let end   = sk_hash(&stmt.to_slug);
+
+    // Diagnose missing endpoints before running BFS.
+    // Common cause: no collection type in pattern e.g. (a)-[r*]->(b) instead of (a:col)-[r*]->(b:col)
+    // so the slug is built as "key" instead of "collection/key".
+    if db.node_data(start).is_none() {
+        eprintln!(
+            "MATCH SHORTEST: start node '{}' not found — did you specify the collection? e.g. ({}:collection)",
+            stmt.from_slug, stmt.start_bind
+        );
+        return None;
+    }
+    if db.node_data(end).is_none() {
+        eprintln!(
+            "MATCH SHORTEST: end node '{}' not found — did you specify the collection? e.g. ({}:collection)",
+            stmt.to_slug, stmt.end_bind
+        );
+        return None;
+    }
+
     let pr    = db.bfs_shortest_path(start, end)?;
 
     let mut row: PathRow = HashMap::new();
@@ -3283,7 +4574,7 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
                 MatchAggStart::Collection(h) => db.collection_members(h).cloned().unwrap_or_default(),
                 MatchAggStart::All           => db.all_hashes(),
             };
-            collect_paths(db, &starts, &agg.hops, agg.start_var.as_deref())
+            collect_paths(db, &starts, &agg.hops, agg.start_var.as_deref(), None)
         }
         FromSource::Shortest(s) => {
             match build_shortest_path_row(db, &s) {

@@ -3558,7 +3558,26 @@ impl Parser {
                 _ => { /* * or ] — anonymous, any type */ }
             }
 
-            // Consume remaining tokens in [...] (*, ranges, etc.)
+            // Optional depth: *min..max  (e.g. *1..3, *3..3)
+            let (mut min_depth, mut max_depth) = (1u32, 1u32);
+            if matches!(self.peek(), Tok::Star) {
+                self.advance(); // consume '*'
+                if let Tok::Num(_) = self.peek().clone() {
+                    let mn = self.expect_num()? as u32;
+                    if matches!(self.peek(), Tok::DotDot) {
+                        self.advance(); // consume '..'
+                        let mx = self.expect_num()? as u32;
+                        min_depth = mn;
+                        max_depth = mx;
+                    } else {
+                        // *N alone means exactly N hops
+                        min_depth = mn;
+                        max_depth = mn;
+                    }
+                }
+                // bare '*' (no number) → keep defaults (1..1 single hop)
+            }
+            // Consume any remaining tokens until ']' (forward-compat)
             loop {
                 match self.peek() {
                     Tok::RBracket | Tok::Eof => break,
@@ -3578,12 +3597,14 @@ impl Parser {
             let node_bind = self.expect_ident()?;
             if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; } // skip :col
             self.expect_rparen()?;
-            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind });
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth });
         }
 
         // ── WHERE clause (optional) ───────────────────────────────────────
-        // Supported: WHERE start_var._key = 'slug'  — refines Collection → Slug.
-        // Multiple AND conditions are parsed but only _key on the start var acts.
+        // Two kinds of conditions:
+        //   1. start_var._key = 'value'  → upgrades MatchAggStart to Slug (fast seed)
+        //   2. any_var.field  = value    → stored in dest_where for post-traversal filter
+        let mut dest_where: Vec<(String, String, serde_json::Value)> = Vec::new();
         if matches!(self.peek(), Tok::Kw(Kw::Where)) {
             self.advance(); // consume WHERE
             loop {
@@ -3600,21 +3621,21 @@ impl Parser {
                 self.advance(); // consume '='
                 let cond_val = self.parse_value()?;
 
-                // _key on the start var upgrades MatchAggStart to Slug.
-                // Reconstruct full slug: if start has a collection label,
-                // slug = "label/key_value", else use the value as-is.
-                if cond_field == "_key" {
-                    if let Some(ref sv) = start_var {
-                        if *sv == cond_var {
-                            if let Some(key_val) = cond_val.as_str() {
-                                let full_slug = match start_label {
-                                    Some(ref lbl) => format!("{}/{}", lbl, key_val),
-                                    None => key_val.to_string(),
-                                };
-                                start = MatchAggStart::Slug(sk_hash(&full_slug));
-                            }
-                        }
+                let is_start_key = cond_field == "_key"
+                    && start_var.as_ref().map_or(false, |sv| *sv == cond_var);
+
+                if is_start_key {
+                    // Upgrade Collection → Slug for fast single-node seed.
+                    if let Some(key_val) = cond_val.as_str() {
+                        let full_slug = match start_label {
+                            Some(ref lbl) => format!("{}/{}", lbl, key_val),
+                            None => key_val.to_string(),
+                        };
+                        start = MatchAggStart::Slug(sk_hash(&full_slug));
                     }
+                } else {
+                    // Post-traversal equality filter on any hop-bound variable.
+                    dest_where.push((cond_var, cond_field, cond_val));
                 }
 
                 if matches!(self.peek(), Tok::Kw(Kw::And)) {
@@ -3685,7 +3706,7 @@ impl Parser {
             None
         };
 
-        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit })
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where })
     }
 
     /// Parse `SELECT return_list FROM MATCH (start)-[edge]->(node)... [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`
@@ -3742,6 +3763,23 @@ impl Parser {
                 _ => {}
             }
 
+            // Optional depth: *min..max or *N
+            let (mut min_depth, mut max_depth) = (1u32, 1u32);
+            if matches!(self.peek(), Tok::Star) {
+                self.advance();
+                if let Tok::Num(_) = self.peek().clone() {
+                    let mn = self.expect_num()? as u32;
+                    if matches!(self.peek(), Tok::DotDot) {
+                        self.advance();
+                        let mx = self.expect_num()? as u32;
+                        min_depth = mn;
+                        max_depth = mx;
+                    } else {
+                        min_depth = mn;
+                        max_depth = mn;
+                    }
+                }
+            }
             loop {
                 match self.peek() {
                     Tok::RBracket | Tok::Eof => break,
@@ -3761,10 +3799,11 @@ impl Parser {
             let node_bind = self.expect_ident()?;
             if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
             self.expect_rparen()?;
-            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind });
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth });
         }
 
         // ── WHERE (same as parse_match_agg_path) ──────────────────────────
+        let mut dest_where: Vec<(String, String, serde_json::Value)> = Vec::new();
         if matches!(self.peek(), Tok::Kw(Kw::Where)) {
             self.advance();
             loop {
@@ -3780,18 +3819,19 @@ impl Parser {
                 self.advance();
                 let cond_val = self.parse_value()?;
 
-                if cond_field == "_key" {
-                    if let Some(ref sv) = start_var {
-                        if *sv == cond_var {
-                            if let Some(key_val) = cond_val.as_str() {
-                                let full_slug = match start_label {
-                                    Some(ref lbl) => format!("{}/{}", lbl, key_val),
-                                    None => key_val.to_string(),
-                                };
-                                start = MatchAggStart::Slug(sk_hash(&full_slug));
-                            }
-                        }
+                let is_start_key = cond_field == "_key"
+                    && start_var.as_ref().map_or(false, |sv| *sv == cond_var);
+
+                if is_start_key {
+                    if let Some(key_val) = cond_val.as_str() {
+                        let full_slug = match start_label {
+                            Some(ref lbl) => format!("{}/{}", lbl, key_val),
+                            None => key_val.to_string(),
+                        };
+                        start = MatchAggStart::Slug(sk_hash(&full_slug));
                     }
+                } else {
+                    dest_where.push((cond_var, cond_field, cond_val));
                 }
 
                 if matches!(self.peek(), Tok::Kw(Kw::And)) {
@@ -3856,7 +3896,7 @@ impl Parser {
             None
         };
 
-        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit })
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where })
     }
 
     /// Parse `SELECT return_list FROM MATCH SHORTEST (a[:col])-[r*]->(b[:col])
@@ -4150,6 +4190,21 @@ impl Parser {
                                 Tok::Colon => { self.advance(); let et = self.expect_ident()?; edge_type_hash = sk_hash(&et); }
                                 _ => {}
                             }
+                            // Optional depth: *min..max or *N
+                            let (mut min_depth, mut max_depth) = (1u32, 1u32);
+                            if matches!(self.peek(), Tok::Star) {
+                                self.advance();
+                                if let Tok::Num(_) = self.peek().clone() {
+                                    let mn = self.expect_num()? as u32;
+                                    if matches!(self.peek(), Tok::DotDot) {
+                                        self.advance();
+                                        let mx = self.expect_num()? as u32;
+                                        min_depth = mn; max_depth = mx;
+                                    } else {
+                                        min_depth = mn; max_depth = mn;
+                                    }
+                                }
+                            }
                             loop { match self.peek() { Tok::RBracket | Tok::Eof => break, _ => { self.advance(); } } }
                             self.expect_rbracket()?;
                             if !matches!(self.peek(), Tok::Arrow) {
@@ -4160,7 +4215,7 @@ impl Parser {
                             let node_bind = self.expect_ident()?;
                             if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
                             self.expect_rparen()?;
-                            hops.push(crate::query::HopSpec { edge_type_hash, node_bind, edge_bind });
+                            hops.push(crate::query::HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth });
                         }
                         // Optional WHERE (only _key on start var acted on)
                         if matches!(self.peek(), Tok::Kw(Kw::Where)) {
@@ -4193,7 +4248,7 @@ impl Parser {
                             }
                         }
                         FromSource::Match(MatchAggStmt {
-                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, limit: None,
+                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, limit: None, dest_where: vec![],
                         })
                     }
                 }

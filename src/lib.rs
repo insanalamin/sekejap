@@ -367,6 +367,10 @@ pub struct CoreDB {
     /// Append-only byte slab for raw JSON payloads.
     /// All `NodeData` entries index into this store via `(payload_offset, payload_len)`.
     payload_store: PayloadStore,
+    /// Set to `true` during WAL replay in `open()`.
+    /// Guards expensive per-entry rebuilds (e.g. HNSW entry-point check in remove_raw)
+    /// that must not fire O(N) times during replay — open() handles those once at the end.
+    replaying: bool,
 }
 
 impl Default for CoreDB {
@@ -400,6 +404,7 @@ impl CoreDB {
             field_indexes: HashMap::new(),
             hnsw_params: HashMap::new(),
             payload_store: PayloadStore::new(),
+            replaying: false,
         }
     }
 
@@ -473,10 +478,10 @@ impl CoreDB {
 
         // One-time migration: if the snapshot was large (legacy had embedded gin_indexes),
         // rewrite it immediately as a clean compact snapshot so subsequent opens are fast.
-        // Threshold: 1 MB. A normal disk-backed snapshot with 500K nodes is ~50-80 MB,
-        // but we only want to rewrite if the file is bloated (2+ GB from gin_indexes).
-        // We use 50 MB as the threshold — anything larger is definitely bloated.
-        if snap_file_size > 50 * 1024 * 1024 {
+        // A normal disk-backed snapshot with 89k nodes is ~50-80 MB (pretty-printed).
+        // The legacy bloated variant (gin_indexes embedded as JSON) was 1-10 GB.
+        // Use 500 MB as the threshold — safely above any real snapshot, far below bloated ones.
+        if snap_file_size > 500 * 1024 * 1024 {
             if let Ok(snap_json) = serde_json::to_vec_pretty(&db.build_snapshot()) {
                 let snap_tmp = snap_path.with_extension("json.tmp");
                 if std::fs::write(&snap_tmp, &snap_json).is_ok() {
@@ -487,23 +492,29 @@ impl CoreDB {
 
         // 2. Replay WAL — stream one entry at a time to avoid loading all
         //    payloads into RAM simultaneously (critical for large datasets).
-        //    Track whether any data-mutating entries were present so we know
-        //    if in-memory indexes (GIN, HNSW) need a post-replay rebuild.
+        //    Track two separate flags:
+        //    - wal_had_payload: Put/Remove/PutVector — affects GIN text indexes
+        //    - wal_had_graph:   Link/LinkMeta/Unlink — only affects graph topology
+        //    GIN rebuild is expensive (reads every payload from disk); we must not
+        //    trigger it for edge-only WAL entries.
         let wal_path = dir.join("wal.log");
-        let mut wal_had_data = false;
+        let mut wal_had_payload = false;
+        let mut wal_had_graph   = false;
         if wal_path.exists() {
+            db.replaying = true;
             let corrupted = WalReader::open(&wal_path)?.replay_all(|entry| {
                 match &entry {
                     WalEntry::Put { .. }
                     | WalEntry::Remove { .. }
-                    | WalEntry::PutVector { .. }
-                    | WalEntry::Link { .. }
+                    | WalEntry::PutVector { .. } => wal_had_payload = true,
+                    WalEntry::Link { .. }
                     | WalEntry::LinkMeta { .. }
-                    | WalEntry::Unlink { .. } => wal_had_data = true,
+                    | WalEntry::Unlink { .. } => wal_had_graph = true,
                     _ => {}
                 }
                 db.replay(entry);
             });
+            db.replaying = false;
             if corrupted {
                 eprintln!(
                     "sekejap: WAL at `{}` had a corrupted frame — \
@@ -521,21 +532,25 @@ impl CoreDB {
 
         // 5. Rebuild GIN and HNSW when WAL added new data, or load GIN from the
         //    binary sidecar gin.bin (compact, fast — no JSON parsing overhead).
-        //    HNSW is always rebuilt when WAL had data (small enough to be fast).
+        //    GIN: only rebuild when payload-mutating entries (Put/Remove) were in WAL.
+        //    HNSW: rebuild when any data changed (payloads or vectors).
         let gin_bin_path = dir.join("gin.bin");
-        if wal_had_data {
-            // Data changed — rebuild GIN from payloads and refresh gin.bin.
+        if wal_had_payload {
+            // Payload changed — rebuild GIN + HNSW from current data and refresh gin.bin.
             db.rebuild_declared_gin_indexes();
             db.rebuild_declared_hnsw_indexes();
             let _ = db.save_gin_binary(&gin_bin_path);
         } else {
-            // WAL was empty (e.g. right after compact). Try loading GIN from
-            // gin.bin. If it is missing or stale, rebuild once and save it.
+            // No payload changes — try loading GIN from gin.bin. If missing or
+            // stale, rebuild once (covers first open after CREATE INDEX, etc.).
             if !db.load_gin_binary(&gin_bin_path) {
                 db.rebuild_declared_gin_indexes();
                 let _ = db.save_gin_binary(&gin_bin_path);
             }
+            // HNSW: rebuild only when vectors changed (PutVector is part of wal_had_payload,
+            // so here vectors are unchanged — no rebuild needed).
         }
+        let _ = wal_had_graph; // used only to determine topology was replayed (no index rebuild needed)
 
         Ok(db)
     }
@@ -741,6 +756,29 @@ impl CoreDB {
             // entries for this node so orphan vectors never accumulate.
             for field_vecs in self.vectors.values_mut() {
                 field_vecs.remove(&hash);
+            }
+
+            // If this node was the HNSW entry point, the graph can no longer
+            // navigate (search_layer returns [] when entry vector is missing).
+            // Rebuild affected HNSW indexes immediately — but NOT during WAL replay:
+            // open() calls rebuild_declared_hnsw_indexes() once at the end, which
+            // handles all removes in the WAL in a single O(N log N) pass.
+            if !self.replaying {
+                use crate::vector::{HnswGraph, CosineDistance};
+                let hnsw_rebuild: Vec<String> = self.hnsw_indexes
+                    .iter()
+                    .filter(|(_, g)| g.entry_point_id() == Some(hash))
+                    .map(|(f, _)| f.clone())
+                    .collect();
+                for field in hnsw_rebuild {
+                    match self.vectors.get(&field) {
+                        Some(field_vecs) => {
+                            let (m, ef) = self.hnsw_params.get(&field).copied().unwrap_or((16, 200));
+                            self.hnsw_indexes.insert(field, HnswGraph::build::<CosineDistance>(field_vecs, m, ef));
+                        }
+                        None => { self.hnsw_indexes.remove(&field); }
+                    }
+                }
             }
 
             // Incrementally update BM25 indexes: adjusts the running
@@ -1944,6 +1982,80 @@ impl CoreDB {
         Some((head, tail))
     }
 
+    /// Read raw JSON bytes for multiple nodes with minimal I/O syscalls.
+    ///
+    /// Sorts hashes by `payload_offset`, groups nodes whose payloads are
+    /// close together (gap ≤ `MAX_GAP`) into one batch, and issues a single
+    /// `pread` per batch instead of one syscall per node.
+    ///
+    /// For sequentially-inserted data (the common case), all payloads in a
+    /// collection are contiguous in `payloads.bin`, so the entire collection
+    /// can be read in **one** syscall rather than O(N).
+    ///
+    /// Returns a `HashMap<u64, Vec<u8>>` of raw JSON bytes keyed by node hash.
+    pub(crate) fn read_raw_payloads_batched(&self, hashes: &[u64]) -> HashMap<u64, Vec<u8>> {
+        /// Bridge gaps between payload regions up to this many bytes.
+        const MAX_GAP: u64 = 16 * 1024;
+        /// Cap each batch read at 32 MB to keep peak RAM bounded.
+        const MAX_BATCH: usize = 32 * 1024 * 1024;
+
+        // Sort candidates by payload_offset for sequential I/O.
+        let mut sorted: Vec<(u64, u64, u32)> = hashes
+            .iter()
+            .filter_map(|&h| {
+                self.nodes
+                    .get(&h)
+                    .map(|nd| (h, nd.payload_offset, nd.payload_len))
+            })
+            .collect();
+        sorted.sort_unstable_by_key(|&(_, off, _)| off);
+
+        let mut result = HashMap::with_capacity(hashes.len());
+        let mut i = 0;
+
+        while i < sorted.len() {
+            let batch_off = sorted[i].1;
+            let mut j = i + 1;
+            let mut batch_end = sorted[i].1 + sorted[i].2 as u64;
+
+            // Extend batch while gap and size constraints hold.
+            while j < sorted.len() {
+                let (_, next_off, next_len) = sorted[j];
+                if next_off.saturating_sub(batch_end) > MAX_GAP {
+                    break;
+                }
+                let cand_end = next_off + next_len as u64;
+                if (cand_end.saturating_sub(batch_off)) as usize > MAX_BATCH {
+                    break;
+                }
+                batch_end = batch_end.max(cand_end);
+                j += 1;
+            }
+
+            // One read for the entire contiguous region.
+            let batch_len = (batch_end - batch_off) as usize;
+            if let Some(buf) = self.payload_store.get_raw_at(batch_off, batch_len) {
+                for &(hash, off, len) in &sorted[i..j] {
+                    let start = (off - batch_off) as usize;
+                    let end = start + len as usize;
+                    if end <= buf.len() {
+                        result.insert(hash, buf[start..end].to_vec());
+                    }
+                }
+            } else {
+                // Fallback: read each node individually on I/O error.
+                for &(hash, off, len) in &sorted[i..j] {
+                    if let Some(raw) = self.payload_store.get_raw(off, len) {
+                        result.insert(hash, raw);
+                    }
+                }
+            }
+            i = j;
+        }
+
+        result
+    }
+
     /// Check if a node exists.
     pub fn contains(&self, slug: &str) -> bool {
         self.nodes.contains_key(&sk_hash(slug))
@@ -2871,6 +2983,30 @@ impl CoreDB {
         self.collections.get(&hash)
     }
 
+    /// Return the btree index for `(collection_hash, field)` if one exists.
+    /// Used by the query executor for index-only scans (GROUP BY, DISTINCT, etc.).
+    pub(crate) fn field_index(
+        &self,
+        coll_hash: u64,
+        field: &str,
+    ) -> Option<&BTreeMap<FieldKey, Vec<u64>>> {
+        self.field_indexes.get(&(coll_hash, field.to_string()))
+    }
+
+    /// Convert a `FieldKey` to a `serde_json::Value` for result projection.
+    pub(crate) fn field_key_to_value(key: &FieldKey) -> Value {
+        match key {
+            FieldKey::Null        => Value::Null,
+            FieldKey::Bool(b)     => Value::Bool(*b),
+            FieldKey::Number(OrdF64(f)) => {
+                serde_json::Number::from_f64(*f)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null)
+            }
+            FieldKey::Str(s)      => Value::String(s.clone()),
+        }
+    }
+
     pub(crate) fn spatial_grid(&self) -> Option<&geo::SpatialGrid> {
         self.spatial_grid.as_ref()
     }
@@ -3073,10 +3209,15 @@ impl CoreDB {
     /// * `pattern` - ILIKE pattern (e.g., "%Alpha%")
     /// * `limit` - Maximum results (None for all)
     pub fn gin_ilike(&self, field: &str, pattern: &str, limit: Option<usize>) -> Vec<u64> {
+        // Belt-and-suspenders: filter out hashes whose nodes were deleted after
+        // the GIN index was last built.  Mirrors the same guard in bm25_search().
         self.gin_indexes
             .get(field)
             .map(|idx| idx.ilike(pattern, limit))
             .unwrap_or_default()
+            .into_iter()
+            .filter(|h| self.nodes.contains_key(h))
+            .collect()
     }
 
     // ── BM25 full-text search ───────────────────────────────────────────────
@@ -3267,62 +3408,171 @@ impl CoreDB {
     ///
     /// Looks ahead in `remaining` for the first filter step that has a btree
     /// index on this collection. Returns `(candidates, skip_idx)` on a hit,
-    /// where `skip_idx` is the index in `remaining` of the step that was consumed
-    /// (so the caller can skip it in the main pipeline loop). Returns `None` to
-    /// fall back to a full collection scan.
-    pub(crate) fn btree_seed(&self, coll_hash: u64, remaining: &[Step]) -> Option<(Vec<u64>, usize)> {
+    /// where `skip_j` is the index in `remaining` of the step that was consumed
+    /// (so the caller can skip it in the main pipeline loop). The optional third
+    /// element is a second consumed step index (e.g. the upper-bound companion
+    /// for a two-sided range like `WhereGt + WhereLte`). Returns `None` to fall
+    /// back to a full collection scan.
+    pub(crate) fn btree_seed(
+        &self,
+        coll_hash: u64,
+        remaining: &[Step],
+    ) -> Option<(Vec<u64>, usize, Option<usize>)> {
         use std::ops::Bound;
         for (j, step) in remaining.iter().enumerate() {
             match step {
                 Step::WhereEq(field, value) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
                         if let Some(fk) = FieldKey::from_json(value) {
-                            return Some((idx.get(&fk).cloned().unwrap_or_default(), j));
+                            return Some((idx.get(&fk).cloned().unwrap_or_default(), j, None));
                         }
                     }
                 }
-                Step::WhereGt(field, t) => {
+                Step::WhereNeq(field, value) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
-                        let fk = FieldKey::from_f64(*t);
-                        return Some((
-                            idx.range((Bound::Excluded(fk), Bound::Unbounded))
-                                .flat_map(|(_, ids)| ids.iter().copied())
-                                .collect(),
-                            j,
-                        ));
+                        if let Some(fk) = FieldKey::from_json(value) {
+                            // Set-difference: all collection members minus those matching value.
+                            let excluded: std::collections::HashSet<u64> = idx
+                                .get(&fk)
+                                .map(|ids| ids.iter().copied().collect())
+                                .unwrap_or_default();
+                            let all = self.collections
+                                .get(&coll_hash)
+                                .cloned()
+                                .unwrap_or_default();
+                            return Some((
+                                all.into_iter().filter(|h| !excluded.contains(h)).collect(),
+                                j,
+                                None,
+                            ));
+                        }
                     }
                 }
-                Step::WhereLt(field, t) => {
+                Step::WhereGt(field, lo) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
-                        let fk = FieldKey::from_f64(*t);
-                        return Some((
-                            idx.range(..fk)
-                                .flat_map(|(_, ids)| ids.iter().copied())
-                                .collect(),
-                            j,
-                        ));
+                        let fk_lo = FieldKey::from_f64(*lo);
+                        // Look ahead: combine with WhereLte/WhereLt on same field into
+                        // a single btree range scan, consuming both steps.
+                        let upper = remaining[j + 1..].iter().enumerate().find_map(|(k, s)| {
+                            match s {
+                                Step::WhereLte(f2, hi) if f2 == field =>
+                                    Some((j + 1 + k, Bound::Included(FieldKey::from_f64(*hi)))),
+                                Step::WhereLt(f2, hi) if f2 == field =>
+                                    Some((j + 1 + k, Bound::Excluded(FieldKey::from_f64(*hi)))),
+                                _ => None,
+                            }
+                        });
+                        return if let Some((pair_j, upper_bound)) = upper {
+                            Some((
+                                idx.range((Bound::Excluded(fk_lo), upper_bound))
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                                j,
+                                Some(pair_j),
+                            ))
+                        } else {
+                            Some((
+                                idx.range((Bound::Excluded(fk_lo), Bound::Unbounded))
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                                j,
+                                None,
+                            ))
+                        };
                     }
                 }
-                Step::WhereGte(field, t) => {
+                Step::WhereLt(field, hi) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
-                        let fk = FieldKey::from_f64(*t);
-                        return Some((
-                            idx.range(fk..)
-                                .flat_map(|(_, ids)| ids.iter().copied())
-                                .collect(),
-                            j,
-                        ));
+                        let fk_hi = FieldKey::from_f64(*hi);
+                        // Look ahead for lower bound on same field.
+                        let lower = remaining[j + 1..].iter().enumerate().find_map(|(k, s)| {
+                            match s {
+                                Step::WhereGte(f2, lo) if f2 == field =>
+                                    Some((j + 1 + k, Bound::Included(FieldKey::from_f64(*lo)))),
+                                Step::WhereGt(f2, lo) if f2 == field =>
+                                    Some((j + 1 + k, Bound::Excluded(FieldKey::from_f64(*lo)))),
+                                _ => None,
+                            }
+                        });
+                        return if let Some((pair_j, lower_bound)) = lower {
+                            Some((
+                                idx.range((lower_bound, Bound::Excluded(fk_hi)))
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                                j,
+                                Some(pair_j),
+                            ))
+                        } else {
+                            Some((
+                                idx.range(..fk_hi)
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                                j,
+                                None,
+                            ))
+                        };
                     }
                 }
-                Step::WhereLte(field, t) => {
+                Step::WhereGte(field, lo) => {
                     if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
-                        let fk = FieldKey::from_f64(*t);
-                        return Some((
-                            idx.range(..=fk)
-                                .flat_map(|(_, ids)| ids.iter().copied())
-                                .collect(),
-                            j,
-                        ));
+                        let fk_lo = FieldKey::from_f64(*lo);
+                        let upper = remaining[j + 1..].iter().enumerate().find_map(|(k, s)| {
+                            match s {
+                                Step::WhereLte(f2, hi) if f2 == field =>
+                                    Some((j + 1 + k, Bound::Included(FieldKey::from_f64(*hi)))),
+                                Step::WhereLt(f2, hi) if f2 == field =>
+                                    Some((j + 1 + k, Bound::Excluded(FieldKey::from_f64(*hi)))),
+                                _ => None,
+                            }
+                        });
+                        return if let Some((pair_j, upper_bound)) = upper {
+                            Some((
+                                idx.range((Bound::Included(fk_lo), upper_bound))
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                                j,
+                                Some(pair_j),
+                            ))
+                        } else {
+                            Some((
+                                idx.range(fk_lo..)
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                                j,
+                                None,
+                            ))
+                        };
+                    }
+                }
+                Step::WhereLte(field, hi) => {
+                    if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
+                        let fk_hi = FieldKey::from_f64(*hi);
+                        let lower = remaining[j + 1..].iter().enumerate().find_map(|(k, s)| {
+                            match s {
+                                Step::WhereGte(f2, lo) if f2 == field =>
+                                    Some((j + 1 + k, Bound::Included(FieldKey::from_f64(*lo)))),
+                                Step::WhereGt(f2, lo) if f2 == field =>
+                                    Some((j + 1 + k, Bound::Excluded(FieldKey::from_f64(*lo)))),
+                                _ => None,
+                            }
+                        });
+                        return if let Some((pair_j, lower_bound)) = lower {
+                            Some((
+                                idx.range((lower_bound, Bound::Included(fk_hi)))
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                                j,
+                                Some(pair_j),
+                            ))
+                        } else {
+                            Some((
+                                idx.range(..=fk_hi)
+                                    .flat_map(|(_, ids)| ids.iter().copied())
+                                    .collect(),
+                                j,
+                                None,
+                            ))
+                        };
                     }
                 }
                 Step::WhereBetween(field, lo, hi) => {
@@ -3334,6 +3584,7 @@ impl CoreDB {
                                 .flat_map(|(_, ids)| ids.iter().copied())
                                 .collect(),
                             j,
+                            None,
                         ));
                     }
                 }
@@ -3346,14 +3597,15 @@ impl CoreDB {
     /// Try to seed the candidate list for a `Collection` step using an ORDER BY index scan.
     ///
     /// Applies when there are **no filter steps** between `Collection` and `Sort`, the
-    /// sort is single-column, and a btree index exists on that field. The candidates are
-    /// returned pre-sorted; the subsequent `Sort` step then runs on a small set (k items
-    /// for `LIMIT k`) rather than the full collection.
+    /// sort is single-column, and a btree index exists on that field.  Returns the
+    /// pre-sorted candidates **and** the index of the `Sort` step in `remaining`
+    /// (so the caller can add it to `skip_set` — data is already sorted, no
+    /// payload-reading re-sort needed).
     pub(crate) fn btree_sorted_seed_from_steps(
         &self,
         coll_hash: u64,
         remaining: &[Step],
-    ) -> Option<Vec<u64>> {
+    ) -> Option<(Vec<u64>, usize)> {
         // Find the first Sort step
         let sort_pos = remaining.iter().position(|s| matches!(s, Step::Sort(_)))?;
 
@@ -3385,10 +3637,11 @@ impl CoreDB {
             idx.values().rev().flat_map(|ids| ids.iter().copied()).collect()
         };
 
-        Some(match take_n {
+        let candidates = match take_n {
             Some(n) => result.into_iter().take(n).collect(),
             None => result,
-        })
+        };
+        Some((candidates, sort_pos))
     }
 
     /// Build (or rebuild) an HNSW approximate-NN index for a vector field.
