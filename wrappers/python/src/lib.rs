@@ -1,7 +1,8 @@
 //! Python bindings for sekejap via PyO3.
 
-use pyo3::exceptions::PyIOError;
+use pyo3::exceptions::{PyIOError, PyTypeError};
 use pyo3::prelude::*;
+use serde_json::Value;
 
 use ::sekejap::CoreDB;
 use ::sekejap::EdgeHit;
@@ -90,6 +91,25 @@ fn to_pyedgehit(e: EdgeHit) -> PyEdgeHit {
 
 fn db_err(e: impl std::fmt::Display) -> PyErr {
     PyIOError::new_err(e.to_string())
+}
+
+/// Convert a Python list of values to `Vec<serde_json::Value>`.
+fn py_list_to_values(py: Python<'_>, objs: Vec<PyObject>) -> PyResult<Vec<Value>> {
+    objs.into_iter().map(|o| {
+        // bool must come before i64 (Python bool is a subclass of int)
+        if let Ok(b) = o.extract::<bool>(py)   { return Ok(Value::Bool(b)); }
+        if let Ok(i) = o.extract::<i64>(py)    { return Ok(serde_json::json!(i)); }
+        if let Ok(f) = o.extract::<f64>(py)    { return Ok(serde_json::json!(f)); }
+        if let Ok(s) = o.extract::<String>(py) { return Ok(Value::String(s)); }
+        if o.is_none(py)                        { return Ok(Value::Null); }
+        // Vec<f32> for vector params
+        if let Ok(v) = o.extract::<Vec<f32>>(py) {
+            return Ok(Value::Array(v.into_iter().map(|f| serde_json::json!(f as f64)).collect()));
+        }
+        Err(PyTypeError::new_err(
+            "parameter must be str, int, float, bool, None, or list[float]"
+        ))
+    }).collect()
 }
 
 // ── PyDB ──────────────────────────────────────────────────────────────────────
@@ -190,6 +210,23 @@ impl PyDB {
     ///         GROUP BY b._key ORDER BY rivals DESC LIMIT 10
     ///     """)
     ///
+    ///     # Multi-stage graph query with WITH chaining
+    ///     db.query("""
+    ///         SELECT c.name AS city, COUNT(*) AS friends
+    ///         FROM MATCH (a:users)-[:knows*1..3]->(b:users)
+    ///         WHERE a._key = 'alice'
+    ///         WITH b
+    ///         MATCH (b)-[:lives_in]->(c:cities)
+    ///         WHERE c.population > 100000
+    ///         GROUP BY c.name ORDER BY friends DESC LIMIT 10
+    ///     """)
+    ///
+    ///     # MATCH...RETURN (Cypher-style syntax, also via query())
+    ///     db.query("""
+    ///         MATCH (a:characters)-[:rival]->(b:characters)
+    ///         RETURN a._key AS name, b.bounty AS rival_bounty
+    ///     """)
+    ///
     ///     # PATH_* aggregates — operate on path intrinsic arrays
     ///     db.query("""
     ///         SELECT c._key AS dest, PATH_PRODUCT(r2._path_strength) AS reliability
@@ -216,22 +253,38 @@ impl PyDB {
     ///         SELECT a._key AS island, b._key AS character
     ///         FROM islands AS a, MATCH ('crews/straw_hats')-[:includes]->(b)
     ///     """)
-    fn query(&self, sql: &str) -> PyResult<Vec<PyHit>> {
-        let hits: Vec<Hit> = self.db()?.query(sql).map_err(db_err)?.collect();
+    ///
+    /// Optionally pass ``params`` for ``$1``, ``$2``, … bindings.
+    ///
+    /// Example::
+    ///
+    ///     db.query("SELECT * FROM users WHERE name = $1 AND age > $2", ["Alice", 25])
+    #[pyo3(signature = (sql, params=None))]
+    fn query(&self, py: Python<'_>, sql: &str, params: Option<Vec<PyObject>>) -> PyResult<Vec<PyHit>> {
+        let hits: Vec<Hit> = if let Some(p) = params {
+            let vals = py_list_to_values(py, p)?;
+            self.db()?.query_params(sql, &vals).map_err(db_err)?.collect()
+        } else {
+            self.db()?.query(sql).map_err(db_err)?.collect()
+        };
         Ok(hits.into_iter().map(to_pyhit).collect())
     }
 
     /// Execute a mutating statement (INSERT / UPDATE / DELETE / CREATE / DROP).
     ///
-    /// Returns the number of rows affected.
-    fn execute(&mut self, sql: &str) -> PyResult<usize> {
-        self.db_mut()?.execute(sql).map_err(db_err)
-    }
-
-    /// Execute a MATCH + WITH pipeline query.
-    fn pipeline_query(&self, sql: &str) -> PyResult<Vec<PyHit>> {
-        Ok(self.db()?.pipeline_query(sql).map_err(db_err)?
-            .into_iter().map(to_pyhit).collect())
+    /// Returns the number of rows affected. Optionally pass ``params`` for ``$1``, ``$2``, … bindings.
+    ///
+    /// Example::
+    ///
+    ///     db.execute("INSERT INTO users (_key, name, age) VALUES ($1, $2, $3)", ["u1", "Bob", 30])
+    #[pyo3(signature = (sql, params=None))]
+    fn execute(&mut self, py: Python<'_>, sql: &str, params: Option<Vec<PyObject>>) -> PyResult<usize> {
+        if let Some(p) = params {
+            let vals = py_list_to_values(py, p)?;
+            self.db_mut()?.execute_params(sql, &vals).map_err(db_err)
+        } else {
+            self.db_mut()?.execute(sql).map_err(db_err)
+        }
     }
 
     /// Execute a ``SHOW`` introspection statement.

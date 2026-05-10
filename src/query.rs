@@ -2,7 +2,7 @@
 
 use crate::{sk_hash, CoreDB, FieldKey};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
@@ -3015,7 +3015,7 @@ impl MathExpr {
 }
 
 /// Comparison operator for CASE WHEN conditions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CmpOp {
     Eq,
     Neq,
@@ -3023,6 +3023,45 @@ pub enum CmpOp {
     Gt,
     Lte,
     Gte,
+    ILike,
+}
+
+impl CmpOp {
+    /// Apply this operator to two JSON values.  Numbers compare numerically;
+    /// strings compare lexicographically; booleans and nulls support Eq/Neq only.
+    pub fn apply(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Number(n1), Value::Number(n2)) => {
+                let (x, y) = (n1.as_f64().unwrap_or(0.0), n2.as_f64().unwrap_or(0.0));
+                match self {
+                    CmpOp::Eq  => x == y,
+                    CmpOp::Neq => x != y,
+                    CmpOp::Lt  => x <  y,
+                    CmpOp::Lte => x <= y,
+                    CmpOp::Gt  => x >  y,
+                    CmpOp::Gte => x >= y,
+                    CmpOp::ILike => false,
+                }
+            }
+            (Value::String(s1), Value::String(s2)) => match self {
+                CmpOp::Eq  => s1 == s2,
+                CmpOp::Neq => s1 != s2,
+                CmpOp::Lt  => s1 <  s2,
+                CmpOp::Lte => s1 <= s2,
+                CmpOp::Gt  => s1 >  s2,
+                CmpOp::Gte => s1 >= s2,
+                CmpOp::ILike => crate::text_index::query::ilike_matches(s1, s2),
+            },
+            (Value::Bool(b1), Value::Bool(b2)) => match self {
+                CmpOp::Eq  => b1 == b2,
+                CmpOp::Neq => b1 != b2,
+                _          => false,
+            },
+            (Value::Null, Value::Null) => matches!(self, CmpOp::Eq),
+            (Value::Null, _) | (_, Value::Null) => matches!(self, CmpOp::Neq),
+            _ => false,
+        }
+    }
 }
 
 /// A single CASE WHEN condition: `var.field op literal`.
@@ -3318,6 +3357,7 @@ fn eval_cmp(actual: &Value, op: &CmpOp, rhs: &Value) -> bool {
         CmpOp::Gt  => cmp_ordered(actual, rhs) == Some(std::cmp::Ordering::Greater),
         CmpOp::Lte => matches!(cmp_ordered(actual, rhs), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
         CmpOp::Gte => matches!(cmp_ordered(actual, rhs), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+        CmpOp::ILike => op.apply(actual, rhs),
     }
 }
 
@@ -3396,6 +3436,119 @@ pub struct HopSpec {
     /// Maximum traversal depth (inclusive). 1 for a plain single-hop `-[:e]->`.
     /// When `max_depth > 1`, `collect_paths` uses batch BFS instead of per-node DFS.
     pub max_depth: u32,
+    /// Collection label on the destination node pattern (e.g. `"boundary"` from `(b:boundary)`).
+    /// Used by [`try_reverse_anchor`] to validate collection membership.
+    pub node_label: Option<String>,
+}
+
+// ── DestWhere / WhereValue ────────────────────────────────────────────────────
+
+/// A single WHERE condition: `var.field <op> value`.
+#[derive(Clone, Debug)]
+pub struct DestWhere {
+    pub var: String,
+    pub field: String,
+    pub op: CmpOp,
+    pub value: WhereValue,
+}
+
+/// Right-hand side of a WHERE condition.
+#[derive(Clone, Debug)]
+pub enum WhereValue {
+    /// A literal JSON value.
+    Literal(Value),
+    /// Reference to a prior WITH alias (row key).
+    RowRef(String),
+}
+
+// ── WithStage / WithOutExpr / WithExpr ───────────────────────────────────────
+
+/// One WITH ... MATCH ... stage in a multi-stage query.
+#[derive(Clone, Debug)]
+pub struct WithStage {
+    /// WITH projections: `(expression, alias)`.
+    pub outputs: Vec<(WithOutExpr, String)>,
+    /// The starting point for this stage's MATCH pattern.
+    pub match_start: MatchAggStart,
+    /// Variable name bound to the start node.
+    pub match_start_var: Option<String>,
+    /// Hop chain for this stage.
+    pub match_hops: Vec<HopSpec>,
+    /// WHERE conditions for this stage (may include RowRef values).
+    pub where_clauses: Vec<DestWhere>,
+}
+
+/// Output expression in a `WITH` clause.
+#[derive(Clone, Debug)]
+pub enum WithOutExpr {
+    Scalar(WithExpr),
+    Sum(WithExpr),
+    Avg(WithExpr),
+    Min(WithExpr),
+    Max(WithExpr),
+    Count,
+}
+
+impl WithOutExpr {
+    pub fn is_agg(&self) -> bool {
+        !matches!(self, WithOutExpr::Scalar(_))
+    }
+}
+
+/// Math expression used inside WITH projections — operates on intermediate rows.
+#[derive(Clone, Debug)]
+pub enum WithExpr {
+    /// `var.field` — access a field inside a bound node payload.
+    VarField { var: String, field: String },
+    /// `key` — access a top-level row value (e.g. a WITH alias).
+    RowKey(String),
+    /// Numeric literal.
+    Literal(f64),
+    Mul(Box<WithExpr>, Box<WithExpr>),
+    Add(Box<WithExpr>, Box<WithExpr>),
+    Sub(Box<WithExpr>, Box<WithExpr>),
+    Div(Box<WithExpr>, Box<WithExpr>),
+}
+
+/// One row in the WITH pipeline: maps bind names and aliases to JSON values.
+pub type WithRow = HashMap<String, Value>;
+
+impl WithExpr {
+    /// Evaluate to f64 (for aggregate computations).
+    pub fn eval(&self, row: &WithRow) -> f64 {
+        match self {
+            WithExpr::VarField { var, field } => row
+                .get(var.as_str())
+                .and_then(|v| v.get(field.as_str()))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            WithExpr::RowKey(key) => row
+                .get(key.as_str())
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            WithExpr::Literal(n) => *n,
+            WithExpr::Mul(a, b) => a.eval(row) * b.eval(row),
+            WithExpr::Add(a, b) => a.eval(row) + b.eval(row),
+            WithExpr::Sub(a, b) => a.eval(row) - b.eval(row),
+            WithExpr::Div(a, b) => {
+                let d = b.eval(row);
+                if d == 0.0 { 0.0 } else { a.eval(row) / d }
+            }
+        }
+    }
+
+    /// Evaluate to a JSON Value (preserves string type for scalar projections).
+    pub fn eval_as_value(&self, row: &WithRow) -> Value {
+        match self {
+            WithExpr::VarField { var, field } => row
+                .get(var.as_str())
+                .and_then(|v| v.get(field.as_str()))
+                .cloned()
+                .unwrap_or(Value::Null),
+            WithExpr::RowKey(key) => row.get(key.as_str()).cloned().unwrap_or(Value::Null),
+            _ => serde_json::json!(self.eval(row)),
+        }
+    }
 }
 
 /// A fully parsed and compiled MATCH aggregate statement.
@@ -3419,10 +3572,12 @@ pub struct MatchAggStmt {
     pub order_by: Option<(String, bool)>,
     /// `LIMIT n`.
     pub limit: Option<usize>,
-    /// Post-traversal equality filters on hop-bound variables.
-    /// `WHERE b.level = 1` → `[("b", "level", Value::Number(1))]`.
+    /// Post-traversal filters on hop-bound variables.
+    /// `WHERE b.level = 1` → `DestWhere { var: "b", field: "level", op: Eq, value: Literal(1) }`.
     /// Applied after topology traversal, before grouping.
-    pub dest_where: Vec<(String, String, serde_json::Value)>,
+    pub dest_where: Vec<DestWhere>,
+    /// Optional WITH stages for multi-stage queries.
+    pub with_stages: Option<Vec<WithStage>>,
 }
 
 /// Topology-only path skeleton returned by [`collect_raw_paths`].
@@ -3650,6 +3805,97 @@ fn collect_final_dest_counts(
     HashMap::new() // unreachable: loop always returns on last hop
 }
 
+/// Try to reverse a single-depth MATCH traversal when the destination can be
+/// resolved to a small set of nodes, avoiding a full forward scan from all starts.
+///
+/// Two strategies:
+/// 1. **_key anchor**: `WHERE b._key = 'slug'` → resolve to 1 hash via `sk_hash`.
+/// 2. **Collection pre-filter**: destination has a collection label AND at least one
+///    equality condition → scan only that collection, filter by condition, then
+///    reverse-walk from the (small) matching set.
+///
+/// Returns `Some(raw_paths)` if the reversal is applicable, `None` otherwise.
+/// The returned paths are in forward orientation (start→dest).
+fn try_reverse_anchor(
+    db: &CoreDB,
+    starts: &[u64],
+    hops: &[HopSpec],
+    dest_where: &[DestWhere],
+) -> Option<Vec<RawPath>> {
+    // Guard: single hop only, max_depth == 1.
+    if hops.len() != 1 || hops[0].max_depth != 1 {
+        return None;
+    }
+    let hop = &hops[0];
+    let dest_bind = &hop.node_bind;
+
+    // Find a `_key = 'literal'` Eq condition on the destination variable.
+    let key_cond = dest_where.iter().find(|dw| {
+        dw.var == *dest_bind
+            && dw.field == "_key"
+            && matches!(dw.op, CmpOp::Eq)
+            && matches!(&dw.value, WhereValue::Literal(v) if v.is_string())
+    });
+
+    let dest_hashes: Vec<u64> = if let Some(kc) = key_cond {
+        let key_val = match &kc.value {
+            WhereValue::Literal(v) => v.as_str()?,
+            _ => return None,
+        };
+        let slug = match &hop.node_label {
+            Some(label) => format!("{}/{}", label, key_val),
+            None => key_val.to_string(),
+        };
+        let h = sk_hash(&slug);
+        if db.node_data(h).is_some() { vec![h] } else { return Some(vec![]) }
+    } else {
+        // No _key condition found — reverse anchor is not applicable.
+        // Non-_key field filters (name, ILIKE, etc.) are handled by the normal
+        // forward path + filter_raw_by_dest_where which only reads unique dest
+        // payloads after topology traversal.
+        return None;
+    };
+
+    if dest_hashes.is_empty() {
+        return Some(vec![]);
+    }
+
+    // Build a set of valid start hashes for O(1) membership checking.
+    let start_set: HashSet<u64> = starts.iter().copied().collect();
+
+    // Walk reverse edges from each destination node.
+    let mut raw_paths = Vec::new();
+    for &dest_hash in &dest_hashes {
+        let dest_slug = match db.node_data(dest_hash) {
+            Some(n) => n.slug.clone(),
+            None => continue,
+        };
+        let rev = match db.rev_edges(dest_hash) {
+            Some(r) => r,
+            None => continue,
+        };
+        for e in rev {
+            if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                continue;
+            }
+            if !start_set.contains(&e.other) {
+                continue;
+            }
+            let source_node = match db.node_data(e.other) {
+                Some(n) => n,
+                None => continue,
+            };
+            raw_paths.push(RawPath {
+                start_hash: e.other,
+                dest_per_hop: vec![dest_hash],
+                slugs_per_hop: vec![source_node.slug.clone(), dest_slug.clone()],
+                strengths_per_hop: vec![e.strength],
+            });
+        }
+    }
+    Some(raw_paths)
+}
+
 /// Collect all complete paths from `starts` through the hop chain.
 ///
 /// Build [`PathRow`]s from pre-collected raw paths.
@@ -3743,27 +3989,191 @@ pub(crate) fn build_path_rows_from_raw(
 fn filter_raw_by_dest_where(
     db: &CoreDB,
     raw: Vec<RawPath>,
-    conditions: &[(String, String, serde_json::Value)],
+    conditions: &[DestWhere],
     var_to_hop: &HashMap<&str, usize>,
 ) -> Vec<RawPath> {
     const FAST_PATH_THRESHOLD: u32 = 64 * 1024;
 
     // Fields required by conditions on hop variables.
     let where_fields: Vec<String> = conditions.iter()
-        .filter(|(v, _, _)| var_to_hop.contains_key(v.as_str()))
-        .map(|(_, f, _)| f.clone())
+        .filter(|dw| var_to_hop.contains_key(dw.var.as_str()))
+        .map(|dw| dw.field.clone())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
 
     if where_fields.is_empty() { return raw; } // all conditions are on start var
 
+    // ── Btree-index fast path ───────────────────────────────────────────────
+    // For each condition on a hop variable, if a btree index exists for that
+    // field on the destination collection, resolve matching hashes from the
+    // index directly — zero payload reads.
+    //
+    // Build per-condition match sets: HashSet<u64> of hashes that satisfy
+    // the condition.  For non-indexed conditions, set is None (must fall
+    // back to payload reads).
+    let mut index_match_sets: Vec<Option<HashSet<u64>>> = Vec::with_capacity(conditions.len());
+    let mut all_indexed = true;
+    for dw in conditions {
+        if !var_to_hop.contains_key(dw.var.as_str()) {
+            // Start-var condition — not our responsibility, always passes.
+            index_match_sets.push(None);
+            continue;
+        }
+        let literal_val = match &dw.value {
+            WhereValue::Literal(v) => v,
+            WhereValue::RowRef(_) => {
+                index_match_sets.push(None);
+                all_indexed = false;
+                continue;
+            }
+        };
+        // Try to find a btree index for this field.
+        // Determine collection hash from the hop's node_label or from the
+        // raw paths themselves.
+        let hi = var_to_hop[dw.var.as_str()];
+        // Try to get collection from node data of first matching dest hash.
+        let coll_hash = raw.iter()
+            .find_map(|rp| rp.dest_per_hop.get(hi).copied())
+            .and_then(|h| db.node_data(h))
+            .map(|nd| sk_hash(&nd.collection))
+            .unwrap_or(0);
+
+        if coll_hash == 0 {
+            index_match_sets.push(None);
+            all_indexed = false;
+            continue;
+        }
+
+        if let Some(btree) = db.field_index(coll_hash, &dw.field) {
+            match dw.op {
+                CmpOp::Eq => {
+                    if let Some(fk) = FieldKey::from_json(literal_val) {
+                        let matches: HashSet<u64> = btree.get(&fk)
+                            .map(|v| v.iter().copied().collect())
+                            .unwrap_or_default();
+                        index_match_sets.push(Some(matches));
+                        continue;
+                    }
+                }
+                CmpOp::Neq => {
+                    if let Some(fk) = FieldKey::from_json(literal_val) {
+                        let excluded: HashSet<u64> = btree.get(&fk)
+                            .map(|v| v.iter().copied().collect())
+                            .unwrap_or_default();
+                        let all: HashSet<u64> = btree.values()
+                            .flat_map(|v| v.iter().copied())
+                            .collect();
+                        let matches: HashSet<u64> = all.difference(&excluded).copied().collect();
+                        index_match_sets.push(Some(matches));
+                        continue;
+                    }
+                }
+                CmpOp::Gt => {
+                    if let Some(fk) = FieldKey::from_json(literal_val) {
+                        let matches: HashSet<u64> = btree.range((std::ops::Bound::Excluded(fk), std::ops::Bound::Unbounded))
+                            .flat_map(|(_, v)| v.iter().copied())
+                            .collect();
+                        index_match_sets.push(Some(matches));
+                        continue;
+                    }
+                }
+                CmpOp::Gte => {
+                    if let Some(fk) = FieldKey::from_json(literal_val) {
+                        let matches: HashSet<u64> = btree.range(fk..)
+                            .flat_map(|(_, v)| v.iter().copied())
+                            .collect();
+                        index_match_sets.push(Some(matches));
+                        continue;
+                    }
+                }
+                CmpOp::Lt => {
+                    if let Some(fk) = FieldKey::from_json(literal_val) {
+                        let matches: HashSet<u64> = btree.range(..fk)
+                            .flat_map(|(_, v)| v.iter().copied())
+                            .collect();
+                        index_match_sets.push(Some(matches));
+                        continue;
+                    }
+                }
+                CmpOp::Lte => {
+                    if let Some(fk) = FieldKey::from_json(literal_val) {
+                        let matches: HashSet<u64> = btree.range(..=fk)
+                            .flat_map(|(_, v)| v.iter().copied())
+                            .collect();
+                        index_match_sets.push(Some(matches));
+                        continue;
+                    }
+                }
+                CmpOp::ILike => {
+                    // ILIKE: iterate btree entries, match case-insensitively.
+                    // For patterns without wildcards, this is exact case-insensitive eq.
+                    // For patterns with %, use ilike_matches on each key.
+                    use crate::text_index::query::ilike_matches;
+                    if let Some(pattern) = literal_val.as_str() {
+                        let mut matches: HashSet<u64> = HashSet::new();
+                        for (key, node_hashes) in btree {
+                            if let FieldKey::Str(s) = key {
+                                if ilike_matches(s, pattern) {
+                                    matches.extend(node_hashes.iter().copied());
+                                }
+                            }
+                        }
+                        index_match_sets.push(Some(matches));
+                        continue;
+                    }
+                }
+            }
+        }
+        // No index or unsupported op — mark for payload fallback.
+        index_match_sets.push(None);
+        all_indexed = false;
+    }
+
+    // If ALL conditions are resolved via btree indexes, skip payload reads entirely.
+    if all_indexed {
+        return raw.into_iter().filter(|rp| {
+            conditions.iter().zip(index_match_sets.iter()).all(|(dw, match_set)| {
+                match var_to_hop.get(dw.var.as_str()) {
+                    None => true,
+                    Some(&hi) => {
+                        let h = rp.dest_per_hop.get(hi).copied().unwrap_or(0);
+                        match match_set {
+                            Some(set) => set.contains(&h),
+                            None => true, // start var, always passes
+                        }
+                    }
+                }
+            })
+        }).collect();
+    }
+
+    // ── Fallback: payload-based filtering ───────────────────────────────────
+    // Pre-filter raw paths using any available index match sets, then load
+    // payloads only for conditions without indexes.
+    let raw = if index_match_sets.iter().any(|s| s.is_some()) {
+        // Some conditions have indexes — pre-filter using those.
+        raw.into_iter().filter(|rp| {
+            conditions.iter().zip(index_match_sets.iter()).all(|(dw, match_set)| {
+                if let Some(set) = match_set {
+                    if let Some(&hi) = var_to_hop.get(dw.var.as_str()) {
+                        let h = rp.dest_per_hop.get(hi).copied().unwrap_or(0);
+                        return set.contains(&h);
+                    }
+                }
+                true // no index — will check via payload below
+            })
+        }).collect()
+    } else {
+        raw
+    };
+
     // Unique dest hashes referenced by hop conditions, sorted by payload offset.
-    let mut unique_dests: Vec<u64> = {
+    let unique_dests: Vec<u64> = {
         let mut seen: HashSet<u64> = HashSet::new();
         for rp in &raw {
-            for (cond_var, _, _) in conditions {
-                if let Some(&hi) = var_to_hop.get(cond_var.as_str()) {
+            for dw in conditions {
+                if let Some(&hi) = var_to_hop.get(dw.var.as_str()) {
                     if let Some(&h) = rp.dest_per_hop.get(hi) {
                         seen.insert(h);
                     }
@@ -3798,16 +4208,22 @@ fn filter_raw_by_dest_where(
         })
         .collect();
 
-    // Retain only raw paths whose hop-variable payloads satisfy all conditions.
+    // Retain only raw paths whose hop-variable payloads satisfy non-indexed conditions.
     raw.into_iter().filter(|rp| {
-        conditions.iter().all(|(cond_var, cond_field, cond_val)| {
-            match var_to_hop.get(cond_var.as_str()) {
-                None => true, // start var or unknown — not our responsibility here
+        conditions.iter().zip(index_match_sets.iter()).all(|(dw, match_set)| {
+            // Skip conditions already resolved via index.
+            if match_set.is_some() { return true; }
+            let literal_val = match &dw.value {
+                WhereValue::Literal(v) => v,
+                WhereValue::RowRef(_) => return true,
+            };
+            match var_to_hop.get(dw.var.as_str()) {
+                None => true,
                 Some(&hi) => {
                     let h = rp.dest_per_hop.get(hi).copied().unwrap_or(0);
                     payload_cache.get(&h)
-                        .and_then(|p| p.get(cond_field.as_str()))
-                        .map_or(false, |v| values_eq(v, cond_val))
+                        .and_then(|p| p.get(dw.field.as_str()))
+                        .map_or(false, |v| dw.op.apply(v, literal_val))
                 }
             }
         })
@@ -3831,10 +4247,472 @@ pub fn collect_paths(
     build_path_rows_from_raw(db, &raw, hops, start_var)
 }
 
+// ── Multi-stage executor (WITH chaining) ─────────────────────────────────────
+
+/// Check if a node belongs to a collection (by collection name hash).
+fn node_in_collection(db: &CoreDB, hash: u64, col_hash: u64) -> bool {
+    db.node_data(hash)
+        .map(|n| !n.collection.is_empty() && crate::sk_hash(&n.collection) == col_hash)
+        .unwrap_or(false)
+}
+
+/// Resolve starting node hashes for a `MatchAggStart`.
+fn resolve_match_start(db: &CoreDB, start: &MatchAggStart) -> Vec<u64> {
+    match start {
+        MatchAggStart::Slug(h) => {
+            if db.node_data(*h).is_some() { vec![*h] } else { vec![] }
+        }
+        MatchAggStart::Collection(h) => {
+            db.collection_members(*h).cloned().unwrap_or_default()
+        }
+        MatchAggStart::All => db.all_hashes(),
+    }
+}
+
+/// Expand a MATCH stage: for each existing row, resolve the start nodes,
+/// then DFS through the hop chain binding node payloads.
+fn expand_match_stage(
+    db: &CoreDB,
+    rows: Vec<WithRow>,
+    start: &MatchAggStart,
+    start_var: &Option<String>,
+    hops: &[HopSpec],
+    where_clauses: &[DestWhere],
+) -> Vec<WithRow> {
+    let mut result = Vec::new();
+
+    for row in &rows {
+        // Resolve starts — may be filtered by inline WHERE (RowRef checks).
+        let starts = resolve_match_start(db, start);
+
+        for &start_h in &starts {
+            // Check inline WHERE (on start node).
+            if !where_clauses.is_empty() {
+                let payload = match db.get_payload(start_h) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let pass = where_clauses.iter().all(|dw| {
+                    // Only process conditions on the start variable.
+                    if start_var.as_ref().map_or(true, |sv| sv != &dw.var) {
+                        return true;
+                    }
+                    let field_val = payload.get(dw.field.as_str());
+                    match &dw.value {
+                        WhereValue::Literal(lit) => field_val.map_or(false, |v| dw.op.apply(v, lit)),
+                        WhereValue::RowRef(key) => {
+                            let row_val = row.get(key.as_str());
+                            match (field_val, row_val) {
+                                (Some(a), Some(b)) => dw.op.apply(a, b),
+                                _ => false,
+                            }
+                        }
+                    }
+                });
+                if !pass { continue; }
+            }
+
+            // Bind start node payload if variable is set.
+            let start_bindings: Vec<(String, Value)> = if let Some(ref sv) = start_var {
+                match db.get_payload(start_h) {
+                    Some(payload) => vec![(sv.clone(), payload)],
+                    None => continue,
+                }
+            } else {
+                vec![]
+            };
+
+            if hops.is_empty() {
+                let mut new_row = row.clone();
+                for (k, v) in start_bindings {
+                    new_row.insert(k, v);
+                }
+                result.push(new_row);
+                continue;
+            }
+
+            // DFS through hop chain (same as pipeline::expand_match).
+            let mut stack: Vec<(u64, usize, Vec<(String, Value)>)> =
+                vec![(start_h, 0, start_bindings)];
+
+            while let Some((current_h, hop_idx, bindings)) = stack.pop() {
+                let hop = &hops[hop_idx];
+                let Some(edges) = db.fwd_edges(current_h) else { continue };
+
+                for e in edges {
+                    if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                        continue;
+                    }
+                    // Optional collection filter on endpoint.
+                    if let Some(node_data) = db.node_data(e.other) {
+                        // No collection filter in HopSpec for pipeline-style;
+                        // accept all nodes (collection filtering is by label in the pattern).
+                    } else {
+                        continue;
+                    }
+
+                    let node_payload = match db.get_payload(e.other) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let mut new_bindings = bindings.clone();
+                    new_bindings.push((hop.node_bind.clone(), node_payload));
+
+                    let next_hop = hop_idx + 1;
+                    if next_hop >= hops.len() {
+                        let mut new_row = row.clone();
+                        for (k, v) in &new_bindings {
+                            new_row.insert(k.clone(), v.clone());
+                        }
+                        result.push(new_row);
+                    } else {
+                        stack.push((e.other, next_hop, new_bindings));
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Project rows through a WITH stage: group by scalars, evaluate aggregates.
+fn project_with_stage(
+    rows: Vec<WithRow>,
+    outputs: &[(WithOutExpr, String)],
+) -> Vec<WithRow> {
+    if rows.is_empty() {
+        return vec![];
+    }
+
+    let has_agg = outputs.iter().any(|(e, _)| e.is_agg());
+
+    if has_agg {
+        let mut group_order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<WithRow>> = HashMap::new();
+
+        for row in rows {
+            let key = outputs
+                .iter()
+                .filter(|(e, _)| !e.is_agg())
+                .map(|(e, _)| {
+                    let val = if let WithOutExpr::Scalar(inner) = e {
+                        inner.eval_as_value(&row)
+                    } else {
+                        Value::Null
+                    };
+                    serde_json::to_string(&val).unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join("\x00");
+
+            if !groups.contains_key(&key) {
+                group_order.push(key.clone());
+            }
+            groups.entry(key).or_default().push(row);
+        }
+
+        group_order
+            .into_iter()
+            .map(|key| {
+                let group = &groups[&key];
+                let mut new_row = WithRow::new();
+                for (expr, alias) in outputs {
+                    new_row.insert(alias.clone(), eval_with_out_over_group(expr, group));
+                }
+                new_row
+            })
+            .collect()
+    } else {
+        rows.into_iter()
+            .map(|row| {
+                let mut new_row = WithRow::new();
+                for (expr, alias) in outputs {
+                    let val = if let WithOutExpr::Scalar(inner) = expr {
+                        inner.eval_as_value(&row)
+                    } else {
+                        Value::Null
+                    };
+                    new_row.insert(alias.clone(), val);
+                }
+                new_row
+            })
+            .collect()
+    }
+}
+
+fn eval_with_out_over_group(expr: &WithOutExpr, group: &[WithRow]) -> Value {
+    match expr {
+        WithOutExpr::Scalar(e) => {
+            group.first().map(|r| e.eval_as_value(r)).unwrap_or(Value::Null)
+        }
+        WithOutExpr::Sum(e) => serde_json::json!(group.iter().map(|r| e.eval(r)).sum::<f64>()),
+        WithOutExpr::Avg(e) => {
+            if group.is_empty() { return Value::Null; }
+            let s: f64 = group.iter().map(|r| e.eval(r)).sum();
+            serde_json::json!(s / group.len() as f64)
+        }
+        WithOutExpr::Min(e) => {
+            let m = group.iter().map(|r| e.eval(r)).fold(f64::INFINITY, f64::min);
+            if m.is_infinite() { Value::Null } else { serde_json::json!(m) }
+        }
+        WithOutExpr::Max(e) => {
+            let m = group.iter().map(|r| e.eval(r)).fold(f64::NEG_INFINITY, f64::max);
+            if m.is_infinite() { Value::Null } else { serde_json::json!(m) }
+        }
+        WithOutExpr::Count => serde_json::json!(group.len() as i64),
+    }
+}
+
+/// Compare two optional JSON values for ordering.
+fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(a), Some(b)) => match (a, b) {
+            (Value::Number(na), Value::Number(nb)) => na
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&nb.as_f64().unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            (Value::String(sa), Value::String(sb)) => sa.cmp(sb),
+            (Value::Bool(ba), Value::Bool(bb)) => ba.cmp(bb),
+            _ => Ordering::Equal,
+        },
+    }
+}
+
+/// Execute a multi-stage [`MatchAggStmt`] with WITH stages.
+///
+/// Adapted from `pipeline::execute_pipeline`.
+fn execute_match_agg_with_stages(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
+    let empty_stages = vec![];
+    let stages = stmt.with_stages.as_ref().unwrap_or(&empty_stages);
+
+    // 1. Execute first MATCH stage.
+    let starts = resolve_match_start(db, &stmt.start);
+    let mut rows: Vec<WithRow> = if stmt.hops.is_empty() {
+        // No hops — just bind start nodes.
+        starts.iter().filter_map(|&h| {
+            let payload = db.get_payload(h)?;
+            let mut row = WithRow::new();
+            if let Some(ref sv) = stmt.start_var {
+                row.insert(sv.clone(), payload);
+            }
+            Some(row)
+        }).collect()
+    } else {
+        let paths = collect_paths(db, &starts, &stmt.hops, stmt.start_var.as_deref(), None);
+        paths
+    };
+
+    if rows.is_empty() { return vec![]; }
+
+    // 2. Apply first WHERE (dest_where with Literal values only).
+    if !stmt.dest_where.is_empty() {
+        rows.retain(|row| {
+            stmt.dest_where.iter().all(|dw| {
+                let literal_val = match &dw.value {
+                    WhereValue::Literal(v) => v,
+                    WhereValue::RowRef(_) => return true,
+                };
+                row.get(dw.var.as_str())
+                    .and_then(|v| v.get(dw.field.as_str()))
+                    .map_or(false, |v| dw.op.apply(v, literal_val))
+            })
+        });
+        if rows.is_empty() { return vec![]; }
+    }
+
+    // 3. Process each WITH stage.
+    for stage in stages {
+        if rows.is_empty() { break; }
+
+        // Project the current rows through the WITH outputs.
+        rows = project_with_stage(rows, &stage.outputs);
+        if rows.is_empty() { break; }
+
+        // If there are hops, expand the next MATCH.
+        if !stage.match_hops.is_empty() || stage.match_start_var.is_some() {
+            rows = expand_match_stage(
+                db,
+                rows,
+                &stage.match_start,
+                &stage.match_start_var,
+                &stage.match_hops,
+                &stage.where_clauses,
+            );
+        }
+    }
+
+    if rows.is_empty() { return vec![]; }
+
+    // 4. Apply final SELECT projections using MatchAggReturn.
+    //    Convert WithRow (HashMap<String, Value>) into the PathRow format
+    //    expected by MatchAggReturn::eval_group.
+    let has_agg = stmt.returns.iter().any(|(e, _)| matches!(e,
+        MatchAggReturn::Sum(_) | MatchAggReturn::Avg(_) |
+        MatchAggReturn::Min(_) | MatchAggReturn::Max(_) | MatchAggReturn::Count));
+
+    let mut result_rows: Vec<Value> = if let Some(ref group_keys) = stmt.group_by {
+        // GROUP BY
+        let mut group_order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<WithRow>> = HashMap::new();
+
+        for row in rows {
+            let key = group_keys.iter()
+                .map(|(gvar, gfield)| {
+                    // Try var.field first, then top-level key
+                    let val = row.get(gvar.as_str())
+                        .and_then(|v| v.get(gfield.as_str()))
+                        .or_else(|| row.get(gvar.as_str()))
+                        .unwrap_or(&Value::Null);
+                    serde_json::to_string(val).unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join("\x00");
+            if !groups.contains_key(&key) {
+                group_order.push(key.clone());
+            }
+            groups.entry(key).or_default().push(row);
+        }
+
+        group_order.into_iter().map(|key| {
+            let group_rows = &groups[&key];
+            let mut map = serde_json::Map::new();
+            for (ret_expr, alias) in &stmt.returns {
+                map.insert(alias.clone(), eval_return_over_with_rows(ret_expr, group_rows));
+            }
+            Value::Object(map)
+        }).collect()
+    } else if has_agg {
+        // Aggregate without GROUP BY — single group.
+        let mut map = serde_json::Map::new();
+        for (ret_expr, alias) in &stmt.returns {
+            map.insert(alias.clone(), eval_return_over_with_rows(ret_expr, &rows));
+        }
+        vec![Value::Object(map)]
+    } else {
+        // No GROUP BY, no aggregates — one row per result.
+        rows.into_iter().map(|row| {
+            let mut map = serde_json::Map::new();
+            for (ret_expr, alias) in &stmt.returns {
+                map.insert(alias.clone(), eval_return_over_with_rows(ret_expr, std::slice::from_ref(&row)));
+            }
+            Value::Object(map)
+        }).collect()
+    };
+
+    // 5. ORDER BY
+    if let Some((ref order_field, ascending)) = stmt.order_by {
+        result_rows.sort_by(|a, b| {
+            let va = a.get(order_field.as_str());
+            let vb = b.get(order_field.as_str());
+            let ord = cmp_values(va, vb);
+            if ascending { ord } else { ord.reverse() }
+        });
+    }
+
+    // 6. LIMIT
+    if let Some(n) = stmt.limit {
+        result_rows.truncate(n);
+    }
+
+    result_rows.into_iter()
+        .map(|v| Hit { slug: String::new(), slug_hash: 0, payload: Some(v) })
+        .collect()
+}
+
+/// Evaluate a MatchAggReturn expression over WithRows (pipeline rows).
+///
+/// WithRows use top-level keys for both bindings (var → payload) and
+/// prior WITH aliases (key → value). MatchAggReturn::Field accesses
+/// var.field from the payload, falling back to top-level key lookup.
+fn eval_return_over_with_rows(expr: &MatchAggReturn, rows: &[WithRow]) -> Value {
+    match expr {
+        MatchAggReturn::Field { var, field } => {
+            let row = match rows.first() {
+                Some(r) => r,
+                None => return Value::Null,
+            };
+            // Bare identifier (field == "*") — return the whole bound value.
+            if field == "*" {
+                return row.get(var.as_str()).cloned().unwrap_or(Value::Null);
+            }
+            // Try var.field (node payload bound under var)
+            if let Some(val) = row.get(var.as_str()).and_then(|v| v.get(field.as_str())) {
+                return val.clone();
+            }
+            // Fall back to top-level key (e.g. a WITH alias)
+            row.get(var.as_str()).cloned().unwrap_or(Value::Null)
+        }
+        MatchAggReturn::Count => serde_json::json!(rows.len() as i64),
+        MatchAggReturn::Sum(expr) => {
+            let sum: f64 = rows.iter().map(|r| eval_math_on_with_row(expr, r)).sum();
+            serde_json::json!(sum)
+        }
+        MatchAggReturn::Avg(expr) => {
+            if rows.is_empty() { return Value::Null; }
+            let sum: f64 = rows.iter().map(|r| eval_math_on_with_row(expr, r)).sum();
+            serde_json::json!(sum / rows.len() as f64)
+        }
+        MatchAggReturn::Min(expr) => {
+            let min = rows.iter().map(|r| eval_math_on_with_row(expr, r)).fold(f64::INFINITY, f64::min);
+            if min.is_infinite() { Value::Null } else { serde_json::json!(min) }
+        }
+        MatchAggReturn::Max(expr) => {
+            let max = rows.iter().map(|r| eval_math_on_with_row(expr, r)).fold(f64::NEG_INFINITY, f64::max);
+            if max.is_infinite() { Value::Null } else { serde_json::json!(max) }
+        }
+        MatchAggReturn::Now => {
+            serde_json::json!(chrono::Utc::now().timestamp())
+        }
+        _ => {
+            // For PathAvg, PathSum, Case, etc. — use eval_group on PathRow.
+            // Convert WithRow to PathRow (they're the same type).
+            let path_rows: Vec<PathRow> = rows.iter().map(|r| r.clone()).collect();
+            expr.eval_group(&path_rows)
+        }
+    }
+}
+
+/// Evaluate a MathExpr against a WithRow.
+/// MathExpr::VarField accesses var.field; also falls back to top-level key.
+fn eval_math_on_with_row(expr: &MathExpr, row: &WithRow) -> f64 {
+    match expr {
+        MathExpr::VarField { var, field } => {
+            // Bare identifier (field == "*") — take the numeric value directly.
+            if field == "*" {
+                return row.get(var.as_str()).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            }
+            // Try var.field from payload
+            if let Some(val) = row.get(var.as_str()).and_then(|v| v.get(field.as_str())).and_then(|v| v.as_f64()) {
+                return val;
+            }
+            // Fall back to top-level row key (WITH alias)
+            row.get(var.as_str()).and_then(|v| v.as_f64()).unwrap_or(0.0)
+        }
+        MathExpr::Literal(n) => *n,
+        MathExpr::Mul(a, b) => eval_math_on_with_row(a, row) * eval_math_on_with_row(b, row),
+        MathExpr::Add(a, b) => eval_math_on_with_row(a, row) + eval_math_on_with_row(b, row),
+        MathExpr::Sub(a, b) => eval_math_on_with_row(a, row) - eval_math_on_with_row(b, row),
+        MathExpr::Div(a, b) => {
+            let d = eval_math_on_with_row(b, row);
+            if d == 0.0 { 0.0 } else { eval_math_on_with_row(a, row) / d }
+        }
+    }
+}
+
 /// Execute a [`MatchAggStmt`] and return synthetic result [`Hit`]s.
 ///
 /// Each Hit has an empty slug and a payload equal to one result row.
 pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
+    // Multi-stage queries (WITH chaining) or no-hop queries use the stages executor.
+    if stmt.with_stages.is_some() || stmt.hops.is_empty() {
+        return execute_match_agg_with_stages(db, stmt);
+    }
     // 1. Resolve starting hashes
     let starts: Vec<u64> = match stmt.start {
         MatchAggStart::Slug(h) => {
@@ -3845,6 +4723,24 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
         }
         MatchAggStart::All => db.all_hashes(),
     };
+
+    // ── Aggregate-only fast path (no GROUP BY) ─────────────────────────────────
+    // For `SELECT COUNT(*) FROM MATCH ...` (no GROUP BY), we don't need to
+    // materialise individual paths — just count them.  Also correct semantics:
+    // aggregate without GROUP BY should produce exactly 1 result row.
+    if stmt.group_by.is_none()
+        && stmt.returns.iter().all(|(r, _)| matches!(r, MatchAggReturn::Count))
+        && stmt.dest_where.is_empty()
+    {
+        let total: usize = collect_final_dest_counts(db, &starts, &stmt.hops)
+            .values()
+            .sum();
+        let mut map = serde_json::Map::new();
+        for (_, alias) in &stmt.returns {
+            map.insert(alias.clone(), serde_json::json!(total as i64));
+        }
+        return vec![Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }];
+    }
 
     // 2. Collect all path rows.
     //
@@ -3889,8 +4785,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             .map_or(false, |sv| group_keys.iter().any(|(gvar, _)| gvar == sv));
 
         if !needs_row_scan && !start_in_group {
-            // ── Shared: field list + payload loader (used by both fast paths) ──
-            // Compute before path collection so the ultra-fast path can reuse them.
+            // ── Shared: field list (used by both fast paths) ──
             let all_returns_simple = stmt.returns.iter().all(|(ret, _)|
                 matches!(ret, MatchAggReturn::Count | MatchAggReturn::Field { .. }
                              | MatchAggReturn::Now));
@@ -3899,7 +4794,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 let mut add = |f: &String| {
                     if !v.iter().any(|x| x == f) { v.push(f.clone()); }
                 };
-                for (_, f, _) in &stmt.dest_where { add(f); }
+                for dw in &stmt.dest_where { add(&dw.field); }
                 for (gvar, gfield) in group_keys.iter() {
                     if var_to_hop.contains_key(gvar.as_str()) { add(gfield); }
                 }
@@ -3910,32 +4805,138 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 }
                 v
             };
-            // Payload size threshold above which we use head+tail extraction to avoid
-            // parsing multi-megabyte GeoJSON blobs for 3 scalar metadata fields.
-            const FAST_PATH_THRESHOLD: u32 = 64 * 1024;
-            let where_fields: Vec<&str> = stmt.dest_where.iter()
-                .map(|(_, f, _)| f.as_str())
-                .collect();
-            let load_for_fields = |h: u64| -> Option<Value> {
-                if all_returns_simple && !needed_fields.is_empty() {
-                    if let Some(node) = db.node_data(h) {
-                        if node.payload_len > FAST_PATH_THRESHOLD {
-                            if let Some((head, tail)) = db.get_payload_head_tail(h, 512, 16384) {
-                                let combined: Vec<u8> =
-                                    [head.as_slice(), tail.as_slice()].concat();
-                                let extracted =
-                                    extract_fields_by_search(&combined, &needed_fields);
-                                let where_ok = where_fields.iter()
-                                    .all(|f| extracted.contains_key(*f));
-                                if where_ok && !extracted.is_empty() {
-                                    return Some(Value::Object(extracted));
-                                }
+            let use_head_extract = all_returns_simple && !needed_fields.is_empty();
+
+            // ── Btree-index resolution: resolve field values from in-memory indexes ──
+            // When btree indexes exist for ALL needed fields on the dest collection,
+            // we can resolve hash → field values without any disk I/O.  This turns
+            // 7,626 page faults on payloads.bin into pure HashMap lookups.
+            //
+            // Returns true if all hashes were fully resolved from indexes.
+            fn try_resolve_from_btree_index(
+                db: &CoreDB,
+                coll_hash: u64,
+                hashes: &[u64],
+                needed_fields: &[String],
+                cache: &mut HashMap<u64, Value>,
+            ) -> bool {
+                if needed_fields.is_empty() || coll_hash == 0 { return false; }
+                // Check all needed fields have btree indexes
+                let indexes: Vec<&BTreeMap<FieldKey, Vec<u64>>> = needed_fields.iter()
+                    .filter_map(|f| db.field_index(coll_hash, f))
+                    .collect();
+                if indexes.len() != needed_fields.len() { return false; }
+
+                // Build reverse map for each field: hash → Value
+                let hash_set: HashSet<u64> = hashes.iter().copied().collect();
+                let mut field_maps: Vec<HashMap<u64, Value>> = Vec::with_capacity(indexes.len());
+                for idx in &indexes {
+                    let mut map: HashMap<u64, Value> = HashMap::with_capacity(hash_set.len());
+                    for (key, node_hashes) in *idx {
+                        let val = CoreDB::field_key_to_value(key);
+                        for &h in node_hashes {
+                            if hash_set.contains(&h) {
+                                map.insert(h, val.clone());
                             }
                         }
                     }
+                    field_maps.push(map);
                 }
-                db.get_payload(h)
-            };
+
+                // Assemble per-hash payload objects
+                for &h in hashes {
+                    let mut obj = serde_json::Map::new();
+                    for (i, field_name) in needed_fields.iter().enumerate() {
+                        if let Some(val) = field_maps[i].get(&h) {
+                            obj.insert(field_name.clone(), val.clone());
+                        }
+                        // Missing = null (field not present on this node)
+                    }
+                    cache.insert(h, Value::Object(obj));
+                }
+                true
+            }
+
+            // Determine dest collection hash for btree index lookups.
+            let dest_coll_hash: u64 = stmt.hops.last()
+                .and_then(|h| h.node_label.as_ref())
+                .map(|label| sk_hash(label))
+                .unwrap_or(0);
+
+            /// Batch-load payloads for a set of hashes into payload_cache.
+            /// Uses zero-copy mmap tail slices (last 512 bytes per node) for field
+            /// extraction, since scalar metadata fields (level, name, pcode) appear
+            /// at the END of the JSON, after large geometry objects.
+            /// Sorted by tail offset to exploit OS readahead on sequential access.
+            #[cfg(unix)]
+            fn batch_load_payloads(
+                db: &CoreDB,
+                hashes: &[u64],
+                cache: &mut HashMap<u64, Value>,
+                needed_fields: &[String],
+                use_tail_extract: bool,
+            ) {
+                if hashes.is_empty() { return; }
+                if use_tail_extract {
+                    // Sort by tail offset for sequential access → readahead benefit.
+                    let mut sorted: Vec<u64> = hashes.to_vec();
+                    sorted.sort_unstable_by_key(|&h| {
+                        db.node_data(h).map(|nd| {
+                            let len = nd.payload_len as u64;
+                            nd.payload_offset + len.saturating_sub(512)
+                        }).unwrap_or(0)
+                    });
+
+                    let mut fallbacks: Vec<u64> = Vec::new();
+                    for &h in &sorted {
+                        // Zero-copy: borrow directly from mmap, no Vec allocation.
+                        if let Some(tail) = db.payload_tail_slice(h, 512) {
+                            let extracted = extract_fields_by_search(tail, needed_fields);
+                            if extracted.len() >= needed_fields.len() {
+                                cache.insert(h, Value::Object(extracted));
+                                continue;
+                            }
+                        }
+                        fallbacks.push(h);
+                    }
+                    // Phase 2: try larger tail (4KB) for remaining nodes.
+                    if !fallbacks.is_empty() {
+                        for &h in &fallbacks {
+                            if let Some(tail) = db.payload_tail_slice(h, 4096) {
+                                let extracted = extract_fields_by_search(tail, needed_fields);
+                                if extracted.len() >= needed_fields.len() {
+                                    cache.insert(h, Value::Object(extracted));
+                                    continue;
+                                }
+                            }
+                            // Final fallback: full payload read.
+                            if let Some(p) = db.get_payload(h) {
+                                cache.insert(h, p);
+                            }
+                        }
+                    }
+                } else {
+                    for &h in hashes {
+                        if let Some(p) = db.get_payload(h) {
+                            cache.insert(h, p);
+                        }
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            fn batch_load_payloads(
+                db: &CoreDB,
+                hashes: &[u64],
+                cache: &mut HashMap<u64, Value>,
+                _needed_fields: &[String],
+                _use_tail_extract: bool,
+            ) {
+                for &h in hashes {
+                    if let Some(p) = db.get_payload(h) {
+                        cache.insert(h, p);
+                    }
+                }
+            }
 
             // ── Ultra-fast path: GROUP BY on final hop variable only ───────────
             //
@@ -3958,58 +4959,63 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                     _ => false,
                 })
                 && stmt.hops.iter().all(|h| h.edge_bind.is_none())
-                && stmt.dest_where.iter().all(|(cond_var, _, _)| {
+                && stmt.dest_where.iter().all(|dw| {
                     // Only allow conditions on the start var (checked elsewhere) or
                     // the final hop var.  Conditions on intermediate hops require the
                     // full per-path data that collect_raw_paths provides.
-                    var_to_hop.get(cond_var.as_str())
+                    var_to_hop.get(dw.var.as_str())
                         .map_or(true, |&hi| hi == last_hop_idx)
                 });
 
             if only_final_var {
-                let mut dest_counts =
-                    collect_final_dest_counts(db, &starts, &stmt.hops);
+                let mut dest_counts = if let Some(reversed) = try_reverse_anchor(db, &starts, &stmt.hops, &stmt.dest_where) {
+                    let mut dc: HashMap<u64, usize> = HashMap::new();
+                    for rp in &reversed {
+                        if let Some(&dh) = rp.dest_per_hop.last() {
+                            *dc.entry(dh).or_insert(0) += 1;
+                        }
+                    }
+                    dc
+                } else {
+                    collect_final_dest_counts(db, &starts, &stmt.hops)
+                };
                 if dest_counts.is_empty() { return vec![]; }
 
                 let null = Value::Null;
                 let mut payload_cache: HashMap<u64, Value> = HashMap::new();
 
-                // dest_where: load unique dest payloads (offset-sorted), filter.
+                // dest_where: filter using btree index or payload reads.
                 if !stmt.dest_where.is_empty() {
-                    let mut unique_dests: Vec<u64> = dest_counts.keys().copied().collect();
-                    unique_dests.sort_unstable_by_key(|&h| {
-                        db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0)
-                    });
-                    for h in unique_dests {
-                        if let Some(p) = load_for_fields(h) {
-                            payload_cache.insert(h, p);
-                        }
+                    let unique_dests: Vec<u64> = dest_counts.keys().copied().collect();
+                    if !try_resolve_from_btree_index(db, dest_coll_hash, &unique_dests, &needed_fields, &mut payload_cache) {
+                        batch_load_payloads(db, &unique_dests, &mut payload_cache, &needed_fields, use_head_extract);
                     }
                     dest_counts.retain(|dest_h, _| {
-                        stmt.dest_where.iter().all(|(cond_var, cond_field, cond_val)| {
-                            match var_to_hop.get(cond_var.as_str()) {
-                                None => true, // start var — skip (no start_in_group)
+                        stmt.dest_where.iter().all(|dw| {
+                            let literal_val = match &dw.value {
+                                WhereValue::Literal(v) => v,
+                                WhereValue::RowRef(_) => return true,
+                            };
+                            match var_to_hop.get(dw.var.as_str()) {
+                                None => true,
                                 Some(_) => payload_cache.get(dest_h)
-                                    .and_then(|p| p.get(cond_field.as_str()))
-                                    .map_or(false, |v| values_eq(v, cond_val)),
+                                    .and_then(|p| p.get(dw.field.as_str()))
+                                    .map_or(false, |v| dw.op.apply(v, literal_val)),
                             }
                         })
                     });
                     if dest_counts.is_empty() { return vec![]; }
                 }
 
-                // Load payloads for dests not yet in cache (offset-sorted I/O).
+                // Resolve remaining dest field values from btree index or payloads.
                 {
-                    let mut remaining: Vec<u64> = dest_counts.keys()
+                    let remaining: Vec<u64> = dest_counts.keys()
                         .copied()
                         .filter(|h| !payload_cache.contains_key(h))
                         .collect();
-                    remaining.sort_unstable_by_key(|&h| {
-                        db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0)
-                    });
-                    for h in remaining {
-                        if let Some(p) = load_for_fields(h) {
-                            payload_cache.insert(h, p);
+                    if !remaining.is_empty() {
+                        if !try_resolve_from_btree_index(db, dest_coll_hash, &remaining, &needed_fields, &mut payload_cache) {
+                            batch_load_payloads(db, &remaining, &mut payload_cache, &needed_fields, use_head_extract);
                         }
                     }
                 }
@@ -4082,7 +5088,11 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             }
 
             // ── Standard fast path (GROUP BY with intermediate vars or edge binds) ─
-            let raw = collect_raw_paths(db, &starts, &stmt.hops, None);
+            let raw = if let Some(reversed) = try_reverse_anchor(db, &starts, &stmt.hops, &stmt.dest_where) {
+                reversed
+            } else {
+                collect_raw_paths(db, &starts, &stmt.hops, None)
+            };
             if raw.is_empty() { return vec![]; }
 
             // ── Phase 1: hash-keyed grouping (zero payload reads) ──────────────
@@ -4105,31 +5115,28 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             let mut payload_cache: HashMap<u64, Value> = HashMap::new();
 
             if !stmt.dest_where.is_empty() {
-                // Collect all unique dest hashes across remaining groups, sorted by offset.
-                let mut unique_dests: Vec<u64> = hash_groups.keys()
+                let unique_dests: Vec<u64> = hash_groups.keys()
                     .flat_map(|dp| dp.iter().copied())
                     .collect::<HashSet<_>>()
                     .into_iter()
                     .collect();
-                unique_dests.sort_unstable_by_key(|&h| {
-                    db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0)
-                });
-                for h in unique_dests {
-                    if let Some(p) = load_for_fields(h) {
-                        payload_cache.insert(h, p);
-                    }
+                if !try_resolve_from_btree_index(db, dest_coll_hash, &unique_dests, &needed_fields, &mut payload_cache) {
+                    batch_load_payloads(db, &unique_dests, &mut payload_cache, &needed_fields, use_head_extract);
                 }
 
-                // Apply dest_where: remove groups whose destination fails the condition.
                 hash_groups.retain(|dest_per_hop, _| {
-                    stmt.dest_where.iter().all(|(cond_var, cond_field, cond_val)| {
-                        match var_to_hop.get(cond_var.as_str()) {
-                            None => true, // start var or unknown — skip
+                    stmt.dest_where.iter().all(|dw| {
+                        let literal_val = match &dw.value {
+                            WhereValue::Literal(v) => v,
+                            WhereValue::RowRef(_) => return true,
+                        };
+                        match var_to_hop.get(dw.var.as_str()) {
+                            None => true,
                             Some(&hi) => {
                                 let h = dest_per_hop.get(hi).copied().unwrap_or(0);
                                 payload_cache.get(&h)
-                                    .and_then(|p| p.get(cond_field.as_str()))
-                                    .map_or(false, |v| values_eq(v, cond_val))
+                                    .and_then(|p| p.get(dw.field.as_str()))
+                                    .map_or(false, |v| dw.op.apply(v, literal_val))
                             }
                         }
                     })
@@ -4137,22 +5144,17 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 if hash_groups.is_empty() { return vec![]; }
             }
 
-            // ── Phase 3: load payloads for remaining unique dests ──────────────
-            // Any dests not already in payload_cache (those not loaded during dest_where)
-            // are loaded now, sorted by offset for sequential I/O.
+            // ── Phase 3: resolve remaining unique dests from btree index or payloads ─
             {
-                let mut remaining: Vec<u64> = hash_groups.keys()
+                let remaining: Vec<u64> = hash_groups.keys()
                     .flat_map(|dp| dp.iter().copied())
                     .filter(|h| !payload_cache.contains_key(h))
                     .collect::<HashSet<_>>()
                     .into_iter()
                     .collect();
-                remaining.sort_unstable_by_key(|&h| {
-                    db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0)
-                });
-                for h in remaining {
-                    if let Some(p) = load_for_fields(h) {
-                        payload_cache.insert(h, p);
+                if !remaining.is_empty() {
+                    if !try_resolve_from_btree_index(db, dest_coll_hash, &remaining, &needed_fields, &mut payload_cache) {
+                        batch_load_payloads(db, &remaining, &mut payload_cache, &needed_fields, use_head_extract);
                     }
                 }
             }
@@ -4259,7 +5261,11 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     };
 
     // Phase 1: topology.
-    let mut raw = collect_raw_paths(db, &starts, &stmt.hops, traversal_limit);
+    let mut raw = if let Some(reversed) = try_reverse_anchor(db, &starts, &stmt.hops, &stmt.dest_where) {
+        reversed
+    } else {
+        collect_raw_paths(db, &starts, &stmt.hops, traversal_limit)
+    };
     if raw.is_empty() { return vec![]; }
 
     // Phase 2: filter by hop-variable conditions (topology-first, efficient).
@@ -4273,7 +5279,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     // Safe when: no ORDER BY (order would change which rows survive) and no GROUP BY.
     // start_where conditions are post-filter, so only skip truncation if they exist.
     let has_start_conditions = stmt.dest_where.iter()
-        .any(|(v, _, _)| !var_to_hop.contains_key(v.as_str()));
+        .any(|dw| !var_to_hop.contains_key(dw.var.as_str()));
     if stmt.group_by.is_none() && stmt.order_by.is_none() && !has_start_conditions {
         if let Some(n) = stmt.limit { raw.truncate(n); }
     }
@@ -4288,11 +5294,15 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     } else {
         all_paths.into_iter().filter(|row| {
             stmt.dest_where.iter()
-                .filter(|(v, _, _)| !var_to_hop.contains_key(v.as_str()))
-                .all(|(cond_var, cond_field, cond_val)| {
-                    row.get(cond_var.as_str())
-                        .and_then(|v| v.get(cond_field.as_str()))
-                        .map_or(false, |v| values_eq(v, cond_val))
+                .filter(|dw| !var_to_hop.contains_key(dw.var.as_str()))
+                .all(|dw| {
+                    let literal_val = match &dw.value {
+                        WhereValue::Literal(v) => v,
+                        WhereValue::RowRef(_) => return true,
+                    };
+                    row.get(dw.var.as_str())
+                        .and_then(|v| v.get(dw.field.as_str()))
+                        .map_or(false, |v| dw.op.apply(v, literal_val))
                 })
         }).collect()
     };

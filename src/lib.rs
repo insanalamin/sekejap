@@ -27,7 +27,6 @@
 
 pub mod bm25;
 pub mod geo;
-pub mod pipeline;
 mod query;
 pub mod scalar;
 pub mod sql;
@@ -37,8 +36,7 @@ pub mod vector;
 
 pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
 
-pub use pipeline::Pipeline;
-pub use query::{Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step};
+pub use query::{CmpOp, DestWhere, Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step, WhereValue, WithExpr, WithOutExpr, WithRow, WithStage};
 pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, SqlError, TableSchema};
 
 use serde::{Deserialize, Serialize};
@@ -123,9 +121,73 @@ pub(crate) struct PayloadStore {
     inner: PayloadInner,
 }
 
+// ── Read-only mmap for payloads.bin ──────────────────────────────────────────
+// Eliminates per-read pread syscalls — reads become pointer dereferences
+// with OS-managed page faults and readahead.  Zero new dependencies:
+// mmap/munmap/madvise are system C library functions always linked by Rust.
+#[cfg(unix)]
+struct MmapView {
+    ptr: *const u8,
+    len: usize,
+}
+
+#[cfg(unix)]
+unsafe impl Send for MmapView {}
+#[cfg(unix)]
+unsafe impl Sync for MmapView {}
+
+#[cfg(unix)]
+impl MmapView {
+    fn try_new(file: &std::fs::File, len: usize) -> Option<Self> {
+        if len == 0 { return None; }
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn mmap(
+                addr: *mut std::ffi::c_void, length: usize,
+                prot: i32, flags: i32, fd: i32, offset: i64,
+            ) -> *mut std::ffi::c_void;
+            fn madvise(addr: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+        }
+        const PROT_READ: i32 = 1;
+        const MAP_PRIVATE: i32 = 2;
+        let ptr = unsafe {
+            mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
+        };
+        if ptr == !0usize as *mut std::ffi::c_void { // MAP_FAILED
+            return None;
+        }
+        // MADV_NORMAL (0) — let OS use default readahead policy.
+        // Sorted-offset access patterns in batch reads benefit from readahead.
+        unsafe { madvise(ptr, len, 0); }
+        Some(Self { ptr: ptr as *const u8, len })
+    }
+
+    #[inline]
+    fn slice(&self, offset: usize, read_len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(read_len)?;
+        if end > self.len { return None; }
+        unsafe { Some(std::slice::from_raw_parts(self.ptr.add(offset), read_len)) }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MmapView {
+    fn drop(&mut self) {
+        extern "C" {
+            fn munmap(addr: *mut std::ffi::c_void, length: usize) -> i32;
+        }
+        unsafe { munmap(self.ptr as *mut std::ffi::c_void, self.len); }
+    }
+}
+
 enum PayloadInner {
     Memory { data: Vec<u8> },
-    Disk   { file: std::fs::File, total_len: u64 },
+    Disk {
+        file: std::fs::File,
+        total_len: u64,
+        #[cfg(unix)]
+        mmap: Option<MmapView>,
+    },
 }
 
 impl PayloadStore {
@@ -141,7 +203,12 @@ impl PayloadStore {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(Self { inner: PayloadInner::Disk { file, total_len: 0 } })
+        Ok(Self { inner: PayloadInner::Disk {
+            file,
+            total_len: 0,
+            #[cfg(unix)]
+            mmap: None,
+        } })
     }
 
     /// Open an existing disk-backed store without truncating.
@@ -150,7 +217,14 @@ impl PayloadStore {
             .read(true)
             .write(true)
             .open(path)?;
-        Ok(Self { inner: PayloadInner::Disk { file, total_len } })
+        #[cfg(unix)]
+        let mmap = MmapView::try_new(&file, total_len as usize);
+        Ok(Self { inner: PayloadInner::Disk {
+            file,
+            total_len,
+            #[cfg(unix)]
+            mmap,
+        } })
     }
 
     fn is_disk(&self) -> bool {
@@ -166,7 +240,7 @@ impl PayloadStore {
                 data.extend_from_slice(bytes);
                 (offset, bytes.len() as u32)
             }
-            PayloadInner::Disk { file, total_len } => {
+            PayloadInner::Disk { file, total_len, .. } => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::FileExt;
@@ -196,36 +270,11 @@ impl PayloadStore {
 
     /// Return raw JSON bytes at the given position (owned copy).
     pub(crate) fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
-        match &self.inner {
-            PayloadInner::Memory { data } => {
-                let start = offset as usize;
-                let end = start.checked_add(len as usize)?;
-                data.get(start..end).map(|b| b.to_vec())
-            }
-            PayloadInner::Disk { file, .. } => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; len as usize];
-                    file.read_exact_at(&mut buf, offset).ok()?;
-                    Some(buf)
-                }
-                #[cfg(not(unix))]
-                {
-                    use std::io::{Read, Seek, SeekFrom};
-                    // Non-unix: need interior mutability for seek — use a thread-local
-                    // or just take &mut self. Since CoreDB is single-threaded we can
-                    // use a workaround: re-open the file for read.
-                    // This is a fallback path; unix is the primary target.
-                    let _ = (file, offset, len); // silence warnings
-                    None // non-unix disk reads not yet implemented
-                }
-            }
-        }
+        self.get_raw_at(offset, len as usize)
     }
 
     /// Read `read_len` bytes starting at an arbitrary absolute byte offset.
-    /// Used for head/tail fast-path field extraction on large payloads.
+    /// Uses mmap when available (zero syscalls), falls back to pread.
     pub(crate) fn get_raw_at(&self, abs_offset: u64, read_len: usize) -> Option<Vec<u8>> {
         if read_len == 0 {
             return Some(vec![]);
@@ -236,24 +285,41 @@ impl PayloadStore {
                 let end = start.checked_add(read_len)?;
                 data.get(start..end).map(|b| b.to_vec())
             }
+            #[cfg(unix)]
+            PayloadInner::Disk { file, mmap, .. } => {
+                // Fast path: read from mmap (no syscall — just memcpy from page cache).
+                if let Some(ref m) = mmap {
+                    if let Some(slice) = m.slice(abs_offset as usize, read_len) {
+                        return Some(slice.to_vec());
+                    }
+                }
+                // Fallback: pread for data written after the mmap was created.
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; read_len];
+                file.read_exact_at(&mut buf, abs_offset).ok()?;
+                Some(buf)
+            }
+            #[cfg(not(unix))]
             PayloadInner::Disk { file, .. } => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; read_len];
-                    file.read_exact_at(&mut buf, abs_offset).ok()?;
-                    Some(buf)
-                }
-                #[cfg(not(unix))]
-                {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let path = {
-                        // fallback: re-open for reading (non-unix only)
-                        return self.get_raw(abs_offset, read_len as u32);
-                    };
-                    let _ = path;
-                    None
-                }
+                let _ = (file, abs_offset, read_len);
+                None
+            }
+        }
+    }
+
+    /// Borrow a slice of the payload store without copying (zero-alloc).
+    /// Returns `None` if offset/len is out of range or no mmap is available.
+    #[cfg(unix)]
+    fn get_slice(&self, abs_offset: u64, read_len: usize) -> Option<&[u8]> {
+        if read_len == 0 { return Some(&[]); }
+        match &self.inner {
+            PayloadInner::Memory { data } => {
+                let start = abs_offset as usize;
+                let end = start.checked_add(read_len)?;
+                data.get(start..end)
+            }
+            PayloadInner::Disk { mmap, .. } => {
+                mmap.as_ref()?.slice(abs_offset as usize, read_len)
             }
         }
     }
@@ -482,7 +548,7 @@ impl CoreDB {
         // The legacy bloated variant (gin_indexes embedded as JSON) was 1-10 GB.
         // Use 500 MB as the threshold — safely above any real snapshot, far below bloated ones.
         if snap_file_size > 500 * 1024 * 1024 {
-            if let Ok(snap_json) = serde_json::to_vec_pretty(&db.build_snapshot()) {
+            if let Ok(snap_json) = serde_json::to_vec(&db.build_snapshot()) {
                 let snap_tmp = snap_path.with_extension("json.tmp");
                 if std::fs::write(&snap_tmp, &snap_json).is_ok() {
                     let _ = std::fs::rename(&snap_tmp, &snap_path);
@@ -1595,7 +1661,7 @@ impl CoreDB {
 
         // 2. Write snapshot atomically (tmp → rename) — AFTER payload compaction
         //    so disk-backed SnapNode offsets match the new payloads.bin layout.
-        let snap_json = serde_json::to_vec_pretty(&self.build_snapshot())
+        let snap_json = serde_json::to_vec(&self.build_snapshot())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let snap_tmp = dir.join("snapshot.json.tmp");
         let snap_path = dir.join("snapshot.json");
@@ -1982,6 +2048,63 @@ impl CoreDB {
         Some((head, tail))
     }
 
+    /// Read only the first `head_bytes` of each payload for multiple nodes.
+    ///
+    /// Used for field extraction when only small metadata fields are needed
+    /// (e.g. `level`, `name`, `pcode`), avoiding reading multi-MB GeoJSON blobs.
+    /// Sorts by payload offset for sequential I/O.
+    /// Zero-copy tail slice for a single node (mmap path only).
+    #[cfg(unix)]
+    pub(crate) fn payload_tail_slice(&self, hash: u64, tail_bytes: usize) -> Option<&[u8]> {
+        let node = self.nodes.get(&hash)?;
+        let len = node.payload_len as usize;
+        if len <= tail_bytes {
+            self.payload_store.get_slice(node.payload_offset, len)
+        } else {
+            let tail_off = node.payload_offset + (len - tail_bytes) as u64;
+            self.payload_store.get_slice(tail_off, tail_bytes)
+        }
+    }
+
+    /// Read the last `tail_bytes` of each node's payload in offset order.
+    ///
+    /// For JSON payloads where scalar metadata fields (level, name, pcode) appear
+    /// AFTER large embedded objects like GeoJSON geometry, reading the tail is
+    /// much more effective than reading the head.
+    pub(crate) fn read_payload_tails_batched(
+        &self,
+        hashes: &[u64],
+        tail_bytes: usize,
+    ) -> HashMap<u64, Vec<u8>> {
+        let mut sorted: Vec<(u64, u64, u32)> = hashes
+            .iter()
+            .filter_map(|&h| {
+                self.nodes.get(&h).map(|nd| (h, nd.payload_offset, nd.payload_len))
+            })
+            .collect();
+        sorted.sort_unstable_by_key(|&(_, off, _)| off);
+
+        let mut result = HashMap::with_capacity(hashes.len());
+
+        for &(hash, off, len) in &sorted {
+            let len_usize = len as usize;
+            if len_usize <= tail_bytes {
+                // Small payload — read the whole thing.
+                if let Some(raw) = self.payload_store.get_raw(off, len) {
+                    result.insert(hash, raw);
+                }
+            } else {
+                // Large payload — read only the tail.
+                let tail_off = off + (len_usize - tail_bytes) as u64;
+                if let Some(raw) = self.payload_store.get_raw_at(tail_off, tail_bytes) {
+                    result.insert(hash, raw);
+                }
+            }
+        }
+
+        result
+    }
+
     /// Read raw JSON bytes for multiple nodes with minimal I/O syscalls.
     ///
     /// Sorts hashes by `payload_offset`, groups nodes whose payloads are
@@ -2323,6 +2446,19 @@ impl CoreDB {
     /// FROM MATCH (a:col)-[r:edge]->(b:col) [WHERE a._key = 'val']
     /// [GROUP BY b._key] [ORDER BY total DESC] [LIMIT n]
     ///
+    /// -- Graph aggregate with WITH chaining (multi-stage)
+    /// SELECT c.name AS city, COUNT(*) AS friends
+    /// FROM MATCH (a:users)-[:knows*1..3]->(b:users)
+    /// WHERE a._key = 'alice'
+    /// WITH b
+    /// MATCH (b)-[:lives_in]->(c:cities)
+    /// WHERE c.population > 100000
+    /// GROUP BY c.name ORDER BY friends DESC LIMIT 10
+    ///
+    /// -- MATCH...RETURN (Cypher-style, routed through query())
+    /// MATCH (a:col)-[:edge]->(b:col) RETURN a._key AS name, b.score AS val
+    /// MATCH (a:col)-[:e]->(b) WITH b MATCH (b)-[:e2]->(c) RETURN c._key AS dest
+    ///
     /// -- Shortest path (0 rows = unreachable, 1 row = found)
     /// SELECT a.field AS from_f, b.field AS to_f, r.length AS hops
     /// FROM MATCH SHORTEST (a)-[r*]->(b)
@@ -2374,24 +2510,41 @@ impl CoreDB {
         }
     }
 
-    /// Execute a `MATCH + WITH` pipeline query.
+    /// Parameterized SELECT / MATCH query.
     ///
-    /// Implements the Cypher-style pipeline: one or more `MATCH` stages
-    /// interleaved with `WITH` aggregation checkpoints, ending with `RETURN`.
+    /// Values are bound to `$1`, `$2`, … placeholders in the SQL string.
+    /// Parameters are resolved at parse time — the execution layer is unchanged.
     ///
-    /// # Syntax
-    /// ```text
-    /// MATCH ('start')-[:edge1]->(a)-[:edge2]->(b)
-    /// WITH  b.field AS alias, SUM(a.x * b.y) AS score
-    /// MATCH (c:clos WHERE _key = alias)-[:edge3]->(d:dest)
-    /// RETURN d._key AS out, SUM(score * c.w) AS total ORDER BY total DESC LIMIT 10
+    /// # Example
     /// ```
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] if the statement is syntactically invalid.
-    pub fn pipeline_query(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError> {
-        let pipe = sql::parse_pipeline(sql)?;
-        Ok(pipeline::execute_pipeline(self, pipe))
+    /// # use sekejap::CoreDB;
+    /// # use serde_json::json;
+    /// let mut db = CoreDB::new();
+    /// db.put("users/alice", r#"{"name":"Alice","age":30,"_collection":"users"}"#).unwrap();
+    /// let hits = db.query_params(
+    ///     "SELECT * FROM users WHERE name = $1",
+    ///     &[json!("Alice")],
+    /// ).unwrap().collect();
+    /// assert_eq!(hits[0].slug, "users/alice");
+    /// ```
+    pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Set<'_>, SqlError> {
+        match sql::parse_match_or_agg_params(sql, params.to_vec())? {
+            sql::MatchOrAgg::Agg(stmt) => {
+                let hits = query::execute_match_agg(self, stmt);
+                Ok(Set::from_hits(self, hits))
+            }
+            sql::MatchOrAgg::Shortest(stmt) => {
+                let hits = query::execute_shortest_select(self, stmt);
+                Ok(Set::from_hits(self, hits))
+            }
+            sql::MatchOrAgg::MultiFrom(stmt) => {
+                let hits = query::execute_multi_from(self, stmt);
+                Ok(Set::from_hits(self, hits))
+            }
+            sql::MatchOrAgg::Steps(steps) => {
+                Ok(Set::from_steps(self, steps))
+            }
+        }
     }
 
     // ── Graph path queries ────────────────────────────────────────────────────
@@ -2735,17 +2888,49 @@ impl CoreDB {
     /// # Errors
     /// Returns [`SqlError`] if the SQL is invalid.
     pub fn execute(&mut self, sql: &str) -> Result<usize, SqlError> {
-        match sql::parse_mutation(sql)? {
+        let mutation = sql::parse_mutation(sql)?;
+        self.execute_mutation(mutation)
+    }
+
+    /// Parameterized mutation (INSERT / UPDATE / DELETE).
+    ///
+    /// Values are bound to `$1`, `$2`, … placeholders in the SQL string.
+    ///
+    /// # Example
+    /// ```
+    /// # use sekejap::CoreDB;
+    /// # use serde_json::json;
+    /// let mut db = CoreDB::new();
+    /// db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+    /// let n = db.execute_params(
+    ///     "INSERT INTO users (_key, name, age) VALUES ($1, $2, $3)",
+    ///     &[json!("u1"), json!("Bob"), json!(30)],
+    /// ).unwrap();
+    /// assert_eq!(n, 1);
+    /// ```
+    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<usize, SqlError> {
+        // Re-parse with params, then delegate to the same execution arms.
+        // We cannot just call self.execute() because it would re-parse without params.
+        match sql::parse_mutation_params(sql, params.to_vec())? {
+            m => {
+                // Build a temporary SQL string? No — reuse the mutation directly.
+                // We need to inline the same execute() body. Instead, factor via a helper.
+                self.execute_mutation(m)
+            }
+        }
+    }
+
+    /// Internal: execute an already-parsed mutation.
+    fn execute_mutation(&mut self, mutation: sql::CompiledMutation) -> Result<usize, SqlError> {
+        match mutation {
             sql::CompiledMutation::Insert { collection, mut slug, payload_json, vectors } => {
-                // Clone schema once so we can drop the immutable borrow before put().
                 let payload_json = if let Some(schema) = self.schemas.get(&collection).cloned() {
                     let mut payload: Value = serde_json::from_str(&payload_json)
                         .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
-                    // Apply DEFAULT UUIDV4 / DEFAULT UUIDV5 for fields absent from the payload.
                     if let Value::Object(ref mut map) = payload {
                         for field in &schema.fields {
                             if map.contains_key(&field.name) {
-                                continue; // explicit value wins
+                                continue;
                             }
                             if field.default_uuid4 {
                                 map.insert(
@@ -2759,8 +2944,6 @@ impl CoreDB {
                                 );
                             }
                         }
-                        // If _key was absent from INSERT (empty sentinel slug), resolve slug now
-                        // using the UUID that was just injected into the payload.
                         if slug.is_empty() {
                             match map.get("_key").and_then(|v| v.as_str()) {
                                 Some(key_val) => {
@@ -2779,7 +2962,6 @@ impl CoreDB {
                     serde_json::to_string(&payload)
                         .map_err(|e| SqlError::InvalidValue(e.to_string()))?
                 } else if slug.is_empty() {
-                    // No schema and no _key — that's a hard error
                     return Err(SqlError::MissingField { field: "_key" });
                 } else {
                     payload_json
@@ -2861,7 +3043,6 @@ impl CoreDB {
                     .collect();
                 let count = hits.len();
                 for (slug, mut payload) in hits {
-                    // Type-check updated fields against schema if registered.
                     if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
                         if let Some(schema) = self.schemas.get(coll) {
                             if let Some(err) = validate_updates_against_schema(schema, &updates) {
@@ -2871,7 +3052,6 @@ impl CoreDB {
                     }
                     let mut vec_updates: Vec<(String, Vec<f32>)> = Vec::new();
                     for (field, value) in &updates {
-                        // Array-of-numbers → vector field, not patched into JSON
                         if let Some(floats) = value_as_f32_vec(value) {
                             vec_updates.push((field.clone(), floats));
                         } else if let Value::Object(ref mut map) = payload {
@@ -2906,7 +3086,6 @@ impl CoreDB {
                 Ok(1)
             }
             sql::CompiledMutation::Reindex { collection, method, fields } => {
-                // Rebuild — no WAL entry; schema already records the declaration.
                 self.apply_index(&collection, &method, &fields)?;
                 Ok(1)
             }

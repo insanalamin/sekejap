@@ -1,0 +1,13 @@
+[package]
+name    = "sekejap-flutter"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name       = "sekejap_ffi"          # libsekejap_ffi.dylib / .a / .so
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+sekejap             = { path = "../.." }
+flutter_rust_bridge = "=2.12.0"
+serde_json          = "1"

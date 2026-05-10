@@ -15,13 +15,20 @@
 //!   INSERT INTO artist (_key, name, city) VALUES ('the-vines', 'The Vines', 'Sydney');
 //!   UPDATE artist SET active = true WHERE _key = 'the-vines';
 //!   DELETE FROM artist WHERE active = false;
+//!   CREATE TABLE artist (_key TEXT PRIMARY KEY, name TEXT, city TEXT);
+//!   ALTER TABLE artist ADD COLUMN active BOOLEAN;
+//!   DROP TABLE artist;
 //!   INSERT ('artist/the-vines')-[:has_genre {strength: 10}]->('genre/garage-rock');
 //!   DELETE ('artist/the-vines')-[:has_genre]->('genre/garage-rock');
-//!   MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g;
+//!   SELECT g._key FROM MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines';
+//!   MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g._key;
+//!   SHOW TABLES;
+//!   SHOW EDGES;
 
 use sekejap::CoreDB;
 use sekejap::Hit;
 use std::io::{self, BufRead, Write};
+use std::time::Instant;
 
 fn main() {
     let arg = std::env::args().nth(1);
@@ -116,14 +123,27 @@ fn main() {
     }
 }
 
+fn fmt_duration(d: std::time::Duration) -> String {
+    let us = d.as_micros();
+    if us < 1_000 {
+        format!("{us} µs")
+    } else if us < 1_000_000 {
+        format!("{:.2} ms", us as f64 / 1_000.0)
+    } else {
+        format!("{:.3} s", d.as_secs_f64())
+    }
+}
+
 fn run(db: &mut CoreDB, sql: &str) {
     let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
     match first.as_str() {
         "SELECT" | "MATCH" => {
+            let t0 = Instant::now();
             match db.query(sql) {
                 Err(e) => eprintln!("error: {e}"),
                 Ok(set) => {
                     let hits: Vec<Hit> = set.collect();
+                    let elapsed = t0.elapsed();
                     let count = hits.len();
                     for hit in hits {
                         match &hit.payload {
@@ -132,17 +152,39 @@ fn run(db: &mut CoreDB, sql: &str) {
                             None    => println!("{}", hit.slug),
                         }
                     }
-                    println!("── {} row{} ──", count, if count == 1 { "" } else { "s" });
+                    println!("── {} row{} in {} ──", count, if count == 1 { "" } else { "s" }, fmt_duration(elapsed));
                 }
             }
         }
-        "INSERT" | "UPDATE" | "DELETE" => {
-            match db.execute(sql) {
-                Err(e)    => eprintln!("error: {e}"),
-                Ok(count) => println!("ok — {} row{} affected", count, if count == 1 { "" } else { "s" }),
+        "SHOW" => {
+            let t0 = Instant::now();
+            match db.show(sql) {
+                Err(e) => eprintln!("error: {e}"),
+                Ok(hits) => {
+                    let elapsed = t0.elapsed();
+                    let count = hits.len();
+                    for hit in hits {
+                        match &hit.payload {
+                            Some(v) => println!("{}", serde_json::to_string_pretty(v)
+                                .unwrap_or_else(|_| v.to_string())),
+                            None    => println!("{}", hit.slug),
+                        }
+                    }
+                    println!("── {} row{} in {} ──", count, if count == 1 { "" } else { "s" }, fmt_duration(elapsed));
+                }
             }
         }
-        _ => eprintln!("unknown statement — try SELECT, MATCH, INSERT, UPDATE, DELETE"),
+        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "ALTER" | "DROP" | "REINDEX" => {
+            let t0 = Instant::now();
+            match db.execute(sql) {
+                Err(e)    => eprintln!("error: {e}"),
+                Ok(count) => {
+                    let elapsed = t0.elapsed();
+                    println!("ok — {} row{} affected in {}", count, if count == 1 { "" } else { "s" }, fmt_duration(elapsed));
+                }
+            }
+        }
+        _ => eprintln!("unknown statement — try SELECT, MATCH, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, SHOW"),
     }
 }
 
@@ -164,22 +206,57 @@ DELETE FROM collection|ALL [WHERE ...];
 INSERT ('from')-[:KIND {{strength: n, key: val}}]->('to');
 DELETE ('from')-[:KIND]->('to');
 
-MATCH (graph pattern)
-─────────────────────
-MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g;
-MATCH (a:artist)-[r:has_genre]->(g:genre) WHERE a._key = 'the-vines' AND r.strength >= 7 RETURN g;
-MATCH (e:event)-[:caused_by*1..5]->(root) WHERE e._key = 'flood' RETURN root;
-MATCH (...) RETURN x UNION MATCH (...) RETURN y;
+Schema
+──────
+CREATE TABLE col (_key TEXT PRIMARY KEY, field TYPE, ...);
+CREATE INDEX ON col USING hash|btree|gin|spatial|hnsw|bm25 (field);
+ALTER TABLE col ADD COLUMN field TYPE;
+ALTER TABLE col DROP COLUMN field;
+ALTER TABLE col RENAME COLUMN old TO new;
+ALTER TABLE col RENAME TO new_name;
+DROP TABLE col;
+DROP INDEX ON col USING type (field);
+REINDEX ON col USING type (field);
+
+Graph traversal
+───────────────
+SELECT b._key FROM MATCH (a:col)-[:edge]->(b:col) WHERE a._key = 'x';
+SELECT b._key, COUNT(a) FROM MATCH (a:col)-[r:edge]->(b:col) GROUP BY b._key;
+
+-- Multi-stage WITH chaining
+SELECT c.name AS city, COUNT(*) AS n
+FROM MATCH (a:users)-[:knows]->(b:users)
+WHERE a._key = 'alice'
+WITH b
+MATCH (b)-[:lives_in]->(c:cities)
+GROUP BY c.name;
+
+-- MATCH...RETURN
+MATCH (a:col)-[:edge]->(b:col) RETURN a._key, b.name;
+MATCH (a:col)-[:e]->(b) WITH b MATCH (b)-[:e2]->(c) RETURN c._key;
+
+-- Shortest path
+SELECT r.length AS hops FROM MATCH SHORTEST (a)-[r*]->(b)
+WHERE a._key = 'start' AND b._key = 'end';
+
+-- Variable-depth hops
+SELECT b._key FROM MATCH (a:col)-[:edge*1..5]->(b:col) WHERE a._key = 'x';
 
 Spatial queries
 ───────────────
 SELECT * FROM places WHERE ST_DWithin(geometry, POINT(lon lat), distance_km);
 SELECT * FROM zones WHERE ST_Contains(geometry, POINT(lon lat));
-SELECT * FROM places WHERE ST_Within(geometry, POLYGON((lon lat, lon lat, ...)));
-SELECT * FROM routes WHERE ST_Intersects(geometry, POLYGON((lon lat, lon lat, ...)));
+
+Introspection
+─────────────
+SHOW TABLES;
+SHOW EDGES;
+SHOW EDGES FROM collection;
+SHOW EDGES FROM col1 TO col2;
+SHOW collection;
 
 Filters:  =  !=  >  <  >=  <=  BETWEEN n AND n  IN (...)  LIKE 'pat'  ILIKE 'pat'
 Spatial:  ST_DWithin  ST_Contains  ST_Within  ST_Intersects
-Booleans: AND  (no OR / NOT yet)
+Booleans: AND  OR  NOT  (parenthesized groups supported)
 "#);
 }

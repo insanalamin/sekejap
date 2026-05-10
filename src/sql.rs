@@ -102,6 +102,10 @@ pub enum SqlError {
     /// A SELECT column is neither in the GROUP BY clause nor wrapped in an aggregate function.
     /// PostgreSQL raises the same error; MySQL silently picks a random row (we do not).
     GroupByViolation(String),
+    /// Parameter $N is out of range (only M parameter(s) provided).
+    ParamOutOfRange { index: usize, count: usize },
+    /// Parameter $N has the wrong type.
+    ParamTypeMismatch { index: usize, expected: &'static str },
 }
 
 impl fmt::Display for SqlError {
@@ -131,6 +135,14 @@ impl fmt::Display for SqlError {
             SqlError::GroupByViolation(col) => write!(
                 f,
                 "column \"{col}\" must appear in the GROUP BY clause or be used in an aggregate function"
+            ),
+            SqlError::ParamOutOfRange { index, count } => write!(
+                f,
+                "parameter ${index} out of range (only {count} parameter(s) provided)"
+            ),
+            SqlError::ParamTypeMismatch { index, expected } => write!(
+                f,
+                "parameter ${index}: expected {expected}"
             ),
         }
     }
@@ -173,6 +185,7 @@ enum Tok {
     VecL2Op,     // <->  Euclidean (L2) distance
     VecDotOp,    // <#>  inner product
     VecL1Op,     // <+>  Manhattan (L1) distance
+    Param(usize), // $1, $2, ... (1-indexed, like PostgreSQL)
     Eof,
 }
 
@@ -590,6 +603,27 @@ fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
                     None => tokens.push(Tok::Ident(s)),
                 }
             }
+            '$' => {
+                i += 1;
+                let start = i;
+                while i < len && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == start {
+                    return Err(SqlError::UnexpectedToken {
+                        expected: "parameter index after $",
+                        got: "$".to_string(),
+                    });
+                }
+                let s: String = chars[start..i].iter().collect();
+                let idx: usize = s.parse().map_err(|_| SqlError::InvalidNumber(s))?;
+                if idx == 0 {
+                    return Err(SqlError::InvalidValue(
+                        "parameter index starts at $1, not $0".into(),
+                    ));
+                }
+                tokens.push(Tok::Param(idx));
+            }
             ';' => {
                 i += 1;
             } // trailing semicolons are ignored
@@ -1000,11 +1034,16 @@ enum FieldOrBm25 {
 struct Parser {
     tokens: Vec<Tok>,
     pos: usize,
+    params: Vec<Value>,
 }
 
 impl Parser {
     fn new(tokens: Vec<Tok>) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, params: vec![] }
+    }
+
+    fn with_params(tokens: Vec<Tok>, params: Vec<Value>) -> Self {
+        Self { tokens, pos: 0, params }
     }
 
     fn peek(&self) -> &Tok {
@@ -1036,6 +1075,13 @@ impl Parser {
     fn expect_str(&mut self) -> Result<String, SqlError> {
         match self.advance() {
             Tok::Str(s) => Ok(s),
+            Tok::Param(idx) => {
+                match self.params.get(idx - 1) {
+                    Some(Value::String(s)) => Ok(s.clone()),
+                    Some(_) => Err(SqlError::ParamTypeMismatch { index: idx, expected: "string" }),
+                    None => Err(SqlError::ParamOutOfRange { index: idx, count: self.params.len() }),
+                }
+            }
             Tok::Eof => Err(SqlError::UnexpectedEnd {
                 expected: "string literal",
             }),
@@ -1049,6 +1095,13 @@ impl Parser {
     fn expect_num(&mut self) -> Result<f64, SqlError> {
         match self.advance() {
             Tok::Num(n) => Ok(n),
+            Tok::Param(idx) => {
+                match self.params.get(idx - 1) {
+                    Some(Value::Number(n)) => n.as_f64().ok_or(SqlError::ParamTypeMismatch { index: idx, expected: "number" }),
+                    Some(_) => Err(SqlError::ParamTypeMismatch { index: idx, expected: "number" }),
+                    None => Err(SqlError::ParamOutOfRange { index: idx, count: self.params.len() }),
+                }
+            }
             Tok::Eof => Err(SqlError::UnexpectedEnd { expected: "number" }),
             other => Err(SqlError::UnexpectedToken {
                 expected: "number",
@@ -1233,6 +1286,12 @@ impl Parser {
             Tok::Kw(Kw::True) => Ok(Value::Bool(true)),
             Tok::Kw(Kw::False) => Ok(Value::Bool(false)),
             Tok::Kw(Kw::Null) => Ok(Value::Null),
+            Tok::Param(idx) => {
+                self.params.get(idx - 1).cloned().ok_or(SqlError::ParamOutOfRange {
+                    index: idx,
+                    count: self.params.len(),
+                })
+            }
             Tok::Eof => Err(SqlError::UnexpectedEnd { expected: "value" }),
             other => Err(SqlError::UnexpectedToken {
                 expected: "value",
@@ -1387,7 +1446,7 @@ impl Parser {
             if let Some(metric) = vec_op {
                 let field = self.expect_ident()?;
                 self.advance(); // consume operator
-                let query = self.parse_f32_array()?;
+                let query = self.parse_f32_array_or_param()?;
                 order_by = Some(OrderKey::Vector { field, query, metric });
             } else {
                 // Arithmetic score expression (handles plain fields, BM25, VECTOR_SIM,
@@ -2089,11 +2148,31 @@ impl Parser {
         self.expect_lparen()?;
         let field = self.expect_ident()?;
         self.expect_comma()?;
-        let query = self.parse_f32_array()?;
+        let query = self.parse_f32_array_or_param()?;
         self.expect_comma()?;
         let k = self.expect_num()? as usize;
         self.expect_rparen()?;
         Ok(CondExpr::VectorNear { field, query, k })
+    }
+
+    /// Parse an f32 vector: either `[num, num, ...]` literal or `$N` param.
+    fn parse_f32_array_or_param(&mut self) -> Result<Vec<f32>, SqlError> {
+        if let Tok::Param(idx) = self.peek().clone() {
+            self.advance();
+            return match self.params.get(idx - 1) {
+                Some(Value::Array(arr)) => {
+                    arr.iter()
+                        .map(|v| v.as_f64().map(|f| f as f32).ok_or(SqlError::ParamTypeMismatch {
+                            index: idx,
+                            expected: "array of numbers",
+                        }))
+                        .collect()
+                }
+                Some(_) => Err(SqlError::ParamTypeMismatch { index: idx, expected: "array of numbers" }),
+                None => Err(SqlError::ParamOutOfRange { index: idx, count: self.params.len() }),
+            };
+        }
+        self.parse_f32_array()
     }
 
     /// Parse a JSON-style f32 array literal: `[ num, num, ... ]`.
@@ -2212,6 +2291,14 @@ impl Parser {
                 self.advance();
                 Ok(ScoreExpr::Lit(n))
             }
+            Tok::Param(idx) => {
+                self.advance();
+                match self.params.get(idx - 1) {
+                    Some(Value::Number(n)) => Ok(ScoreExpr::Lit(n.as_f64().unwrap_or(0.0))),
+                    Some(_) => Err(SqlError::ParamTypeMismatch { index: idx, expected: "number" }),
+                    None => Err(SqlError::ParamOutOfRange { index: idx, count: self.params.len() }),
+                }
+            }
             Tok::LParen => {
                 self.advance(); // consume '('
                 let inner = self.parse_score_expr()?;
@@ -2233,7 +2320,7 @@ impl Parser {
                         self.expect_lparen()?;
                         let field = self.expect_ident()?;
                         self.expect_comma()?;
-                        let query = self.parse_f32_array()?;
+                        let query = self.parse_f32_array_or_param()?;
                         self.expect_rparen()?;
                         Ok(ScoreExpr::VectorCosine { field, query })
                     }
@@ -2241,7 +2328,7 @@ impl Parser {
                         self.expect_lparen()?;
                         let field = self.expect_ident()?;
                         self.expect_comma()?;
-                        let query = self.parse_f32_array()?;
+                        let query = self.parse_f32_array_or_param()?;
                         self.expect_rparen()?;
                         Ok(ScoreExpr::VectorL2 { field, query })
                     }
@@ -2249,7 +2336,7 @@ impl Parser {
                         self.expect_lparen()?;
                         let field = self.expect_ident()?;
                         self.expect_comma()?;
-                        let query = self.parse_f32_array()?;
+                        let query = self.parse_f32_array_or_param()?;
                         self.expect_rparen()?;
                         Ok(ScoreExpr::VectorDot { field, query })
                     }
@@ -2257,7 +2344,7 @@ impl Parser {
                         self.expect_lparen()?;
                         let field = self.expect_ident()?;
                         self.expect_comma()?;
-                        let query = self.parse_f32_array()?;
+                        let query = self.parse_f32_array_or_param()?;
                         self.expect_rparen()?;
                         Ok(ScoreExpr::VectorL1 { field, query })
                     }
@@ -3223,6 +3310,18 @@ impl Parser {
             return Ok(MatchNode { var, label, props });
         }
 
+        // $N param as a slug — resolve to string, treat as a bare name (no var/label distinction)
+        if let Tok::Param(idx) = self.peek().clone() {
+            self.advance();
+            let name = match self.params.get(idx - 1) {
+                Some(Value::String(s)) => s.clone(),
+                Some(_) => return Err(SqlError::ParamTypeMismatch { index: idx, expected: "string" }),
+                None => return Err(SqlError::ParamOutOfRange { index: idx, count: self.params.len() }),
+            };
+            self.expect_rparen()?;
+            return Ok(MatchNode { var: Some(name), label, props });
+        }
+
         // Colon first means no var, just :label
         if matches!(self.peek(), Tok::Colon) {
             self.advance();
@@ -3595,37 +3694,30 @@ impl Parser {
             self.advance(); // consume '->'
             self.expect_lparen()?;
             let node_bind = self.expect_ident()?;
-            if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; } // skip :col
+            let node_label = if matches!(self.peek(), Tok::Colon) { self.advance(); Some(self.expect_ident()?) } else { None };
             self.expect_rparen()?;
-            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth });
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label });
         }
 
         // ── WHERE clause (optional) ───────────────────────────────────────
         // Two kinds of conditions:
         //   1. start_var._key = 'value'  → upgrades MatchAggStart to Slug (fast seed)
-        //   2. any_var.field  = value    → stored in dest_where for post-traversal filter
-        let mut dest_where: Vec<(String, String, serde_json::Value)> = Vec::new();
+        //   2. any_var.field op value    → stored in dest_where for post-traversal filter
+        let mut dest_where: Vec<crate::query::DestWhere> = Vec::new();
         if matches!(self.peek(), Tok::Kw(Kw::Where)) {
             self.advance(); // consume WHERE
             loop {
-                // Parse one condition: var.field = value
                 let cond_var = self.expect_ident()?;
                 self.expect_dot()?;
                 let cond_field = self.expect_ident()?;
-                if !matches!(self.peek(), Tok::Eq) {
-                    return Err(SqlError::UnexpectedToken {
-                        expected: "=",
-                        got: format!("{:?}", self.peek()),
-                    });
-                }
-                self.advance(); // consume '='
+                let op = self.parse_cmp_op()?;
                 let cond_val = self.parse_value()?;
 
                 let is_start_key = cond_field == "_key"
+                    && op == crate::query::CmpOp::Eq
                     && start_var.as_ref().map_or(false, |sv| *sv == cond_var);
 
                 if is_start_key {
-                    // Upgrade Collection → Slug for fast single-node seed.
                     if let Some(key_val) = cond_val.as_str() {
                         let full_slug = match start_label {
                             Some(ref lbl) => format!("{}/{}", lbl, key_val),
@@ -3634,12 +3726,14 @@ impl Parser {
                         start = MatchAggStart::Slug(sk_hash(&full_slug));
                     }
                 } else {
-                    // Post-traversal equality filter on any hop-bound variable.
-                    dest_where.push((cond_var, cond_field, cond_val));
+                    dest_where.push(crate::query::DestWhere {
+                        var: cond_var, field: cond_field, op,
+                        value: crate::query::WhereValue::Literal(cond_val),
+                    });
                 }
 
                 if matches!(self.peek(), Tok::Kw(Kw::And)) {
-                    self.advance(); // consume AND, continue to next condition
+                    self.advance();
                 } else {
                     break;
                 }
@@ -3672,7 +3766,7 @@ impl Parser {
         if let Some(ref gkeys) = group_by {
             for (ret_expr, _alias) in &returns {
                 if let crate::query::MatchAggReturn::Field { var, field } = ret_expr {
-                    if !gkeys.iter().any(|(gv, gf)| gv == var && gf == field) {
+                    if field != "*" && !gkeys.iter().any(|(gv, gf)| gv == var && gf == field) {
                         return Err(SqlError::GroupByViolation(format!("{var}.{field}")));
                     }
                 }
@@ -3706,7 +3800,7 @@ impl Parser {
             None
         };
 
-        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where })
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where, with_stages: None })
     }
 
     /// Parse `SELECT return_list FROM MATCH (start)-[edge]->(node)... [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`
@@ -3797,29 +3891,24 @@ impl Parser {
             self.advance();
             self.expect_lparen()?;
             let node_bind = self.expect_ident()?;
-            if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+            let node_label = if matches!(self.peek(), Tok::Colon) { self.advance(); Some(self.expect_ident()?) } else { None };
             self.expect_rparen()?;
-            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth });
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label });
         }
 
         // ── WHERE (same as parse_match_agg_path) ──────────────────────────
-        let mut dest_where: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut dest_where: Vec<crate::query::DestWhere> = Vec::new();
         if matches!(self.peek(), Tok::Kw(Kw::Where)) {
             self.advance();
             loop {
                 let cond_var = self.expect_ident()?;
                 self.expect_dot()?;
                 let cond_field = self.expect_ident()?;
-                if !matches!(self.peek(), Tok::Eq) {
-                    return Err(SqlError::UnexpectedToken {
-                        expected: "=",
-                        got: format!("{:?}", self.peek()),
-                    });
-                }
-                self.advance();
+                let op = self.parse_cmp_op()?;
                 let cond_val = self.parse_value()?;
 
                 let is_start_key = cond_field == "_key"
+                    && op == crate::query::CmpOp::Eq
                     && start_var.as_ref().map_or(false, |sv| *sv == cond_var);
 
                 if is_start_key {
@@ -3831,7 +3920,10 @@ impl Parser {
                         start = MatchAggStart::Slug(sk_hash(&full_slug));
                     }
                 } else {
-                    dest_where.push((cond_var, cond_field, cond_val));
+                    dest_where.push(crate::query::DestWhere {
+                        var: cond_var, field: cond_field, op,
+                        value: crate::query::WhereValue::Literal(cond_val),
+                    });
                 }
 
                 if matches!(self.peek(), Tok::Kw(Kw::And)) {
@@ -3841,6 +3933,37 @@ impl Parser {
                 }
             }
         }
+
+        // ── WITH stages (optional) ────────────────────────────────────────
+        let mut with_stages_vec: Vec<crate::query::WithStage> = Vec::new();
+        while matches!(self.peek(), Tok::Kw(Kw::With)) {
+            self.advance(); // consume WITH
+            let outputs = self.parse_with_output_list()?;
+            self.expect_kw(Kw::Match, "MATCH")?;
+
+            let sn = self.parse_match_node()?;
+            let sv = sn.var.clone();
+            let sl = sn.label.clone();
+            let mut ms = match sn.label {
+                Some(ref lbl) => MatchAggStart::Collection(sk_hash(lbl)),
+                None => match sn.var {
+                    Some(ref v) => MatchAggStart::Slug(sk_hash(v)),
+                    None => MatchAggStart::All,
+                },
+            };
+
+            let mh = self.parse_hop_chain()?;
+            let wc = self.parse_match_where_clauses(&sv, &sl, &mut ms)?;
+
+            with_stages_vec.push(crate::query::WithStage {
+                outputs,
+                match_start: ms,
+                match_start_var: sv,
+                match_hops: mh,
+                where_clauses: wc,
+            });
+        }
+        let with_stages = if with_stages_vec.is_empty() { None } else { Some(with_stages_vec) };
 
         // ── GROUP BY ──────────────────────────────────────────────────────
         // Supports multiple keys: GROUP BY a.city, b.role
@@ -3864,7 +3987,7 @@ impl Parser {
         if let Some(ref gkeys) = group_by {
             for (ret_expr, _alias) in &returns {
                 if let crate::query::MatchAggReturn::Field { var, field } = ret_expr {
-                    if !gkeys.iter().any(|(gv, gf)| gv == var && gf == field) {
+                    if field != "*" && !gkeys.iter().any(|(gv, gf)| gv == var && gf == field) {
                         return Err(SqlError::GroupByViolation(format!("{var}.{field}")));
                     }
                 }
@@ -3896,7 +4019,7 @@ impl Parser {
             None
         };
 
-        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where })
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where, with_stages })
     }
 
     /// Parse `SELECT return_list FROM MATCH SHORTEST (a[:col])-[r*]->(b[:col])
@@ -4213,9 +4336,9 @@ impl Parser {
                             self.advance();
                             self.expect_lparen()?;
                             let node_bind = self.expect_ident()?;
-                            if matches!(self.peek(), Tok::Colon) { self.advance(); self.expect_ident()?; }
+                            let node_label = if matches!(self.peek(), Tok::Colon) { self.advance(); Some(self.expect_ident()?) } else { None };
                             self.expect_rparen()?;
-                            hops.push(crate::query::HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth });
+                            hops.push(crate::query::HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label });
                         }
                         // Optional WHERE (only _key on start var acted on)
                         if matches!(self.peek(), Tok::Kw(Kw::Where)) {
@@ -4248,7 +4371,7 @@ impl Parser {
                             }
                         }
                         FromSource::Match(MatchAggStmt {
-                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, limit: None, dest_where: vec![],
+                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, limit: None, dest_where: vec![], with_stages: None,
                         })
                     }
                 }
@@ -4371,9 +4494,15 @@ impl Parser {
                     MatchAggReturn::Now
                 } else {
                     let var = self.expect_ident()?;
-                    self.expect_dot()?;
-                    let field = self.expect_ident()?;
-                    MatchAggReturn::Field { var, field }
+                    if matches!(self.peek(), Tok::Dot) {
+                        self.advance();
+                        let field = self.expect_ident()?;
+                        MatchAggReturn::Field { var, field }
+                    } else {
+                        // Bare identifier — reference to a bound variable or WITH alias.
+                        // Represented as Field { var, field: "*" } to signal "whole value".
+                        MatchAggReturn::Field { var, field: "*".to_string() }
+                    }
                 }
             }
             Tok::Kw(Kw::Case) => {
@@ -4414,7 +4543,9 @@ impl Parser {
 
         // Optional AS alias
         let default_alias = match &expr {
-            MatchAggReturn::Field { var, field } => format!("{}.{}", var, field),
+            MatchAggReturn::Field { var, field } => {
+                if field == "*" { var.clone() } else { format!("{}.{}", var, field) }
+            }
             MatchAggReturn::Sum(_) => "sum".to_string(),
             MatchAggReturn::Count => "count".to_string(),
             MatchAggReturn::Avg(_) => "avg".to_string(),
@@ -4474,12 +4605,22 @@ impl Parser {
         Ok(left)
     }
 
-    /// Parse a math primary: `var.field`, numeric literal, or `(expr)`.
+    /// Parse a math primary: `var.field`, numeric literal, `$N` param, or `(expr)`.
     fn parse_math_primary(&mut self) -> Result<crate::query::MathExpr, SqlError> {
         match self.peek().clone() {
             Tok::Num(n) => {
                 self.advance();
                 Ok(crate::query::MathExpr::Literal(n))
+            }
+            Tok::Param(idx) => {
+                self.advance();
+                match self.params.get(idx - 1) {
+                    Some(Value::Number(n)) => Ok(crate::query::MathExpr::Literal(
+                        n.as_f64().unwrap_or(0.0),
+                    )),
+                    Some(_) => Err(SqlError::ParamTypeMismatch { index: idx, expected: "number" }),
+                    None => Err(SqlError::ParamOutOfRange { index: idx, count: self.params.len() }),
+                }
             }
             Tok::LParen => {
                 self.advance();
@@ -4487,11 +4628,17 @@ impl Parser {
                 self.expect_rparen()?;
                 Ok(inner)
             }
-            Tok::Ident(_) => {
+            Tok::Ident(_) | Tok::Kw(_) => {
                 let var = self.expect_ident()?;
-                self.expect_dot()?;
-                let field = self.expect_ident()?;
-                Ok(crate::query::MathExpr::VarField { var, field })
+                if matches!(self.peek(), Tok::Dot) {
+                    self.advance();
+                    let field = self.expect_ident()?;
+                    Ok(crate::query::MathExpr::VarField { var, field })
+                } else {
+                    // Bare identifier — reference to a WITH alias (top-level row key).
+                    // VarField with field="*" signals "take the numeric value directly".
+                    Ok(crate::query::MathExpr::VarField { var, field: "*".to_string() })
+                }
             }
             other => Err(SqlError::UnexpectedToken {
                 expected: "number, var.field, or (expr)",
@@ -4510,268 +4657,39 @@ impl Parser {
             Tok::Gt  => { self.advance(); Ok(CmpOp::Gt) }
             Tok::Lte => { self.advance(); Ok(CmpOp::Lte) }
             Tok::Gte => { self.advance(); Ok(CmpOp::Gte) }
+            Tok::Kw(Kw::ILike) => { self.advance(); Ok(CmpOp::ILike) }
             other => Err(SqlError::UnexpectedToken {
-                expected: "comparison operator (=, !=, <>, <, >, <=, >=)",
+                expected: "comparison operator (=, !=, <>, <, >, <=, >=, ILIKE)",
                 got: format!("{other:?}"),
             }),
         }
     }
 
-    // ── PIPELINE parser (MATCH + WITH) ───────────────────────────────────────
+    // ── WITH expression parser (for SELECT FROM MATCH ... WITH ... MATCH ... and MATCH...RETURN) ──
 
-    /// Parse a `MATCH + WITH` pipeline statement.
-    ///
-    /// ```text
-    /// MATCH start_pattern [WITH output_list MATCH start_pattern]* RETURN output_list [ORDER BY alias] [LIMIT n]
-    /// ```
-    pub fn parse_pipeline(&mut self) -> Result<crate::pipeline::Pipeline, SqlError> {
-        use crate::pipeline::{Pipeline, PipelineStage, PipeProjectStage};
-
-        let mut stages = Vec::new();
-
-        // First MATCH (keyword already consumed by caller or to be consumed here)
-        self.expect_kw(Kw::Match, "MATCH")?;
-        stages.push(PipelineStage::Match(self.parse_pipe_match_stage()?));
-
-        loop {
-            match self.peek().clone() {
-                Tok::Kw(Kw::With) => {
-                    self.advance(); // consume WITH
-                    let outputs = self.parse_pipe_output_list()?;
-                    stages.push(PipelineStage::Project(PipeProjectStage {
-                        outputs,
-                        order_by: None,
-                        limit: None,
-                    }));
-                    // Next must be MATCH (continue pipeline) or RETURN (fall through)
-                    if matches!(self.peek(), Tok::Kw(Kw::Match)) {
-                        self.advance(); // consume MATCH
-                        stages.push(PipelineStage::Match(self.parse_pipe_match_stage()?));
-                    } else if !matches!(self.peek(), Tok::Kw(Kw::Return)) {
-                        return Err(SqlError::UnexpectedToken {
-                            expected: "MATCH or RETURN after WITH",
-                            got: format!("{:?}", self.peek()),
-                        });
-                    }
-                    // If peek is Return, next loop iteration handles it
-                }
-                Tok::Kw(Kw::Return) => {
-                    self.advance(); // consume RETURN
-                    let outputs = self.parse_pipe_output_list()?;
-                    let order_by = self.parse_pipe_opt_order_by()?;
-                    let limit = self.parse_pipe_opt_limit()?;
-                    stages.push(PipelineStage::Project(PipeProjectStage {
-                        outputs,
-                        order_by,
-                        limit,
-                    }));
-                    break;
-                }
-                Tok::Eof => {
-                    return Err(SqlError::UnexpectedEnd { expected: "WITH or RETURN" })
-                }
-                other => {
-                    return Err(SqlError::UnexpectedToken {
-                        expected: "WITH or RETURN",
-                        got: format!("{other:?}"),
-                    })
-                }
-            }
-        }
-
-        Ok(Pipeline { stages })
-    }
-
-    /// Parse a MATCH pattern (start node + hop chain).
-    /// Caller has already consumed the MATCH keyword.
-    fn parse_pipe_match_stage(&mut self) -> Result<crate::pipeline::PipeMatchStage, SqlError> {
-        use crate::pipeline::{PipeHop, PipeMatchStage};
-
-        let start = self.parse_pipe_match_start()?;
-        let mut hops = Vec::new();
-
-        // Each hop: -[:edge_type]->(bind[:col])
-        while matches!(self.peek(), Tok::Dash) {
-            self.advance(); // consume -
-            self.expect_lbracket()?;
-            if matches!(self.peek(), Tok::Colon) {
-                self.advance();
-            }
-            let edge_type = self.expect_ident()?;
-            self.expect_rbracket()?;
-            self.expect_arrow()?;
-            let (bind, col_filter) = self.parse_pipe_hop_node()?;
-            hops.push(PipeHop {
-                edge_type_hash: sk_hash(&edge_type),
-                bind,
-                col_filter,
-            });
-        }
-
-        Ok(PipeMatchStage { start, hops })
-    }
-
-    /// Parse: `('slug')` or `(var:collection [WHERE ...])`
-    fn parse_pipe_match_start(&mut self) -> Result<crate::pipeline::PipeMatchStart, SqlError> {
-        use crate::pipeline::PipeMatchStart;
-
-        self.expect_lparen()?;
-        match self.peek().clone() {
-            Tok::Str(slug) => {
-                self.advance();
-                self.expect_rparen()?;
-                Ok(PipeMatchStart::Slug(sk_hash(&slug)))
-            }
-            Tok::Ident(_) | Tok::Kw(_) => {
-                let name = self.expect_ident()?;
-                match self.peek().clone() {
-                    Tok::Colon => {
-                        self.advance(); // consume :
-                        let col = self.expect_ident()?;
-                        let mut filters = vec![];
-                        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
-                            self.advance(); // consume WHERE
-                            filters = self.parse_pipe_where_conds()?;
-                        }
-                        self.expect_rparen()?;
-                        Ok(PipeMatchStart::Collection {
-                            bind: Some(name),
-                            col_hash: sk_hash(&col),
-                            filters,
-                        })
-                    }
-                    Tok::RParen => {
-                        self.advance(); // consume )
-                        // Bare `(name)` — collection scan with bind, no filter
-                        // Treat as all-nodes bind (useful for pipeline starts that reference prior result)
-                        // We require a collection label for meaningful pipeline traversal
-                        Err(SqlError::UnexpectedToken {
-                            expected: ":collection after variable name in MATCH start",
-                            got: format!(") (use ({}:collection) syntax)", name),
-                        })
-                    }
-                    other => Err(SqlError::UnexpectedToken {
-                        expected: ": or ) after variable name in MATCH start",
-                        got: format!("{other:?}"),
-                    }),
-                }
-            }
-            other => Err(SqlError::UnexpectedToken {
-                expected: "string literal or (var:collection) in MATCH start",
-                got: format!("{other:?}"),
-            }),
-        }
-    }
-
-    /// Parse hop endpoint: `(bind[:collection])`
-    fn parse_pipe_hop_node(&mut self) -> Result<(String, Option<u64>), SqlError> {
-        self.expect_lparen()?;
-        let bind = self.expect_ident()?;
-        let col_filter = if matches!(self.peek(), Tok::Colon) {
-            self.advance(); // consume :
-            let col = self.expect_ident()?;
-            Some(sk_hash(&col))
-        } else {
-            None
-        };
-        self.expect_rparen()?;
-        Ok((bind, col_filter))
-    }
-
-    /// Parse WHERE conditions: `field = value_or_ref [AND ...]`
-    fn parse_pipe_where_conds(&mut self) -> Result<Vec<crate::pipeline::PipeWhere>, SqlError> {
-        let mut conds = vec![self.parse_pipe_where_cond()?];
-        while matches!(self.peek(), Tok::Kw(Kw::And)) {
-            self.advance();
-            conds.push(self.parse_pipe_where_cond()?);
-        }
-        Ok(conds)
-    }
-
-    /// Parse: `field <op> literal_or_row_ref`
-    /// Op: `=`  `!=`  `<>`  `<`  `<=`  `>`  `>=`
-    fn parse_pipe_where_cond(&mut self) -> Result<crate::pipeline::PipeWhere, SqlError> {
-        use crate::pipeline::{CmpOp, PipeWhere};
-
-        let field = self.expect_ident()?;
-
-        let op = match self.peek().clone() {
-            Tok::Eq  => { self.advance(); CmpOp::Eq  }
-            Tok::Neq => { self.advance(); CmpOp::Ne  }
-            Tok::Lt  => { self.advance(); CmpOp::Lt  }
-            Tok::Lte => { self.advance(); CmpOp::Lte }
-            Tok::Gt  => { self.advance(); CmpOp::Gt  }
-            Tok::Gte => { self.advance(); CmpOp::Gte }
-            other => return Err(SqlError::UnexpectedToken {
-                expected: "comparison operator (= != <> < <= > >=) in pipeline WHERE",
-                got: format!("{other:?}"),
-            }),
-        };
-
-        match self.peek().clone() {
-            Tok::Str(s) => {
-                self.advance();
-                Ok(PipeWhere::FieldCmpLiteral { field, op, value: Value::String(s) })
-            }
-            Tok::Num(n) => {
-                self.advance();
-                let num = serde_json::Number::from_f64(n)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null);
-                Ok(PipeWhere::FieldCmpLiteral { field, op, value: num })
-            }
-            Tok::Kw(Kw::True) => {
-                self.advance();
-                Ok(PipeWhere::FieldCmpLiteral { field, op, value: Value::Bool(true) })
-            }
-            Tok::Kw(Kw::False) => {
-                self.advance();
-                Ok(PipeWhere::FieldCmpLiteral { field, op, value: Value::Bool(false) })
-            }
-            Tok::Kw(Kw::Null) => {
-                self.advance();
-                Ok(PipeWhere::FieldCmpLiteral { field, op, value: Value::Null })
-            }
-            Tok::Ident(row_key) => {
-                self.advance();
-                Ok(PipeWhere::FieldCmpRowRef { field, op, row_key })
-            }
-            other => Err(SqlError::UnexpectedToken {
-                expected: "literal or row reference in pipeline WHERE",
-                got: format!("{other:?}"),
-            }),
-        }
-    }
-
-    /// Parse WITH/RETURN output list: `expr AS alias [, expr AS alias]*`
-    fn parse_pipe_output_list(
-        &mut self,
-    ) -> Result<Vec<(crate::pipeline::PipeOutExpr, String)>, SqlError> {
-        let mut items = vec![self.parse_pipe_output_item()?];
+    /// Parse WITH output list: `expr AS alias [, expr AS alias]*`
+    fn parse_with_output_list(&mut self) -> Result<Vec<(crate::query::WithOutExpr, String)>, SqlError> {
+        let mut items = vec![self.parse_with_output_item()?];
         while matches!(self.peek(), Tok::Comma) {
             self.advance();
-            items.push(self.parse_pipe_output_item()?);
+            items.push(self.parse_with_output_item()?);
         }
         Ok(items)
     }
 
-    fn parse_pipe_output_item(
-        &mut self,
-    ) -> Result<(crate::pipeline::PipeOutExpr, String), SqlError> {
-        use crate::pipeline::{PipeExpr, PipeOutExpr};
-        let expr = self.parse_pipe_out_expr()?;
-
-        // `AS alias` is optional — derive alias from expression when absent
+    fn parse_with_output_item(&mut self) -> Result<(crate::query::WithOutExpr, String), SqlError> {
+        use crate::query::{WithExpr, WithOutExpr};
+        let expr = self.parse_with_out_expr()?;
         let alias = if matches!(self.peek(), Tok::Kw(Kw::As)) {
-            self.advance(); // consume AS
+            self.advance();
             self.expect_ident()?
         } else {
             match &expr {
-                PipeOutExpr::Scalar(PipeExpr::RowKey(key)) => key.clone(),
-                PipeOutExpr::Scalar(PipeExpr::RowField { field, .. }) => field.clone(),
+                WithOutExpr::Scalar(WithExpr::RowKey(key)) => key.clone(),
+                WithOutExpr::Scalar(WithExpr::VarField { field, .. }) => field.clone(),
                 _ => {
                     return Err(SqlError::UnexpectedToken {
-                        expected: "AS alias (required for aggregate expressions)",
+                        expected: "AS alias (required for aggregate/complex expressions)",
                         got: format!("{:?}", self.peek()),
                     });
                 }
@@ -4780,59 +4698,57 @@ impl Parser {
         Ok((expr, alias))
     }
 
-    fn parse_pipe_out_expr(&mut self) -> Result<crate::pipeline::PipeOutExpr, SqlError> {
-        use crate::pipeline::PipeOutExpr;
+    fn parse_with_out_expr(&mut self) -> Result<crate::query::WithOutExpr, SqlError> {
+        use crate::query::WithOutExpr;
         match self.peek().clone() {
             Tok::Kw(Kw::Sum) => {
                 self.advance();
-                Ok(PipeOutExpr::Sum(self.parse_pipe_paren_math_expr()?))
+                Ok(WithOutExpr::Sum(self.parse_with_paren_math_expr()?))
             }
             Tok::Kw(Kw::Avg) => {
                 self.advance();
-                Ok(PipeOutExpr::Avg(self.parse_pipe_paren_math_expr()?))
+                Ok(WithOutExpr::Avg(self.parse_with_paren_math_expr()?))
             }
             Tok::Kw(Kw::Min) => {
                 self.advance();
-                Ok(PipeOutExpr::Min(self.parse_pipe_paren_math_expr()?))
+                Ok(WithOutExpr::Min(self.parse_with_paren_math_expr()?))
             }
             Tok::Kw(Kw::Max) => {
                 self.advance();
-                Ok(PipeOutExpr::Max(self.parse_pipe_paren_math_expr()?))
+                Ok(WithOutExpr::Max(self.parse_with_paren_math_expr()?))
             }
             Tok::Kw(Kw::Count) => {
                 self.advance();
                 self.expect_lparen()?;
-                if matches!(self.peek(), Tok::Star) {
-                    self.advance();
-                }
+                if matches!(self.peek(), Tok::Star) { self.advance(); }
                 self.expect_rparen()?;
-                Ok(PipeOutExpr::Count)
+                Ok(WithOutExpr::Count)
             }
-            _ => Ok(PipeOutExpr::Scalar(self.parse_pipe_math_expr()?)),
+            _ => Ok(WithOutExpr::Scalar(self.parse_with_math_expr()?)),
         }
     }
 
-    fn parse_pipe_paren_math_expr(&mut self) -> Result<crate::pipeline::PipeExpr, SqlError> {
+    fn parse_with_paren_math_expr(&mut self) -> Result<crate::query::WithExpr, SqlError> {
         self.expect_lparen()?;
-        let expr = self.parse_pipe_math_expr()?;
+        let expr = self.parse_with_math_expr()?;
         self.expect_rparen()?;
         Ok(expr)
     }
 
-    fn parse_pipe_math_expr(&mut self) -> Result<crate::pipeline::PipeExpr, SqlError> {
-        use crate::pipeline::PipeExpr;
-        let mut left = self.parse_pipe_math_term()?;
+    fn parse_with_math_expr(&mut self) -> Result<crate::query::WithExpr, SqlError> {
+        use crate::query::WithExpr;
+        let mut left = self.parse_with_math_term()?;
         loop {
             match self.peek() {
                 Tok::Plus => {
                     self.advance();
-                    let right = self.parse_pipe_math_term()?;
-                    left = PipeExpr::Add(Box::new(left), Box::new(right));
+                    let right = self.parse_with_math_term()?;
+                    left = WithExpr::Add(Box::new(left), Box::new(right));
                 }
                 Tok::Dash => {
                     self.advance();
-                    let right = self.parse_pipe_math_term()?;
-                    left = PipeExpr::Sub(Box::new(left), Box::new(right));
+                    let right = self.parse_with_math_term()?;
+                    left = WithExpr::Sub(Box::new(left), Box::new(right));
                 }
                 _ => break,
             }
@@ -4840,20 +4756,20 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_pipe_math_term(&mut self) -> Result<crate::pipeline::PipeExpr, SqlError> {
-        use crate::pipeline::PipeExpr;
-        let mut left = self.parse_pipe_math_primary()?;
+    fn parse_with_math_term(&mut self) -> Result<crate::query::WithExpr, SqlError> {
+        use crate::query::WithExpr;
+        let mut left = self.parse_with_math_primary()?;
         loop {
             match self.peek() {
                 Tok::Star => {
                     self.advance();
-                    let right = self.parse_pipe_math_primary()?;
-                    left = PipeExpr::Mul(Box::new(left), Box::new(right));
+                    let right = self.parse_with_math_primary()?;
+                    left = WithExpr::Mul(Box::new(left), Box::new(right));
                 }
                 Tok::Slash => {
                     self.advance();
-                    let right = self.parse_pipe_math_primary()?;
-                    left = PipeExpr::Div(Box::new(left), Box::new(right));
+                    let right = self.parse_with_math_primary()?;
+                    left = WithExpr::Div(Box::new(left), Box::new(right));
                 }
                 _ => break,
             }
@@ -4861,72 +4777,396 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_pipe_math_primary(&mut self) -> Result<crate::pipeline::PipeExpr, SqlError> {
-        use crate::pipeline::PipeExpr;
+    fn parse_with_math_primary(&mut self) -> Result<crate::query::WithExpr, SqlError> {
+        use crate::query::WithExpr;
         match self.peek().clone() {
             Tok::Num(n) => {
                 self.advance();
-                Ok(PipeExpr::Literal(n))
+                Ok(WithExpr::Literal(n))
+            }
+            Tok::Param(idx) => {
+                self.advance();
+                match self.params.get(idx - 1) {
+                    Some(Value::Number(n)) => Ok(WithExpr::Literal(n.as_f64().unwrap_or(0.0))),
+                    Some(_) => Err(SqlError::ParamTypeMismatch { index: idx, expected: "number" }),
+                    None => Err(SqlError::ParamOutOfRange { index: idx, count: self.params.len() }),
+                }
             }
             Tok::LParen => {
                 self.advance();
-                let expr = self.parse_pipe_math_expr()?;
+                let expr = self.parse_with_math_expr()?;
                 self.expect_rparen()?;
                 Ok(expr)
             }
             Tok::Ident(_) | Tok::Kw(_) => {
                 let name = self.expect_ident()?;
                 if matches!(self.peek(), Tok::Dot) {
-                    self.advance(); // consume .
+                    self.advance();
                     let field = self.expect_ident()?;
-                    Ok(PipeExpr::RowField { var: name, field })
+                    Ok(WithExpr::VarField { var: name, field })
                 } else {
-                    Ok(PipeExpr::RowKey(name))
+                    Ok(WithExpr::RowKey(name))
                 }
             }
             other => Err(SqlError::UnexpectedToken {
-                expected: "number, identifier, or ( in expression",
+                expected: "number, identifier, or ( in WITH expression",
                 got: format!("{other:?}"),
             }),
         }
     }
 
-    fn parse_pipe_opt_order_by(&mut self) -> Result<Option<(String, bool)>, SqlError> {
-        if !matches!(self.peek(), Tok::Kw(Kw::Order)) {
-            return Ok(None);
+    /// Parse WHERE conditions that support both literals and RowRef (for multi-stage).
+    /// Used after MATCH hops in WITH stages.
+    fn parse_match_where_clauses(
+        &mut self,
+        start_var: &Option<String>,
+        start_label: &Option<String>,
+        start: &mut crate::query::MatchAggStart,
+    ) -> Result<Vec<crate::query::DestWhere>, SqlError> {
+        let mut dest_where: Vec<crate::query::DestWhere> = Vec::new();
+        if !matches!(self.peek(), Tok::Kw(Kw::Where)) {
+            return Ok(dest_where);
         }
-        self.advance(); // ORDER
-        self.expect_kw(Kw::By, "BY")?;
-        let field = self.expect_ident()?;
-        let asc = !matches!(self.peek(), Tok::Kw(Kw::Desc));
-        if !asc {
-            self.advance(); // consume DESC
-        } else if matches!(self.peek(), Tok::Kw(Kw::Asc)) {
-            self.advance(); // consume optional ASC
+        self.advance(); // consume WHERE
+        loop {
+            let cond_var = self.expect_ident()?;
+            self.expect_dot()?;
+            let cond_field = self.expect_ident()?;
+            let op = self.parse_cmp_op()?;
+            // RHS: literal value, param, or bare ident (RowRef)
+            let (cond_val_opt, row_ref) = match self.peek().clone() {
+                Tok::Ident(ref name) if !matches!(self.peek(), Tok::Kw(_)) => {
+                    let rr = name.clone();
+                    self.advance();
+                    (None, Some(rr))
+                }
+                _ => {
+                    let v = self.parse_value()?;
+                    (Some(v), None)
+                }
+            };
+
+            let is_start_key = cond_field == "_key"
+                && op == crate::query::CmpOp::Eq
+                && start_var.as_ref().map_or(false, |sv| *sv == cond_var)
+                && cond_val_opt.is_some();
+
+            if is_start_key {
+                if let Some(ref cond_val) = cond_val_opt {
+                    if let Some(key_val) = cond_val.as_str() {
+                        let full_slug = match start_label {
+                            Some(ref lbl) => format!("{}/{}", lbl, key_val),
+                            None => key_val.to_string(),
+                        };
+                        *start = crate::query::MatchAggStart::Slug(sk_hash(&full_slug));
+                    }
+                }
+            } else {
+                let value = if let Some(rr) = row_ref {
+                    crate::query::WhereValue::RowRef(rr)
+                } else {
+                    crate::query::WhereValue::Literal(cond_val_opt.unwrap())
+                };
+                dest_where.push(crate::query::DestWhere {
+                    var: cond_var, field: cond_field, op, value,
+                });
+            }
+
+            if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                self.advance();
+            } else {
+                break;
+            }
         }
-        Ok(Some((field, asc)))
+        Ok(dest_where)
     }
 
-    fn parse_pipe_opt_limit(&mut self) -> Result<Option<usize>, SqlError> {
-        if !matches!(self.peek(), Tok::Kw(Kw::Limit)) {
-            return Ok(None);
-        }
-        self.advance(); // LIMIT
-        let n = self.expect_num()?;
-        Ok(Some(n as usize))
-    }
+    /// Parse a MATCH...RETURN (with optional WITH stages) into a MatchAggStmt.
+    /// Called from `parse_match_or_agg_inner` when MATCH...WITH or MATCH...RETURN with
+    /// projections is detected.
+    fn parse_match_return_with(&mut self) -> Result<crate::query::MatchAggStmt, SqlError> {
+        use crate::query::{MatchAggStmt, WithStage};
 
-    fn expect_arrow(&mut self) -> Result<(), SqlError> {
-        if matches!(self.peek(), Tok::Arrow) {
+        // ── First MATCH ──
+        self.expect_kw(Kw::Match, "MATCH")?;
+        let (mut start, start_var, start_label, mut inline_where) =
+            self.parse_match_start_with_inline_where()?;
+
+        // ── Hop chain ──
+        let hops = self.parse_hop_chain()?;
+
+        // ── WHERE (after hops) ──
+        let mut dest_where = self.parse_match_where_clauses(&start_var, &start_label, &mut start)?;
+        // Merge inline WHERE (from inside start node parens) into dest_where
+        dest_where.append(&mut inline_where);
+
+        // ── WITH stages ──
+        let mut with_stages: Vec<WithStage> = Vec::new();
+        while matches!(self.peek(), Tok::Kw(Kw::With)) {
+            self.advance(); // consume WITH
+            let outputs = self.parse_with_output_list()?;
+
+            // WITH may not be followed by MATCH if it's followed by RETURN
+            // (e.g., `WITH ... RETURN ...` without another MATCH)
+            if !matches!(self.peek(), Tok::Kw(Kw::Match)) {
+                // No further MATCH — the WITH outputs just feed into the RETURN clause.
+                // We need a dummy stage with no hops to hold the projection.
+                with_stages.push(WithStage {
+                    outputs,
+                    match_start: crate::query::MatchAggStart::All,
+                    match_start_var: None,
+                    match_hops: vec![],
+                    where_clauses: vec![],
+                });
+                break;
+            }
+            self.advance(); // consume MATCH
+
+            let (mut ms, sv, sl, mut stage_inline_where) =
+                self.parse_match_start_with_inline_where()?;
+            let mh = self.parse_hop_chain()?;
+            let mut wc = self.parse_match_where_clauses(&sv, &sl, &mut ms)?;
+            wc.append(&mut stage_inline_where);
+
+            with_stages.push(WithStage {
+                outputs,
+                match_start: ms,
+                match_start_var: sv,
+                match_hops: mh,
+                where_clauses: wc,
+            });
+        }
+
+        // ── RETURN ──
+        self.expect_kw(Kw::Return, "RETURN")?;
+        let returns = self.parse_agg_return_list()?;
+
+        // ── GROUP BY ──
+        let group_by = if matches!(self.peek(), Tok::Kw(Kw::Group)) {
             self.advance();
-            Ok(())
+            self.expect_kw(Kw::By, "BY")?;
+            let mut keys: Vec<(String, String)> = Vec::new();
+            loop {
+                let var = self.expect_ident()?;
+                self.expect_dot()?;
+                let field = self.expect_ident()?;
+                keys.push((var, field));
+                if matches!(self.peek(), Tok::Comma) { self.advance(); } else { break; }
+            }
+            Some(keys)
         } else {
-            Err(SqlError::UnexpectedToken {
-                expected: "->",
-                got: format!("{:?}", self.peek()),
-            })
-        }
+            None
+        };
+
+        // ── ORDER BY ──
+        let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
+            self.advance();
+            self.expect_kw(Kw::By, "BY")?;
+            let alias = self.expect_ident()?;
+            let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
+                self.advance(); false
+            } else {
+                if matches!(self.peek(), Tok::Kw(Kw::Asc)) { self.advance(); }
+                true
+            };
+            Some((alias, ascending))
+        } else {
+            None
+        };
+
+        // ── LIMIT ──
+        let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
+            self.advance();
+            Some(self.expect_num()? as usize)
+        } else {
+            None
+        };
+
+        let ws = if with_stages.is_empty() { None } else { Some(with_stages) };
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where, with_stages: ws })
     }
+
+    /// Parse a MATCH start node that may contain inline WHERE conditions inside the parens.
+    /// Returns (MatchAggStart, start_var, start_label, inline_where_clauses).
+    /// Handles patterns like: `('slug')`, `(var:col)`, `(var:col WHERE _key = ref)`
+    fn parse_match_start_with_inline_where(&mut self) -> Result<(
+        crate::query::MatchAggStart,
+        Option<String>,
+        Option<String>,
+        Vec<crate::query::DestWhere>,
+    ), SqlError> {
+        self.expect_lparen()?;
+
+        // Handle $N param as slug
+        if let Tok::Param(idx) = self.peek().clone() {
+            self.advance();
+            let slug = match self.params.get(idx - 1) {
+                Some(Value::String(s)) => s.clone(),
+                Some(_) => return Err(SqlError::ParamTypeMismatch { index: idx, expected: "string" }),
+                None => return Err(SqlError::ParamOutOfRange { index: idx, count: self.params.len() }),
+            };
+            self.expect_rparen()?;
+            return Ok((crate::query::MatchAggStart::Slug(sk_hash(&slug)), None, None, vec![]));
+        }
+
+        // Handle string literal as slug: ('slug/path')
+        if let Tok::Str(ref s) = self.peek().clone() {
+            let slug = s.clone();
+            self.advance();
+            self.expect_rparen()?;
+            return Ok((crate::query::MatchAggStart::Slug(sk_hash(&slug)), None, None, vec![]));
+        }
+
+        let name = self.expect_ident()?;
+        if !matches!(self.peek(), Tok::Colon) {
+            // Bare (name) — treated as slug
+            self.expect_rparen()?;
+            return Ok((crate::query::MatchAggStart::Slug(sk_hash(&name)), Some(name.clone()), None, vec![]));
+        }
+        self.advance(); // consume :
+        let label = self.expect_ident()?;
+
+        // Optional inline WHERE
+        let mut inline_where: Vec<crate::query::DestWhere> = Vec::new();
+        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
+            self.advance(); // consume WHERE
+            loop {
+                let field = self.expect_ident()?;
+                let op = self.parse_cmp_op()?;
+                // RHS: literal, param, or bare ident (RowRef)
+                let value = match self.peek().clone() {
+                    Tok::Str(s) => {
+                        self.advance();
+                        crate::query::WhereValue::Literal(Value::String(s))
+                    }
+                    Tok::Num(n) => {
+                        self.advance();
+                        let num = serde_json::Number::from_f64(n)
+                            .map(Value::Number)
+                            .unwrap_or(Value::Null);
+                        crate::query::WhereValue::Literal(num)
+                    }
+                    Tok::Kw(Kw::True) => { self.advance(); crate::query::WhereValue::Literal(Value::Bool(true)) }
+                    Tok::Kw(Kw::False) => { self.advance(); crate::query::WhereValue::Literal(Value::Bool(false)) }
+                    Tok::Kw(Kw::Null) => { self.advance(); crate::query::WhereValue::Literal(Value::Null) }
+                    Tok::Param(idx) => {
+                        self.advance();
+                        let val = self.params.get(idx - 1).cloned().ok_or(SqlError::ParamOutOfRange {
+                            index: idx,
+                            count: self.params.len(),
+                        })?;
+                        crate::query::WhereValue::Literal(val)
+                    }
+                    Tok::Ident(ref row_key) => {
+                        let rr = row_key.clone();
+                        self.advance();
+                        crate::query::WhereValue::RowRef(rr)
+                    }
+                    ref other => return Err(SqlError::UnexpectedToken {
+                        expected: "literal or row reference in WHERE",
+                        got: format!("{other:?}"),
+                    }),
+                };
+                inline_where.push(crate::query::DestWhere {
+                    var: name.clone(), field, op, value,
+                });
+                if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_rparen()?;
+        // _key optimization: if there's an `_key = literal` condition, upgrade to Slug.
+        let mut start = crate::query::MatchAggStart::Collection(sk_hash(&label));
+        inline_where.retain(|dw| {
+            if dw.field == "_key" && dw.op == crate::query::CmpOp::Eq {
+                if let crate::query::WhereValue::Literal(ref val) = dw.value {
+                    if let Some(key_val) = val.as_str() {
+                        let full_slug = format!("{}/{}", label, key_val);
+                        start = crate::query::MatchAggStart::Slug(sk_hash(&full_slug));
+                        return false; // consumed — remove from inline_where
+                    }
+                }
+            }
+            true
+        });
+        Ok((start, Some(name), Some(label), inline_where))
+    }
+
+    /// Parse hop chain: `-[edge_spec]->(node)` repeated.
+    fn parse_hop_chain(&mut self) -> Result<Vec<crate::query::HopSpec>, SqlError> {
+        use crate::query::HopSpec;
+        let mut hops: Vec<HopSpec> = Vec::new();
+        while matches!(self.peek(), Tok::Dash) {
+            self.advance(); // consume '-'
+            self.expect_lbracket()?;
+
+            let mut edge_bind: Option<String> = None;
+            let mut edge_type_hash: u64 = 0;
+
+            match self.peek().clone() {
+                Tok::Ident(name) => {
+                    self.advance();
+                    match self.peek() {
+                        Tok::Colon => {
+                            self.advance();
+                            let et = self.expect_ident()?;
+                            edge_bind = Some(name);
+                            edge_type_hash = sk_hash(&et);
+                        }
+                        _ => { edge_bind = Some(name); }
+                    }
+                }
+                Tok::Colon => {
+                    self.advance();
+                    let et = self.expect_ident()?;
+                    edge_type_hash = sk_hash(&et);
+                }
+                _ => {}
+            }
+
+            let (mut min_depth, mut max_depth) = (1u32, 1u32);
+            if matches!(self.peek(), Tok::Star) {
+                self.advance();
+                if let Tok::Num(_) = self.peek().clone() {
+                    let mn = self.expect_num()? as u32;
+                    if matches!(self.peek(), Tok::DotDot) {
+                        self.advance();
+                        let mx = self.expect_num()? as u32;
+                        min_depth = mn;
+                        max_depth = mx;
+                    } else {
+                        min_depth = mn;
+                        max_depth = mn;
+                    }
+                }
+            }
+            loop {
+                match self.peek() {
+                    Tok::RBracket | Tok::Eof => break,
+                    _ => { self.advance(); }
+                }
+            }
+            self.expect_rbracket()?;
+
+            if !matches!(self.peek(), Tok::Arrow) {
+                return Err(SqlError::UnexpectedToken {
+                    expected: "->",
+                    got: format!("{:?}", self.peek()),
+                });
+            }
+            self.advance();
+            self.expect_lparen()?;
+            let node_bind = self.expect_ident()?;
+            let node_label = if matches!(self.peek(), Tok::Colon) { self.advance(); Some(self.expect_ident()?) } else { None };
+            self.expect_rparen()?;
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label });
+        }
+        Ok(hops)
+    }
+
 }
 
 // ── Compiler ──────────────────────────────────────────────────────────────────
@@ -5439,16 +5679,6 @@ fn compile_update(stmt: UpdateStmt) -> CompiledMutation {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Parse a `MATCH + WITH` pipeline statement.
-///
-/// # Errors
-/// Returns [`SqlError`] if the statement is syntactically invalid.
-pub fn parse_pipeline(sql: &str) -> Result<crate::pipeline::Pipeline, SqlError> {
-    let tokens = tokenize(sql)?;
-    let mut parser = Parser::new(tokens);
-    parser.parse_pipeline()
-}
-
 /// The result of parsing a MATCH statement — either a compiled step pipeline
 /// (simple graph traversal) or an aggregate statement.
 pub enum MatchOrAgg {
@@ -5462,41 +5692,42 @@ pub enum MatchOrAgg {
     MultiFrom(crate::query::MultiFromStmt),
 }
 
-/// Parse a MATCH statement and determine whether it is a simple graph query
-/// or an aggregate (multi-hop with RETURN var.field / aggregate functions).
-///
-/// This is the unified entry-point called by `db.query()`.
-///
-/// # Errors
-/// Returns [`SqlError`] if the statement is syntactically invalid.
-pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
+fn parse_match_or_agg_inner(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
     let tokens = tokenize(sql)?;
 
     // Multi-FROM: SELECT … FROM source1, source2, … (comma between FROM sources)
     if is_multi_from(&tokens) {
-        let stmt = Parser::new(tokens).parse_select_multi_from()?;
+        let stmt = Parser::with_params(tokens, params).parse_select_multi_from()?;
         return Ok(MatchOrAgg::MultiFrom(stmt));
     }
 
     // SELECT … FROM MATCH [SHORTEST] — check before regular SELECT routing.
     if is_select_from_match(&tokens) {
         if is_select_from_match_shortest(&tokens) {
-            let stmt = Parser::new(tokens).parse_select_from_match_shortest()?;
+            let stmt = Parser::with_params(tokens, params).parse_select_from_match_shortest()?;
             return Ok(MatchOrAgg::Shortest(stmt));
         }
-        let stmt = Parser::new(tokens).parse_select_from_match()?;
+        let stmt = Parser::with_params(tokens, params).parse_select_from_match()?;
         return Ok(MatchOrAgg::Agg(stmt));
     }
 
     // Non-MATCH SQL goes through the regular pipeline.
     if !matches!(tokens.first(), Some(Tok::Kw(Kw::Match))) {
-        let mut parser = Parser::new(tokens);
+        let mut parser = Parser::with_params(tokens, params);
         let stmt = parser.parse()?;
         return Ok(MatchOrAgg::Steps(compile(stmt)));
     }
 
+    // MATCH...WITH or MATCH...RETURN with projections → unified aggregate path.
+    // Detected by: tokens start with MATCH and contain WITH or RETURN keyword.
+    if is_match_with_or_return(&tokens) {
+        let mut parser = Parser::with_params(tokens, params);
+        let stmt = parser.parse_match_return_with()?;
+        return Ok(MatchOrAgg::Agg(stmt));
+    }
+
     // Simple MATCH — compile to Steps.
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::with_params(tokens, params);
     let stmt = parser.parse_match()?;
     let mut all_steps = compile_match(stmt);
     while matches!(parser.peek(), Tok::Kw(Kw::Union)) {
@@ -5506,6 +5737,77 @@ pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
         all_steps.push(Step::Union(next_steps));
     }
     Ok(MatchOrAgg::Steps(all_steps))
+}
+
+/// Parse a MATCH statement and determine whether it is a simple graph query
+/// or an aggregate (multi-hop with RETURN var.field / aggregate functions).
+///
+/// This is the unified entry-point called by `db.query()`.
+///
+/// # Errors
+/// Returns [`SqlError`] if the statement is syntactically invalid.
+pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
+    parse_match_or_agg_inner(sql, vec![])
+}
+
+/// Parse a MATCH/SELECT statement with parameter bindings (`$1`, `$2`, …).
+pub fn parse_match_or_agg_params(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
+    parse_match_or_agg_inner(sql, params)
+}
+
+/// Return `true` when `MATCH` is the first token and the stream contains a `WITH`
+/// keyword or a `RETURN` followed by a `var.field` projection (dot after ident).
+///
+/// Simple `MATCH (a)-[:e]->(b) RETURN a, b` does NOT match — it routes through
+/// `parse_match` instead.  `MATCH ... WITH ...` or `MATCH ... RETURN b._key AS k`
+/// matches and routes through `parse_match_return_with`.
+fn is_match_with_or_return(tokens: &[Tok]) -> bool {
+    if !matches!(tokens.first(), Some(Tok::Kw(Kw::Match))) {
+        return false;
+    }
+    // WITH keyword is unambiguous.
+    if tokens.iter().any(|t| matches!(t, Tok::Kw(Kw::With))) {
+        return true;
+    }
+    // Inline WHERE inside start node parens: `(s:col WHERE ...)` — route through
+    // parse_match_return_with which handles this via parse_match_start_with_inline_where.
+    // Detect: WHERE between the opening `(` and the first `-` or RETURN.
+    {
+        let mut depth = 0i32;
+        for tok in tokens.iter().skip(1) {
+            match tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => depth -= 1,
+                Tok::Kw(Kw::Where) if depth > 0 => return true,
+                Tok::Dash | Tok::Kw(Kw::Return) => break,
+                _ => {}
+            }
+        }
+    }
+    // Check for RETURN with var.field projection or aggregate function.
+    for (i, tok) in tokens.iter().enumerate() {
+        if matches!(tok, Tok::Kw(Kw::Return)) {
+            // Check what follows RETURN: if next-next is Dot (i.e. RETURN var.field)
+            // or next is an aggregate keyword (SUM, COUNT, etc.), it's an aggregate.
+            if let Some(next) = tokens.get(i + 1) {
+                // Aggregate function keyword right after RETURN
+                if matches!(next, Tok::Kw(Kw::Count) | Tok::Kw(Kw::Sum) | Tok::Kw(Kw::Avg) |
+                    Tok::Kw(Kw::Min) | Tok::Kw(Kw::Max)) {
+                    return true;
+                }
+                // var.field pattern: RETURN ident DOT ident
+                if matches!(next, Tok::Ident(_)) {
+                    if let Some(dot) = tokens.get(i + 2) {
+                        if matches!(dot, Tok::Dot) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+    }
+    false
 }
 
 /// Return `true` when the SQL is `SELECT … FROM MATCH (…)-[…]->(…) …`.
@@ -5637,35 +5939,9 @@ pub fn parse_and_compile(sql: &str) -> Result<Vec<Step>, SqlError> {
     }
 }
 
-/// Parse a mutation SQL statement and compile it to a [`CompiledMutation`].
-///
-/// # Node INSERT
-/// ```text
-/// INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...)
-/// ```
-///
-/// # Edge INSERT (Cypher-style)
-/// ```text
-/// INSERT ('from')-[:KIND {strength: n, key: val}]->('to')
-/// ```
-///
-/// # Node DELETE
-/// ```text
-/// DELETE FROM collection [WHERE field OP value [AND ...]]
-/// DELETE FROM ALL [WHERE ...]
-/// ```
-///
-/// # Edge DELETE (Cypher-style)
-/// ```text
-/// DELETE ('from')-[:KIND]->('to')
-/// ```
-///
-/// # Errors
-/// Returns [`SqlError`] if the SQL is syntactically invalid, or if an INSERT
-/// is missing a `_key` field or has mismatched field/value counts.
-pub fn parse_mutation(sql: &str) -> Result<CompiledMutation, SqlError> {
+fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutation, SqlError> {
     let tokens = tokenize(sql)?;
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::with_params(tokens, params);
     match parser.peek().clone() {
         Tok::Kw(Kw::Insert) => {
             parser.advance(); // consume INSERT
@@ -5825,6 +6101,41 @@ pub fn parse_mutation(sql: &str) -> Result<CompiledMutation, SqlError> {
             got: format!("{other:?}"),
         }),
     }
+}
+
+/// Parse a mutation SQL statement and compile it to a [`CompiledMutation`].
+///
+/// # Node INSERT
+/// ```text
+/// INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...)
+/// ```
+///
+/// # Edge INSERT (Cypher-style)
+/// ```text
+/// INSERT ('from')-[:KIND {strength: n, key: val}]->('to')
+/// ```
+///
+/// # Node DELETE
+/// ```text
+/// DELETE FROM collection [WHERE field OP value [AND ...]]
+/// DELETE FROM ALL [WHERE ...]
+/// ```
+///
+/// # Edge DELETE (Cypher-style)
+/// ```text
+/// DELETE ('from')-[:KIND]->('to')
+/// ```
+///
+/// # Errors
+/// Returns [`SqlError`] if the SQL is syntactically invalid, or if an INSERT
+/// is missing a `_key` field or has mismatched field/value counts.
+pub fn parse_mutation(sql: &str) -> Result<CompiledMutation, SqlError> {
+    parse_mutation_inner(sql, vec![])
+}
+
+/// Parse a mutation SQL statement with parameter bindings (`$1`, `$2`, …).
+pub fn parse_mutation_params(sql: &str, params: Vec<Value>) -> Result<CompiledMutation, SqlError> {
+    parse_mutation_inner(sql, params)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
