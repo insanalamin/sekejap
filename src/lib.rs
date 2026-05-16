@@ -3921,8 +3921,11 @@ impl CoreDB {
                     self.build_field_index(collection, field);
                 }
             }
-            // Hash — hint stored; no in-memory structure needed
-            IndexMethod::Hash => {}
+            IndexMethod::Hash => {
+                for field in fields {
+                    self.build_field_index(collection, field);
+                }
+            }
         }
 
         Ok(())

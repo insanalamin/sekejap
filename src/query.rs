@@ -798,23 +798,25 @@ impl<'db> Set<'db> {
         if fields.is_empty() {
             return None;
         }
-        let mut has_count = false;
+        // Collect aggregate info: (func, arg, output_key) for each aggregate field.
+        struct AggField { func: String, arg: String, out_key: String }
+        let mut agg_fields: Vec<AggField> = Vec::new();
+        let mut has_agg = false;
         for f in fields {
             let out = field_inner_name(f);
             if let Some(agg) = agg_inner(f) {
                 let rest = agg.strip_prefix("__AGG__").unwrap_or(agg);
-                let func = rest.splitn(2, "__").next().unwrap_or("").to_uppercase();
-                if func == "COUNT" {
-                    has_count = true;
-                } else {
-                    return None; // SUM/AVG/MIN/MAX need payloads
-                }
+                let mut parts = rest.splitn(2, "__");
+                let func = parts.next().unwrap_or("").to_uppercase();
+                let arg = parts.next().unwrap_or("*").to_string();
+                has_agg = true;
+                agg_fields.push(AggField { func, arg, out_key: field_output_key(f) });
             } else if out != gf.as_str() {
                 return None; // Non-agg field that isn't the GROUP BY key
             }
         }
-        if !has_count {
-            return None; // No aggregation — pure GROUP BY without count makes no sense here
+        if !has_agg {
+            return None; // No aggregation
         }
 
         // No HAVING, no SKIP — these require payload evaluation.
@@ -849,34 +851,92 @@ impl<'db> Set<'db> {
         // Look up the btree for this (collection, field) pair.
         let btree = self.db.field_index(collection_hash, gf)?;
 
+        // For aggregate args that aren't "*", verify btree indexes exist and
+        // build hash→f64 reverse maps from those indexes.
+        let mut arg_val_maps: HashMap<String, HashMap<u64, f64>> = HashMap::new();
+        for af in &agg_fields {
+            if af.arg == "*" { continue; }
+            let arg_idx = self.db.field_index(collection_hash, &af.arg)?;
+            if !arg_val_maps.contains_key(&af.arg) {
+                let mut m: HashMap<u64, f64> = HashMap::new();
+                for (key, node_hashes) in arg_idx.iter() {
+                    let val = CoreDB::field_key_to_value(key);
+                    if let Some(f) = val.as_f64() {
+                        for &h in node_hashes {
+                            m.insert(h, f);
+                        }
+                    }
+                }
+                arg_val_maps.insert(af.arg.clone(), m);
+            }
+        }
+
         // Build result rows from btree entries — zero disk reads.
         let sort_step: Option<&Vec<(String, bool)>> = self.steps.iter().find_map(|s| {
             if let Step::Sort(cols) = s { Some(cols) } else { None }
         });
         let take_n = self.steps.iter().find_map(|s| if let Step::Take(n) = s { Some(*n) } else { None });
 
-        // Collect (group_value, count) pairs from the btree.
-        let mut rows: Vec<(Value, u64)> = btree
+        // Collect (group_value, agg_results_map) from the btree.
+        let group_alias = fields.iter().find_map(|f| {
+            if agg_inner(f).is_none() { Some(field_output_key(f)) } else { None }
+        });
+        let mut rows: Vec<serde_json::Map<String, Value>> = btree
             .iter()
-            .map(|(key, hashes)| (CoreDB::field_key_to_value(key), hashes.len() as u64))
+            .map(|(key, group_hashes)| {
+                let group_val = CoreDB::field_key_to_value(key);
+                let mut map = serde_json::Map::new();
+                if let Some(ref alias) = group_alias {
+                    map.insert(alias.clone(), group_val);
+                }
+                for af in &agg_fields {
+                    let val = if af.func == "COUNT" && af.arg == "*" {
+                        serde_json::json!(group_hashes.len() as i64)
+                    } else if af.func == "COUNT" {
+                        // COUNT(field) — count non-null values
+                        if let Some(vm) = arg_val_maps.get(&af.arg) {
+                            let n = group_hashes.iter().filter(|h| vm.contains_key(h)).count();
+                            serde_json::json!(n as i64)
+                        } else {
+                            serde_json::json!(0)
+                        }
+                    } else if let Some(vm) = arg_val_maps.get(&af.arg) {
+                        let mut acc = AggAccum::new(&af.func, &af.arg);
+                        acc.all_count = group_hashes.len();
+                        for &h in group_hashes {
+                            if let Some(&f) = vm.get(&h) {
+                                acc.count_notnull += 1;
+                                acc.sum += f;
+                                acc.min = Some(acc.min.map_or(f, |m: f64| m.min(f)));
+                                acc.max = Some(acc.max.map_or(f, |m: f64| m.max(f)));
+                            }
+                        }
+                        acc.finalize()
+                    } else {
+                        Value::Null
+                    };
+                    map.insert(af.out_key.clone(), val);
+                }
+                map
+            })
             .collect();
 
-        // Apply ORDER BY if present (sort by count alias or group field).
+        // Apply ORDER BY if present.
         if let Some(sort_cols) = sort_step {
-            // Find the COUNT alias in the select fields.
-            let count_alias = fields.iter().find_map(|f| {
-                if agg_inner(f).is_some() { Some(field_output_key(f)) } else { None }
-            });
-            rows.sort_by(|(av, ac), (bv, bc)| {
+            rows.sort_by(|a, b| {
                 let mut ord = std::cmp::Ordering::Equal;
                 for (col, asc) in sort_cols {
-                    ord = if Some(col.as_str()) == count_alias.as_deref() {
-                        ac.cmp(bc)
-                    } else {
-                        // Sort by group field value.
-                        let sa = serde_json::to_string(av).unwrap_or_default();
-                        let sb = serde_json::to_string(bv).unwrap_or_default();
-                        sa.cmp(&sb)
+                    let va = a.get(col.as_str());
+                    let vb = b.get(col.as_str());
+                    ord = match (va.and_then(|v| v.as_f64()), vb.and_then(|v| v.as_f64())) {
+                        (Some(fa), Some(fb)) => fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal),
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (None, None) => {
+                            let sa = va.map(|v| v.to_string()).unwrap_or_default();
+                            let sb = vb.map(|v| v.to_string()).unwrap_or_default();
+                            sa.cmp(&sb)
+                        }
                     };
                     if !asc { ord = ord.reverse(); }
                     if ord != std::cmp::Ordering::Equal { break; }
@@ -890,22 +950,7 @@ impl<'db> Set<'db> {
             rows.truncate(n);
         }
 
-        // Build Hit payloads.
-        let count_alias = fields.iter().find_map(|f| {
-            if agg_inner(f).is_some() { Some(field_output_key(f)) } else { None }
-        });
-        let group_alias = fields.iter().find_map(|f| {
-            if agg_inner(f).is_none() { Some((field_inner_name(f).to_string(), field_output_key(f))) } else { None }
-        });
-
-        let hits = rows.into_iter().map(|(val, cnt)| {
-            let mut map = serde_json::Map::new();
-            if let Some(ref alias) = count_alias {
-                map.insert(alias.clone(), serde_json::json!(cnt));
-            }
-            if let Some((ref _inner, ref alias)) = group_alias {
-                map.insert(alias.clone(), val);
-            }
+        let hits = rows.into_iter().map(|map| {
             Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }
         }).collect();
 
@@ -1151,6 +1196,76 @@ impl<'db> Set<'db> {
                 for f in fields {
                     map.insert(field_output_key(f), Value::Number(serde_json::Number::from(n)));
                 }
+                return vec![Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }];
+            }
+
+            // Index-only aggregate fast path: when btree indexes exist for all
+            // aggregate argument fields, compute SUM/AVG/MIN/MAX/COUNT from the
+            // index alone — zero payload reads.
+            'index_agg: {
+                // Extract collection hash from steps.
+                let coll_hash = self.steps.iter().find_map(|s| {
+                    if let Step::Collection(h) = s { Some(*h) } else { None }
+                });
+                let coll_hash = match coll_hash {
+                    Some(h) => h,
+                    None => break 'index_agg,
+                };
+
+                // Parse all aggregate fields and verify they're all indexable.
+                struct AggInfo { func: String, arg: String, out_key: String }
+                let mut agg_infos: Vec<AggInfo> = Vec::new();
+                let mut has_non_agg = false;
+                for f in fields {
+                    if let Some(agg_expr) = agg_inner(f) {
+                        let rest = agg_expr.strip_prefix("__AGG__").unwrap_or(agg_expr);
+                        let mut parts = rest.splitn(2, "__");
+                        let func = parts.next().unwrap_or("COUNT").to_uppercase();
+                        let arg = parts.next().unwrap_or("*").to_string();
+                        if arg != "*" && self.db.field_index(coll_hash, &arg).is_none() {
+                            break 'index_agg; // no index for this arg
+                        }
+                        agg_infos.push(AggInfo { func, arg, out_key: field_output_key(f) });
+                    } else {
+                        has_non_agg = true;
+                        break 'index_agg; // non-agg fields need payloads
+                    }
+                }
+                if agg_infos.is_empty() { break 'index_agg; }
+
+                let hash_set: HashSet<u64> = hashes.iter().copied().collect();
+                let total = hashes.len();
+                let mut map = serde_json::Map::new();
+
+                for info in &agg_infos {
+                    if info.func == "COUNT" && info.arg == "*" {
+                        map.insert(info.out_key.clone(),
+                            Value::Number(serde_json::Number::from(total as i64)));
+                        continue;
+                    }
+                    let idx = match self.db.field_index(coll_hash, &info.arg) {
+                        Some(i) => i,
+                        None => break 'index_agg,
+                    };
+                    let mut acc = AggAccum::new(&info.func, &info.arg);
+                    acc.all_count = total;
+                    // Iterate btree entries and accumulate for matching hashes.
+                    for (key, node_hashes) in idx.iter() {
+                        let val = CoreDB::field_key_to_value(key);
+                        if let Some(f) = val.as_f64() {
+                            for &h in node_hashes {
+                                if hash_set.contains(&h) {
+                                    acc.count_notnull += 1;
+                                    acc.sum += f;
+                                    acc.min = Some(acc.min.map_or(f, |m: f64| m.min(f)));
+                                    acc.max = Some(acc.max.map_or(f, |m: f64| m.max(f)));
+                                }
+                            }
+                        }
+                    }
+                    map.insert(info.out_key.clone(), acc.finalize());
+                }
+
                 return vec![Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }];
             }
 
@@ -2071,19 +2186,23 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::WhereGt(field, threshold) => {
-                const FILTER_BATCH_MIN: usize = 64;
-                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
-                    let raw_map = db.read_raw_payloads_batched(&candidates);
-                    let fq = vec![field.clone()];
-                    candidates.retain(|&h| {
-                        raw_map.get(&h)
-                            .and_then(|bytes| {
-                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
-                            })
-                            .and_then(|v| v.as_f64())
-                            .map(|f| f > *threshold)
-                            .unwrap_or(false)
-                    });
+                if let Some(coll) = current_coll_hash {
+                    if let Some(idx) = db.field_index(coll, field) {
+                        let lo = FieldKey::from_f64(*threshold);
+                        let btree_set: HashSet<u64> = idx
+                            .range((std::ops::Bound::Excluded(lo), std::ops::Bound::Unbounded))
+                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .collect();
+                        candidates.retain(|h| btree_set.contains(h));
+                    } else {
+                        candidates.retain(|&h| {
+                            db.get_payload(h)
+                                .and_then(|p| resolve_field(field, &p))
+                                .and_then(|v| v.as_f64())
+                                .map(|f| f > *threshold)
+                                .unwrap_or(false)
+                        });
+                    }
                 } else {
                     candidates.retain(|&h| {
                         db.get_payload(h)
@@ -2095,19 +2214,23 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::WhereLt(field, threshold) => {
-                const FILTER_BATCH_MIN: usize = 64;
-                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
-                    let raw_map = db.read_raw_payloads_batched(&candidates);
-                    let fq = vec![field.clone()];
-                    candidates.retain(|&h| {
-                        raw_map.get(&h)
-                            .and_then(|bytes| {
-                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
-                            })
-                            .and_then(|v| v.as_f64())
-                            .map(|f| f < *threshold)
-                            .unwrap_or(false)
-                    });
+                if let Some(coll) = current_coll_hash {
+                    if let Some(idx) = db.field_index(coll, field) {
+                        let hi = FieldKey::from_f64(*threshold);
+                        let btree_set: HashSet<u64> = idx
+                            .range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(hi)))
+                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .collect();
+                        candidates.retain(|h| btree_set.contains(h));
+                    } else {
+                        candidates.retain(|&h| {
+                            db.get_payload(h)
+                                .and_then(|p| resolve_field(field, &p))
+                                .and_then(|v| v.as_f64())
+                                .map(|f| f < *threshold)
+                                .unwrap_or(false)
+                        });
+                    }
                 } else {
                     candidates.retain(|&h| {
                         db.get_payload(h)
@@ -2119,19 +2242,23 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::WhereGte(field, threshold) => {
-                const FILTER_BATCH_MIN: usize = 64;
-                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
-                    let raw_map = db.read_raw_payloads_batched(&candidates);
-                    let fq = vec![field.clone()];
-                    candidates.retain(|&h| {
-                        raw_map.get(&h)
-                            .and_then(|bytes| {
-                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
-                            })
-                            .and_then(|v| v.as_f64())
-                            .map(|f| f >= *threshold)
-                            .unwrap_or(false)
-                    });
+                if let Some(coll) = current_coll_hash {
+                    if let Some(idx) = db.field_index(coll, field) {
+                        let lo = FieldKey::from_f64(*threshold);
+                        let btree_set: HashSet<u64> = idx
+                            .range(lo..)
+                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .collect();
+                        candidates.retain(|h| btree_set.contains(h));
+                    } else {
+                        candidates.retain(|&h| {
+                            db.get_payload(h)
+                                .and_then(|p| resolve_field(field, &p))
+                                .and_then(|v| v.as_f64())
+                                .map(|f| f >= *threshold)
+                                .unwrap_or(false)
+                        });
+                    }
                 } else {
                     candidates.retain(|&h| {
                         db.get_payload(h)
@@ -2143,19 +2270,23 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::WhereLte(field, threshold) => {
-                const FILTER_BATCH_MIN: usize = 64;
-                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
-                    let raw_map = db.read_raw_payloads_batched(&candidates);
-                    let fq = vec![field.clone()];
-                    candidates.retain(|&h| {
-                        raw_map.get(&h)
-                            .and_then(|bytes| {
-                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
-                            })
-                            .and_then(|v| v.as_f64())
-                            .map(|f| f <= *threshold)
-                            .unwrap_or(false)
-                    });
+                if let Some(coll) = current_coll_hash {
+                    if let Some(idx) = db.field_index(coll, field) {
+                        let hi = FieldKey::from_f64(*threshold);
+                        let btree_set: HashSet<u64> = idx
+                            .range(..=hi)
+                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .collect();
+                        candidates.retain(|h| btree_set.contains(h));
+                    } else {
+                        candidates.retain(|&h| {
+                            db.get_payload(h)
+                                .and_then(|p| resolve_field(field, &p))
+                                .and_then(|v| v.as_f64())
+                                .map(|f| f <= *threshold)
+                                .unwrap_or(false)
+                        });
+                    }
                 } else {
                     candidates.retain(|&h| {
                         db.get_payload(h)
@@ -2167,19 +2298,24 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::WhereBetween(field, lo, hi) => {
-                const FILTER_BATCH_MIN: usize = 64;
-                if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
-                    let raw_map = db.read_raw_payloads_batched(&candidates);
-                    let fq = vec![field.clone()];
-                    candidates.retain(|&h| {
-                        raw_map.get(&h)
-                            .and_then(|bytes| {
-                                extract_fields_by_search(bytes, &fq).remove(field.as_str())
-                            })
-                            .and_then(|v| v.as_f64())
-                            .map(|f| f >= *lo && f <= *hi)
-                            .unwrap_or(false)
-                    });
+                if let Some(coll) = current_coll_hash {
+                    if let Some(idx) = db.field_index(coll, field) {
+                        let lo_key = FieldKey::from_f64(*lo);
+                        let hi_key = FieldKey::from_f64(*hi);
+                        let btree_set: HashSet<u64> = idx
+                            .range(lo_key..=hi_key)
+                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .collect();
+                        candidates.retain(|h| btree_set.contains(h));
+                    } else {
+                        candidates.retain(|&h| {
+                            db.get_payload(h)
+                                .and_then(|p| resolve_field(field, &p))
+                                .and_then(|v| v.as_f64())
+                                .map(|f| f >= *lo && f <= *hi)
+                                .unwrap_or(false)
+                        });
+                    }
                 } else {
                     candidates.retain(|&h| {
                         db.get_payload(h)
@@ -5236,6 +5372,181 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 .into_iter()
                 .map(|v| Hit { slug: String::new(), slug_hash: 0, payload: Some(v) })
                 .collect();
+        }
+
+        // ── Start-variable GROUP BY fast path ───────────────────────────────
+        //
+        // When the GROUP BY references the start variable (e.g. `GROUP BY a.region`)
+        // and all returns are either start-var fields or COUNT(*), we can skip
+        // building full PathRows and reading destination payloads entirely.
+        //
+        // Strategy:
+        //   1. Collect raw paths (topology only)
+        //   2. Group by start_hash → count paths per start node
+        //   3. Load start-node fields from btree index or payloads
+        //   4. Merge groups with identical field values
+        if start_in_group && !needs_row_scan {
+            let start_var = stmt.start_var.as_deref().unwrap_or("");
+            // Verify ALL group keys and return fields reference the start var or are COUNT.
+            let all_start_or_count = group_keys.iter().all(|(gvar, _)| gvar == start_var)
+                && stmt.returns.iter().all(|(ret, _)| match ret {
+                    MatchAggReturn::Count | MatchAggReturn::Now => true,
+                    MatchAggReturn::Field { var, .. } => var == start_var,
+                    _ => false,
+                });
+
+            if all_start_or_count {
+                // Phase 1: topology
+                let raw = if let Some(reversed) = try_reverse_anchor(db, &starts, &stmt.hops, &stmt.dest_where) {
+                    reversed
+                } else {
+                    collect_raw_paths(db, &starts, &stmt.hops, None)
+                };
+                if raw.is_empty() { return vec![]; }
+
+                // Phase 2: filter dest_where (hop-variable conditions)
+                let raw = if !stmt.dest_where.is_empty() {
+                    let filtered = filter_raw_by_dest_where(db, raw, &stmt.dest_where, &var_to_hop);
+                    if filtered.is_empty() { return vec![]; }
+                    filtered
+                } else { raw };
+
+                // Phase 3: group by start_hash → path count
+                let mut start_counts: HashMap<u64, usize> = HashMap::new();
+                for rp in &raw {
+                    *start_counts.entry(rp.start_hash).or_insert(0) += 1;
+                }
+
+                // Phase 4: load start-node fields from btree index or payloads
+                let needed_start_fields: Vec<String> = {
+                    let mut v: Vec<String> = Vec::new();
+                    let mut add = |f: &String| {
+                        if !v.iter().any(|x| x == f) { v.push(f.clone()); }
+                    };
+                    for (_, gfield) in group_keys.iter() { add(gfield); }
+                    for (ret, _) in &stmt.returns {
+                        if let MatchAggReturn::Field { field, .. } = ret { add(field); }
+                    }
+                    v
+                };
+                let start_coll_hash = match stmt.start {
+                    MatchAggStart::Collection(h) => h,
+                    _ => 0,
+                };
+                let unique_starts: Vec<u64> = start_counts.keys().copied().collect();
+                let mut payload_cache: HashMap<u64, Value> = HashMap::new();
+                // Try btree index resolution for start node fields.
+                let resolved = 'resolve: {
+                    if needed_start_fields.is_empty() || start_coll_hash == 0 { break 'resolve false; }
+                    let indexes: Vec<&BTreeMap<FieldKey, Vec<u64>>> = needed_start_fields.iter()
+                        .filter_map(|f| db.field_index(start_coll_hash, f))
+                        .collect();
+                    if indexes.len() != needed_start_fields.len() { break 'resolve false; }
+                    let hash_set: HashSet<u64> = unique_starts.iter().copied().collect();
+                    let mut field_maps: Vec<HashMap<u64, Value>> = Vec::with_capacity(indexes.len());
+                    for idx in &indexes {
+                        let mut map: HashMap<u64, Value> = HashMap::with_capacity(hash_set.len());
+                        for (key, node_hashes) in *idx {
+                            let val = CoreDB::field_key_to_value(key);
+                            for &h in node_hashes {
+                                if hash_set.contains(&h) {
+                                    map.insert(h, val.clone());
+                                }
+                            }
+                        }
+                        field_maps.push(map);
+                    }
+                    for &h in &unique_starts {
+                        let mut obj = serde_json::Map::new();
+                        for (i, field_name) in needed_start_fields.iter().enumerate() {
+                            if let Some(val) = field_maps[i].get(&h) {
+                                obj.insert(field_name.clone(), val.clone());
+                            }
+                        }
+                        payload_cache.insert(h, Value::Object(obj));
+                    }
+                    true
+                };
+                if !resolved {
+                    for &h in &unique_starts {
+                        if let Some(p) = db.get_payload(h) {
+                            payload_cache.insert(h, p);
+                        }
+                    }
+                }
+
+                // Phase 5: merge groups with identical field values
+                let null = Value::Null;
+                let mut group_order: Vec<String> = Vec::new();
+                let mut groups: HashMap<String, (usize, u64)> = HashMap::new(); // (count, representative hash)
+
+                for (&sh, &cnt) in &start_counts {
+                    let key: String = group_keys.iter()
+                        .map(|(_, gfield)| {
+                            serde_json::to_string(
+                                payload_cache.get(&sh)
+                                    .and_then(|p| p.get(gfield.as_str()))
+                                    .unwrap_or(&null)
+                            ).unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\x00");
+                    match groups.entry(key.clone()) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            group_order.push(key);
+                            e.insert((cnt, sh));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            e.get_mut().0 += cnt;
+                        }
+                    }
+                }
+
+                // Phase 6: build result rows
+                let mut result_rows: Vec<Value> = group_order.iter().map(|key| {
+                    let &(count, rep_hash) = &groups[key];
+                    let mut map = serde_json::Map::new();
+                    for (ret_expr, alias) in &stmt.returns {
+                        let val = match ret_expr {
+                            MatchAggReturn::Count => serde_json::json!(count as i64),
+                            MatchAggReturn::Field { field, .. } => {
+                                payload_cache.get(&rep_hash)
+                                    .and_then(|p| p.get(field.as_str()))
+                                    .cloned()
+                                    .unwrap_or(Value::Null)
+                            }
+                            MatchAggReturn::Now => serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                            _ => Value::Null,
+                        };
+                        map.insert(alias.clone(), val);
+                    }
+                    Value::Object(map)
+                }).collect();
+
+                // ORDER BY
+                if let Some((ref order_field, ascending)) = stmt.order_by {
+                    result_rows.sort_by(|a, b| {
+                        let va = a.get(order_field.as_str()).and_then(|v| v.as_f64());
+                        let vb = b.get(order_field.as_str()).and_then(|v| v.as_f64());
+                        let ord = match (va, vb) {
+                            (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                            (None, Some(_)) => std::cmp::Ordering::Less,
+                            (Some(_), None) => std::cmp::Ordering::Greater,
+                            (None, None) => {
+                                let sa = a.get(order_field.as_str()).map(|v| v.to_string()).unwrap_or_default();
+                                let sb = b.get(order_field.as_str()).map(|v| v.to_string()).unwrap_or_default();
+                                sa.cmp(&sb)
+                            }
+                        };
+                        if ascending { ord } else { ord.reverse() }
+                    });
+                }
+                if let Some(n) = stmt.limit { result_rows.truncate(n); }
+                return result_rows
+                    .into_iter()
+                    .map(|v| Hit { slug: String::new(), slug_hash: 0, payload: Some(v) })
+                    .collect();
+            }
         }
     }
 

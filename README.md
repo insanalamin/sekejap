@@ -241,6 +241,19 @@ GROUP BY b._key
 ORDER BY total_strength DESC
 LIMIT 10
 
+-- Multi-stage graph query with WITH chaining
+SELECT c.name AS island, COUNT(*) AS visitors
+FROM MATCH (a:characters)-[:allied_with]->(b:characters)
+WHERE a._key = 'luffy'
+WITH b
+MATCH (b)-[:visited]->(c:islands)
+GROUP BY c.name
+ORDER BY visitors DESC
+
+-- MATCH...RETURN (Cypher-style, also via query())
+MATCH (a:characters)-[:rival]->(b:characters)
+RETURN a._key AS name, b.bounty AS rival_bounty
+
 -- Edge intrinsics: _depth, _path_keys, _path_strength, _avg_strength, _min/_max_strength
 -- Available on any named edge binding (e.g. [r:route_to] or [r*])
 SELECT dest._key AS island, r2._depth AS hops, r2._path_keys AS route
