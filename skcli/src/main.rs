@@ -219,24 +219,31 @@ fn run_sql(db: &mut CoreDB, sql: &str) -> bool {
                 print_table(hits, t0.elapsed().as_nanos());
             }
         },
-        "MATCH" => {
-            let is_pipeline = sql.split_whitespace().any(|w| w.to_uppercase() == "WITH");
-            if is_pipeline {
-                match db.pipeline_query(sql) {
-                    Err(e) => eprintln!("error: {e}"),
-                    Ok(hits) => print_table(hits, t0.elapsed().as_nanos()),
-                }
+        "MATCH" => match db.query(sql) {
+            Err(e) => eprintln!("error: {e}"),
+            Ok(set) => {
+                let hits = set.collect();
+                print_table(hits, t0.elapsed().as_nanos());
+            }
+        },
+        "EXPLAIN" => {
+            let rest = sql.strip_prefix("EXPLAIN").unwrap_or(sql).trim();
+            let (analyze, inner_sql) = if rest.to_uppercase().starts_with("ANALYZE") {
+                (true, rest.strip_prefix("ANALYZE").or_else(|| rest.strip_prefix("analyze")).unwrap_or(rest).trim())
             } else {
-                match db.query(sql) {
-                    Err(e) => eprintln!("error: {e}"),
-                    Ok(set) => {
-                        let hits = set.collect();
-                        print_table(hits, t0.elapsed().as_nanos());
-                    }
-                }
+                (false, rest)
+            };
+            let result = if analyze {
+                db.explain_analyze(inner_sql)
+            } else {
+                db.explain(inner_sql)
+            };
+            match result {
+                Err(e) => eprintln!("error: {e}"),
+                Ok(hits) => print_table(hits, t0.elapsed().as_nanos()),
             }
         }
-        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" => match db.execute(sql) {
+        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" | "REINDEX" => match db.execute(sql) {
             Err(e) => eprintln!("error: {e}"),
             Ok(n) => {
                 let timing = format_duration(t0.elapsed().as_nanos());
@@ -253,7 +260,7 @@ fn run_sql(db: &mut CoreDB, sql: &str) -> bool {
             Err(e) => eprintln!("error: {e}"),
             Ok(hits) => print_table(hits, t0.elapsed().as_nanos()),
         },
-        _ => eprintln!("unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE CREATE DROP ALTER"),
+        _ => eprintln!("unknown statement — supported: SELECT MATCH SHOW EXPLAIN INSERT UPDATE DELETE CREATE DROP ALTER REINDEX"),
     }
     true
 }
