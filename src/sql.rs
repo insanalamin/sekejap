@@ -185,6 +185,7 @@ enum Tok {
     VecL2Op,     // <->  Euclidean (L2) distance
     VecDotOp,    // <#>  inner product
     VecL1Op,     // <+>  Manhattan (L1) distance
+    ArrayContains, // @>  PostgreSQL array containment
     Param(usize), // $1, $2, ... (1-indexed, like PostgreSQL)
     Eof,
 }
@@ -264,6 +265,9 @@ enum Kw {
     Then,
     Else,
     End,
+    // EXPLAIN
+    Explain,
+    Analyze,
     // Path predicate quantifiers (ANY/ALL already: All, add Any/None_/Single)
     Any,
     None_,
@@ -336,6 +340,8 @@ fn kw_to_str(kw: &Kw) -> &'static str {
         Kw::Then => "then",
         Kw::Else => "else",
         Kw::End => "end",
+        Kw::Explain => "explain",
+        Kw::Analyze => "analyze",
         Kw::Any => "any",
         Kw::None_ => "none",
         Kw::Single => "single",
@@ -408,6 +414,8 @@ fn keyword(s: &str) -> Option<Kw> {
         "THEN" => Some(Kw::Then),
         "ELSE" => Some(Kw::Else),
         "END" => Some(Kw::End),
+        "EXPLAIN" => Some(Kw::Explain),
+        "ANALYZE" => Some(Kw::Analyze),
         "ANY" => Some(Kw::Any),
         "NONE" => Some(Kw::None_),
         "SINGLE" => Some(Kw::Single),
@@ -603,6 +611,17 @@ fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
                     None => tokens.push(Tok::Ident(s)),
                 }
             }
+            '@' => {
+                if i + 1 < len && chars[i + 1] == '>' {
+                    tokens.push(Tok::ArrayContains);
+                    i += 2;
+                } else {
+                    return Err(SqlError::UnexpectedToken {
+                        expected: "> after @",
+                        got: if i + 1 < len { chars[i + 1].to_string() } else { "end".into() },
+                    });
+                }
+            }
             '$' => {
                 i += 1;
                 let start = i;
@@ -727,6 +746,11 @@ enum CondExpr {
     IsNull {
         field: String,
         negated: bool, // true = IS NOT NULL
+    },
+    /// `field @> ['a', 'b']` — JSON array field contains all specified values.
+    ArrayContains {
+        field: String,
+        values: Vec<Value>,
     },
     /// `NOT <inner_cond>`
     Not(Box<CondExpr>),
@@ -1773,6 +1797,47 @@ impl Parser {
         match self.peek().clone() {
             Tok::Eq => {
                 self.advance();
+                // = ANY($1) or = ANY(['a','b']) — PostgreSQL-style dynamic IN.
+                if matches!(self.peek(), Tok::Kw(Kw::Any)) {
+                    self.advance(); // consume ANY
+                    self.expect_lparen()?;
+                    // Try parameter first, then inline array literal.
+                    let values = if let Tok::Param(idx) = self.peek().clone() {
+                        self.advance();
+                        match self.params.get(idx - 1) {
+                            Some(Value::Array(arr)) => arr.clone(),
+                            Some(v) => vec![v.clone()], // scalar → single-element IN
+                            None => return Err(SqlError::ParamOutOfRange {
+                                index: idx, count: self.params.len(),
+                            }),
+                        }
+                    } else if matches!(self.peek(), Tok::LBracket) {
+                        // Inline array literal: ['a', 'b', 3, true]
+                        self.advance(); // consume [
+                        let mut arr = Vec::new();
+                        loop {
+                            match self.peek().clone() {
+                                Tok::RBracket => { self.advance(); break; }
+                                Tok::Comma => { self.advance(); }
+                                _ => arr.push(self.parse_value()?),
+                            }
+                        }
+                        arr
+                    } else {
+                        // Single value: = ANY(some_val)
+                        let v = self.parse_value()?;
+                        match v {
+                            Value::Array(arr) => arr,
+                            scalar => vec![scalar],
+                        }
+                    };
+                    self.expect_rparen()?;
+                    return if values.len() == 1 {
+                        Ok(CondExpr::Compare { field, op: CompareOp::Eq, value: values.into_iter().next().unwrap() })
+                    } else {
+                        Ok(CondExpr::In { field, values })
+                    };
+                }
                 let v = self.parse_value()?;
                 Ok(CondExpr::Compare { field, op: CompareOp::Eq, value: v })
             }
@@ -1800,6 +1865,35 @@ impl Parser {
                 self.advance();
                 let v = self.parse_value()?;
                 Ok(CondExpr::Compare { field, op: CompareOp::Lte, value: v })
+            }
+            Tok::ArrayContains => {
+                self.advance();
+                // @> $1 (bound array param) or @> ['a', 'b'] (inline array)
+                let values = if let Tok::Param(idx) = self.peek().clone() {
+                    self.advance();
+                    match self.params.get(idx - 1) {
+                        Some(Value::Array(arr)) => arr.clone(),
+                        Some(v) => vec![v.clone()],
+                        None => return Err(SqlError::ParamOutOfRange {
+                            index: idx, count: self.params.len(),
+                        }),
+                    }
+                } else if matches!(self.peek(), Tok::LBracket) {
+                    self.advance(); // consume [
+                    let mut arr = Vec::new();
+                    loop {
+                        match self.peek().clone() {
+                            Tok::RBracket => { self.advance(); break; }
+                            Tok::Comma => { self.advance(); }
+                            _ => arr.push(self.parse_value()?),
+                        }
+                    }
+                    arr
+                } else {
+                    // Single value: field @> 'crime'
+                    vec![self.parse_value()?]
+                };
+                Ok(CondExpr::ArrayContains { field, values })
             }
             Tok::Kw(Kw::Between) => {
                 self.advance();
@@ -5385,6 +5479,7 @@ fn compile_cond(cond: CondExpr) -> Step {
         },
         CondExpr::Between { field, lo, hi } => Step::WhereBetween(field, lo, hi),
         CondExpr::In { field, values } => Step::WhereIn(field, values),
+        CondExpr::ArrayContains { field, values } => Step::ArrayContains(field, values),
         CondExpr::Like {
             field,
             pattern,
@@ -6167,6 +6262,7 @@ mod tests {
                 Step::WhereLte(..) => "WhereLte",
                 Step::WhereBetween(..) => "WhereBetween",
                 Step::WhereIn(..) => "WhereIn",
+                Step::ArrayContains(..) => "ArrayContains",
                 Step::Like(..) => "Like",
                 Step::StDWithin(..) => "StDWithin",
                 Step::StContainsPoint(..) => "StContainsPoint",

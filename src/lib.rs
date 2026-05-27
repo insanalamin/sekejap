@@ -2547,6 +2547,68 @@ impl CoreDB {
         }
     }
 
+    /// `EXPLAIN SELECT ...` — return the query plan as result rows.
+    pub fn explain(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError> {
+        match sql::parse_match_or_agg(sql)? {
+            sql::MatchOrAgg::Steps(steps) => {
+                Ok(query::explain_steps(self, &steps))
+            }
+            sql::MatchOrAgg::Agg(stmt) => {
+                let mut rows = Vec::new();
+                let mut map = serde_json::Map::new();
+                map.insert("step".into(), serde_json::json!("MATCH Aggregate"));
+                map.insert("detail".into(), serde_json::json!(format!(
+                    "hops: {}, returns: {}, group_by: {}",
+                    stmt.hops.len(),
+                    stmt.returns.len(),
+                    stmt.group_by.as_ref().map_or(0, |g| g.len()),
+                )));
+                rows.push(query::Hit {
+                    slug: String::new(), slug_hash: 0,
+                    payload: Some(Value::Object(map)),
+                });
+                Ok(rows)
+            }
+            sql::MatchOrAgg::Shortest(_) => {
+                let mut map = serde_json::Map::new();
+                map.insert("step".into(), serde_json::json!("Shortest Path"));
+                Ok(vec![query::Hit {
+                    slug: String::new(), slug_hash: 0,
+                    payload: Some(Value::Object(map)),
+                }])
+            }
+            sql::MatchOrAgg::MultiFrom(_) => {
+                let mut map = serde_json::Map::new();
+                map.insert("step".into(), serde_json::json!("Multi-FROM Join"));
+                Ok(vec![query::Hit {
+                    slug: String::new(), slug_hash: 0,
+                    payload: Some(Value::Object(map)),
+                }])
+            }
+        }
+    }
+
+    /// `EXPLAIN ANALYZE SELECT ...` — run the query and return plan + actual timing.
+    pub fn explain_analyze(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError> {
+        let t0 = std::time::Instant::now();
+        let result = self.query(sql)?;
+        let hits = result.collect();
+        let elapsed = t0.elapsed();
+        let mut rows = self.explain(sql)?;
+        // Append actual execution stats.
+        let mut map = serde_json::Map::new();
+        map.insert("step".into(), serde_json::json!("Actual Results"));
+        map.insert("rows".into(), serde_json::json!(hits.len()));
+        map.insert("time_ms".into(), serde_json::json!(
+            format!("{:.3}", elapsed.as_secs_f64() * 1000.0)
+        ));
+        rows.push(query::Hit {
+            slug: String::new(), slug_hash: 0,
+            payload: Some(Value::Object(map)),
+        });
+        Ok(rows)
+    }
+
     // ── Graph path queries ────────────────────────────────────────────────────
 
     /// BFS from `start` to `end`, tracking the parent pointer and edge used at

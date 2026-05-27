@@ -137,6 +137,36 @@ fn fmt_duration(d: std::time::Duration) -> String {
 fn run(db: &mut CoreDB, sql: &str) {
     let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
     match first.as_str() {
+        "EXPLAIN" => {
+            let t0 = Instant::now();
+            // Check for EXPLAIN ANALYZE
+            let rest = sql.strip_prefix("EXPLAIN").unwrap_or(sql).trim();
+            let (analyze, inner_sql) = if rest.to_uppercase().starts_with("ANALYZE") {
+                (true, rest.strip_prefix("ANALYZE").or_else(|| rest.strip_prefix("analyze")).unwrap_or(rest).trim())
+            } else {
+                (false, rest)
+            };
+            let result = if analyze {
+                db.explain_analyze(inner_sql)
+            } else {
+                db.explain(inner_sql)
+            };
+            match result {
+                Err(e) => eprintln!("error: {e}"),
+                Ok(hits) => {
+                    let elapsed = t0.elapsed();
+                    let count = hits.len();
+                    for hit in hits {
+                        match &hit.payload {
+                            Some(v) => println!("{}", serde_json::to_string_pretty(v)
+                                .unwrap_or_else(|_| v.to_string())),
+                            None => println!("{}", hit.slug),
+                        }
+                    }
+                    println!("── {} step{} in {} ──", count, if count == 1 { "" } else { "s" }, fmt_duration(elapsed));
+                }
+            }
+        }
         "SELECT" | "MATCH" => {
             let t0 = Instant::now();
             match db.query(sql) {

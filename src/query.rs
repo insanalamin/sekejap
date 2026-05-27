@@ -119,6 +119,8 @@ pub enum Step {
     WhereLte(String, f64),
     WhereBetween(String, f64, f64),
     WhereIn(String, Vec<Value>),
+    /// `field @> ['a', 'b']` — JSON array field contains all specified values.
+    ArrayContains(String, Vec<Value>),
     /// Substring match. Third param: `true` = case-insensitive (ILIKE).
     Like(String, String, bool),
 
@@ -191,6 +193,113 @@ pub enum Step {
     Take(usize),
     /// Project only these fields in the returned payload.
     Select(Vec<String>),
+}
+
+/// Describe a step for EXPLAIN output.
+pub fn describe_step(step: &Step, db: &CoreDB) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    let (name, detail) = match step {
+        Step::One(h) => ("Scan", format!("lookup slug hash {h}")),
+        Step::Many(v) => ("Scan", format!("{} hashes", v.len())),
+        Step::Collection(h) => {
+            let n = db.collection_members(*h).map(|m| m.len()).unwrap_or(0);
+            ("Seq Scan", format!("collection ({n} rows)"))
+        }
+        Step::All => ("Seq Scan", "all nodes".into()),
+        Step::Forward(h) => ("Forward", format!("edge type {h}")),
+        Step::Backward(h) => ("Backward", format!("edge type {h}")),
+        Step::Hops(n) => ("BFS", format!("up to {n} hops")),
+        Step::HopsTyped { type_hash, min_depth, max_depth } => {
+            ("BFS Typed", format!("type {type_hash} depth {min_depth}..{max_depth}"))
+        }
+        Step::MinStrength(s) => ("Filter", format!("edge strength >= {s}")),
+        Step::Leaves => ("Filter", "leaf nodes only".into()),
+        Step::Roots => ("Filter", "root nodes only".into()),
+        Step::WhereEq(f, v) => {
+            let idx = db.field_index(0, f).is_some(); // approximate
+            ("Index Scan", format!("{f} = {v} (index: {idx})"))
+        }
+        Step::WhereNeq(f, v) => ("Filter", format!("{f} != {v}")),
+        Step::WhereGt(f, t) => ("Index Scan", format!("{f} > {t}")),
+        Step::WhereLt(f, t) => ("Index Scan", format!("{f} < {t}")),
+        Step::WhereGte(f, t) => ("Index Scan", format!("{f} >= {t}")),
+        Step::WhereLte(f, t) => ("Index Scan", format!("{f} <= {t}")),
+        Step::WhereBetween(f, lo, hi) => ("Index Scan", format!("{f} BETWEEN {lo} AND {hi}")),
+        Step::WhereIn(f, vs) => ("Index Scan", format!("{f} IN ({} values)", vs.len())),
+        Step::ArrayContains(f, vs) => ("Filter", format!("{f} @> ({} values)", vs.len())),
+        Step::Like(f, p, ci) => {
+            let op = if *ci { "ILIKE" } else { "LIKE" };
+            ("Filter", format!("{f} {op} '{p}'"))
+        }
+        Step::StDWithin(lat, lon, km) => ("Spatial Filter", format!("ST_DWithin({lat},{lon},{km}km)")),
+        Step::StContainsPoint(lat, lon) => ("Spatial Filter", format!("ST_Contains(POINT({lat},{lon}))")),
+        Step::StWithin(_) => ("Spatial Filter", "ST_Within(polygon)".into()),
+        Step::StContains(_) => ("Spatial Filter", "ST_Contains(polygon)".into()),
+        Step::StIntersects(_) => ("Spatial Filter", "ST_Intersects(polygon)".into()),
+        Step::StDistance(f, lat, lon, km) => ("Spatial Filter", format!("ST_Distance({f},{lat},{lon}) < {km}km")),
+        Step::StLength(f, km) => ("Spatial Filter", format!("ST_Length({f}) > {km}km")),
+        Step::StArea(f, km2) => ("Spatial Filter", format!("ST_Area({f}) > {km2}km²")),
+        Step::VectorNear { field, k, .. } => ("Vector Scan", format!("{field} top-{k} nearest")),
+        Step::Bm25Filter(f, q, s) => ("BM25 Filter", format!("{f} match '{q}' score > {s}")),
+        Step::Bm25Sort(f, q, asc) => ("BM25 Sort", format!("{f} match '{q}' {}", if *asc { "ASC" } else { "DESC" })),
+        Step::Bm25Score(f, q) => ("BM25 Score", format!("score({f}, '{q}')")),
+        Step::WhereIsNull(f, neg) => {
+            let op = if *neg { "IS NOT NULL" } else { "IS NULL" };
+            ("Filter", format!("{f} {op}"))
+        }
+        Step::WhereNot(_) => ("Filter", "NOT (...)".into()),
+        Step::WhereOr(branches) => ("Filter", format!("OR ({} branches)", branches.len())),
+        Step::Intersect(v) => ("Intersect", format!("{} branches", v.len())),
+        Step::Union(v) => ("Union", format!("{} branches", v.len())),
+        Step::Subtract(v) => ("Subtract", format!("{} branches", v.len())),
+        Step::GroupBy(fields) => ("GroupBy", fields.join(", ")),
+        Step::Having(_) => ("Having", "filter".into()),
+        Step::Distinct => ("Distinct", "deduplicate".into()),
+        Step::Sort(cols) => {
+            let desc: Vec<String> = cols.iter().map(|(f, asc)| {
+                format!("{f} {}", if *asc { "ASC" } else { "DESC" })
+            }).collect();
+            ("Sort", desc.join(", "))
+        }
+        Step::SortByVector { field, .. } => ("Vector Sort", format!("{field}")),
+        Step::SortByExpr { ascending, .. } => ("Score Sort", format!("{}", if *ascending { "ASC" } else { "DESC" })),
+        Step::Take(n) => ("Limit", format!("{n}")),
+        Step::Skip(n) => ("Offset", format!("{n}")),
+        Step::Select(fields) => ("Project", fields.join(", ")),
+    };
+    map.insert("step".into(), Value::String(name.into()));
+    map.insert("detail".into(), Value::String(detail));
+    map
+}
+
+/// Build EXPLAIN output for a step chain.
+pub fn explain_steps(db: &CoreDB, steps: &[Step]) -> Vec<Hit> {
+    steps.iter().enumerate().map(|(i, step)| {
+        let mut map = describe_step(step, db);
+        map.insert("seq".into(), Value::Number(serde_json::Number::from(i)));
+        // Check if btree index is available for filter steps.
+        let has_index = match step {
+            Step::WhereEq(f, _) | Step::WhereGt(f, _) | Step::WhereLt(f, _)
+            | Step::WhereGte(f, _) | Step::WhereLte(f, _) | Step::WhereIn(f, _) => {
+                // Find collection hash from previous Collection step.
+                let coll = steps.iter().find_map(|s| {
+                    if let Step::Collection(h) = s { Some(*h) } else { None }
+                });
+                coll.and_then(|c| db.field_index(c, f)).is_some()
+            }
+            Step::WhereBetween(f, _, _) => {
+                let coll = steps.iter().find_map(|s| {
+                    if let Step::Collection(h) = s { Some(*h) } else { None }
+                });
+                coll.and_then(|c| db.field_index(c, f)).is_some()
+            }
+            _ => false,
+        };
+        if has_index {
+            map.insert("index".into(), Value::String("btree".into()));
+        }
+        Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }
+    }).collect()
 }
 
 // ── Set ───────────────────────────────────────────────────────────────────────
@@ -1707,6 +1816,10 @@ fn eval_step_on_payload(step: &Step, payload: &Value) -> bool {
             .and_then(|v| v.as_f64())
             .map(|f| f <= *t)
             .unwrap_or(false),
+        Step::ArrayContains(field, values) => resolve_field(field, payload)
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| values.iter().all(|needle| arr.contains(needle)))
+            .unwrap_or(false),
         Step::WhereIsNull(field, negated) => {
             let is_null = resolve_field(field, payload)
                 .map(|v| v.is_null())
@@ -1770,6 +1883,12 @@ fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool {
             .get_payload(h)
             .and_then(|p| resolve_field(field, &p))
             .map(|v| value_in(&v, values))
+            .unwrap_or(false),
+        Step::ArrayContains(field, values) => db
+            .get_payload(h)
+            .and_then(|p| resolve_field(field, &p))
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| values.iter().all(|needle| arr.contains(needle)))
             .unwrap_or(false),
         Step::WhereIsNull(field, negated) => {
             let v = db.get_payload(h).and_then(|p| resolve_field(field, &p));
@@ -2327,10 +2446,38 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::WhereIn(field, values) => {
+                if let Some(coll) = current_coll_hash {
+                    if let Some(idx) = db.field_index(coll, field) {
+                        let btree_set: HashSet<u64> = values.iter()
+                            .filter_map(|v| FieldKey::from_json(v))
+                            .flat_map(|fk| idx.get(&fk).into_iter().flat_map(|ids| ids.iter().copied()))
+                            .collect();
+                        candidates.retain(|h| btree_set.contains(h));
+                    } else {
+                        candidates.retain(|&h| {
+                            db.get_payload(h)
+                                .and_then(|p| resolve_field(field, &p))
+                                .map(|v| value_in(&v, values))
+                                .unwrap_or(false)
+                        });
+                    }
+                } else {
+                    candidates.retain(|&h| {
+                        db.get_payload(h)
+                            .and_then(|p| resolve_field(field, &p))
+                            .map(|v| value_in(&v, values))
+                            .unwrap_or(false)
+                    });
+                }
+            }
+            Step::ArrayContains(field, values) => {
+                // field @> ['a', 'b'] — the payload's field must be a JSON array
+                // containing ALL of the specified values.
                 candidates.retain(|&h| {
                     db.get_payload(h)
                         .and_then(|p| resolve_field(field, &p))
-                        .map(|v| value_in(&v, values))
+                        .and_then(|v| v.as_array().cloned())
+                        .map(|arr| values.iter().all(|needle| arr.contains(needle)))
                         .unwrap_or(false)
                 });
             }

@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/flutter", "skcli"]
 
 [workspace.package]
-version = "0.8.9"
+version = "0.8.10"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
