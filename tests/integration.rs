@@ -525,6 +525,62 @@ fn match_end_no_label_where_filter() {
     assert_eq!(hits.len(), 1);
 }
 
+/// Reverse anchor: single-hop with _key filter on dest → uses reverse anchor
+/// in execute_match_agg (SELECT ... FROM MATCH syntax).
+#[test]
+fn match_reverse_anchor_single_hop() {
+    let db = setup_music_db();
+    // Start is a collection scan (a:artist), dest has _key filter on g.
+    // Reverse anchor should kick in: walk rev_edges from genre/garage-rock
+    // and find artist/the-vines as the only source.
+    let hits = db.query(
+        "SELECT a.name AS name FROM MATCH (a:artist)-[:has_genre]->(g:genre) WHERE g._key = 'garage-rock'"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let name = hits[0].payload.as_ref().unwrap()["name"].as_str().unwrap();
+    assert_eq!(name, "The Vines");
+}
+
+/// Reverse anchor with specific edge type filter — only matching edge types are traversed.
+#[test]
+fn match_reverse_anchor_with_edge_type() {
+    let db = setup_music_db();
+    // Use edge type :origin which links artist→city.
+    // Filter on city _key = 'melbourne' should reverse-anchor and find the-vines.
+    let hits = db.query(
+        "SELECT a.name AS name FROM MATCH (a:artist)-[:origin]->(c:city) WHERE c._key = 'melbourne'"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["name"].as_str().unwrap(), "The Vines");
+
+    // Edge type :has_genre should NOT match city nodes — 0 results.
+    let hits2 = db.query(
+        "SELECT a.name AS name FROM MATCH (a:artist)-[:has_genre]->(c:city) WHERE c._key = 'melbourne'"
+    ).unwrap().collect();
+    assert_eq!(hits2.len(), 0);
+}
+
+/// Multi-hop or non-_key filter → falls back to forward traversal.
+/// Verify results are identical to what forward path produces.
+#[test]
+fn match_reverse_anchor_not_applicable() {
+    let mut db = CoreDB::new();
+    // Build a 2-hop chain: person → team → league
+    db.put("person/alice", r#"{"_collection":"person","_key":"alice","name":"Alice"}"#).unwrap();
+    db.put("team/rockets", r#"{"_collection":"team","_key":"rockets","name":"Rockets"}"#).unwrap();
+    db.put("league/nbl", r#"{"_collection":"league","_key":"nbl","name":"NBL"}"#).unwrap();
+    db.link("person/alice", "team/rockets", "member_of", 1.0);
+    db.link("team/rockets", "league/nbl", "plays_in", 1.0);
+
+    // Multi-hop: reverse anchor should NOT apply (hops.len() == 2).
+    // Forward traversal should still find the path.
+    let hits = db.query(
+        "SELECT p.name AS name FROM MATCH (p:person)-[:member_of]->(t:team)-[:plays_in]->(l:league) WHERE l._key = 'nbl'"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["name"].as_str().unwrap(), "Alice");
+}
+
 #[test]
 fn ilike_filter() {
     let db = setup_music_db();
@@ -2750,9 +2806,9 @@ fn pipeline_single_match_scalar_return() {
     db.link("users/alice", "posts/p1", "wrote", 1.0);
     db.link("users/alice", "posts/p2", "wrote", 1.0);
 
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH ('users/alice')-[:wrote]->(p) RETURN p._key AS post_key",
-    ).unwrap();
+    ).unwrap().collect();
 
     let mut keys: Vec<String> = hits.iter()
         .map(|h| h.payload.as_ref().unwrap().get("post_key")
@@ -2788,11 +2844,11 @@ fn pipeline_match_with_group_sum() {
     db.link("answers/a2", "questions/q2", "for", 1.0);
     db.link("answers/a3", "questions/q3", "for", 1.0);
 
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH ('students/budi')-[:answered]->(a)-[:for]->(q) \
          WITH q.clo AS clo, SUM(a.score * q.weight) AS clo_score \
          RETURN clo, clo_score ORDER BY clo_score DESC",
-    ).unwrap();
+    ).unwrap().collect();
 
     assert_eq!(hits.len(), 2, "expected 2 CLO rows");
 
@@ -2839,13 +2895,13 @@ fn pipeline_two_level_clo_plo() {
     db.link("clos/clo1", "plos/plo1", "contributes_to", 1.0);
     db.link("clos/clo2", "plos/plo1", "contributes_to", 1.0);
 
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH ('students/budi')-[:answered]->(a)-[:for]->(q) \
          WITH q.clo AS clo, SUM(a.score * q.weight) AS clo_score \
          MATCH (c:clos WHERE _key = clo)-[:contributes_to]->(plo:plos) \
          RETURN plo._key AS plo, SUM(clo_score * c.weight) AS plo_score \
          ORDER BY plo_score DESC",
-    ).unwrap();
+    ).unwrap().collect();
 
     assert_eq!(hits.len(), 1, "expected 1 PLO row");
     let plo = hits[0].payload.as_ref().unwrap().get("plo")
@@ -2871,9 +2927,9 @@ fn pipeline_with_limit() {
         db.link("root", &slug, "has", 1.0);
     }
 
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH ('root')-[:has]->(item) RETURN item.val AS v ORDER BY v ASC LIMIT 3",
-    ).unwrap();
+    ).unwrap().collect();
 
     assert_eq!(hits.len(), 3);
     let vals: Vec<f64> = hits.iter()
@@ -2893,11 +2949,11 @@ fn pipeline_count_aggregate() {
         db.link("src", &slug, "points_to", 1.0);
     }
 
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH ('src')-[:points_to]->(d) \
          WITH d.grp AS grp, COUNT(*) AS cnt \
          RETURN grp, cnt ORDER BY grp ASC",
-    ).unwrap();
+    ).unwrap().collect();
 
     assert_eq!(hits.len(), 2);
     let g1_cnt = hits[0].payload.as_ref().unwrap().get("cnt")
@@ -2919,9 +2975,9 @@ fn pipeline_collection_start() {
     db.link("cats/a", "items/x", "has", 1.0);
     db.link("cats/b", "items/y", "has", 1.0);
 
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH (c:cats)-[:has]->(item:items) RETURN c._key AS cat, item.val AS val ORDER BY val ASC",
-    ).unwrap();
+    ).unwrap().collect();
 
     assert_eq!(hits.len(), 2);
     let val_of = |i: usize| hits[i].payload.as_ref().unwrap().get("val")
@@ -2973,28 +3029,28 @@ fn pipeline_where_cmp_operators() {
 
     // ── Test >= (pass threshold) ──────────────────────────────────────────────
     // MATCH (s:students WHERE score >= 60) RETURN s
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH (s:students WHERE score >= 60) RETURN s"
-    ).unwrap();
+    ).unwrap().collect();
     assert_eq!(hits.len(), 2, "Ali and Cici should pass (score >= 60)");
 
     // ── Test < (failing) ─────────────────────────────────────────────────────
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH (s:students WHERE score < 60) RETURN s"
-    ).unwrap();
+    ).unwrap().collect();
     assert_eq!(hits.len(), 2, "Budi and Dodi should fail (score < 60)");
 
     // ── Test != ──────────────────────────────────────────────────────────────
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH (s:students WHERE score != 80) RETURN s"
-    ).unwrap();
+    ).unwrap().collect();
     assert_eq!(hits.len(), 3, "Everyone except Ali");
 
     // ── Test AND with multiple comparison ops ────────────────────────────────
     // score >= 50 AND score <= 75 → Budi(55) and Cici(72)
-    let hits = db.pipeline_query(
+    let hits = db.query(
         "MATCH (s:students WHERE score >= 50 AND score <= 75) RETURN s"
-    ).unwrap();
+    ).unwrap().collect();
     assert_eq!(hits.len(), 2, "Budi(55) and Cici(72) are in 50..=75");
 }
 
@@ -4337,4 +4393,561 @@ fn insert_without_key_no_schema_errors() {
 
     let result = db.execute("INSERT INTO items (name) VALUES ('Widget')");
     assert!(result.is_err(), "INSERT without _key and no schema must fail");
+}
+
+// ── Parameter bindings ($1, $2, ...) ─────────────────────────────────────────
+
+#[test]
+fn param_select_where_eq() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('alice', 'Alice', 30)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('bob', 'Bob', 25)").unwrap();
+
+    let hits = db.query_params(
+        "SELECT * FROM users WHERE name = $1",
+        &[serde_json::json!("Alice")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/alice");
+}
+
+#[test]
+fn param_select_where_gt() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('alice', 'Alice', 30)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('bob', 'Bob', 25)").unwrap();
+
+    let hits = db.query_params(
+        "SELECT * FROM users WHERE age > $1",
+        &[serde_json::json!(27)],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/alice");
+}
+
+#[test]
+fn param_insert_values() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+
+    let n = db.execute_params(
+        "INSERT INTO users (_key, name, age) VALUES ($1, $2, $3)",
+        &[serde_json::json!("charlie"), serde_json::json!("Charlie"), serde_json::json!(35)],
+    ).unwrap();
+    assert_eq!(n, 1);
+
+    let hits = db.query("SELECT * FROM users WHERE name = 'Charlie'").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/charlie");
+}
+
+#[test]
+fn param_update_set() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('alice', 'Alice', 30)").unwrap();
+
+    db.execute_params(
+        "UPDATE users SET age = $1 WHERE name = $2",
+        &[serde_json::json!(31), serde_json::json!("Alice")],
+    ).unwrap();
+
+    let hits = db.query("SELECT * FROM users WHERE age = 31").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn param_like() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO users (_key, name) VALUES ('alice', 'Alice')").unwrap();
+    db.execute("INSERT INTO users (_key, name) VALUES ('bob', 'Bob')").unwrap();
+
+    let hits = db.query_params(
+        "SELECT * FROM users WHERE name LIKE $1",
+        &[serde_json::json!("Ali%")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/alice");
+}
+
+#[test]
+fn param_between() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('alice', 'Alice', 30)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('bob', 'Bob', 25)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('charlie', 'Charlie', 40)").unwrap();
+
+    let hits = db.query_params(
+        "SELECT * FROM users WHERE age BETWEEN $1 AND $2",
+        &[serde_json::json!(26), serde_json::json!(35)],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/alice");
+}
+
+#[test]
+fn param_in_list() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO users (_key, name) VALUES ('alice', 'Alice')").unwrap();
+    db.execute("INSERT INTO users (_key, name) VALUES ('bob', 'Bob')").unwrap();
+    db.execute("INSERT INTO users (_key, name) VALUES ('charlie', 'Charlie')").unwrap();
+
+    let hits = db.query_params(
+        "SELECT * FROM users WHERE name IN ($1, $2)",
+        &[serde_json::json!("Alice"), serde_json::json!("Charlie")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 2);
+}
+
+#[test]
+fn param_reuse_same_param() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE items (_key TEXT PRIMARY KEY, name TEXT, label TEXT)").unwrap();
+    db.execute("INSERT INTO items (_key, name, label) VALUES ('a', 'foo', 'foo')").unwrap();
+    db.execute("INSERT INTO items (_key, name, label) VALUES ('b', 'foo', 'bar')").unwrap();
+
+    // Use $1 in two different conditions
+    let hits = db.query_params(
+        "SELECT * FROM items WHERE name = $1 AND label = $1",
+        &[serde_json::json!("foo")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "items/a");
+}
+
+#[test]
+fn param_out_of_range_error() {
+    let db = CoreDB::new();
+    let result = db.query_params(
+        "SELECT * FROM users WHERE name = $2",
+        &[serde_json::json!("Alice")], // only 1 param but $2 used
+    );
+    match result {
+        Err(e) => {
+            let err_msg = format!("{e}");
+            assert!(err_msg.contains("out of range"), "error: {err_msg}");
+        }
+        Ok(_) => panic!("expected error for out-of-range param"),
+    }
+}
+
+#[test]
+fn param_type_mismatch_error() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('alice', 'Alice', 30)").unwrap();
+
+    // $1 is a string, but BETWEEN expects numbers
+    let result = db.query_params(
+        "SELECT * FROM users WHERE age BETWEEN $1 AND $2",
+        &[serde_json::json!("not_a_number"), serde_json::json!(35)],
+    );
+    match result {
+        Err(e) => {
+            let err_msg = format!("{e}");
+            assert!(err_msg.contains("expected number"), "error: {err_msg}");
+        }
+        Ok(_) => panic!("expected error for type mismatch"),
+    }
+}
+
+#[test]
+fn param_edge_insert() {
+    let mut db = CoreDB::new();
+    db.put("users/alice", r#"{"name":"Alice","_collection":"users"}"#).unwrap();
+    db.put("users/bob", r#"{"name":"Bob","_collection":"users"}"#).unwrap();
+
+    db.execute_params(
+        "INSERT ($1)-[:follows {strength: $2}]->($3)",
+        &[serde_json::json!("users/alice"), serde_json::json!(1.0), serde_json::json!("users/bob")],
+    ).unwrap();
+
+    let hits = db.query(
+        "MATCH ('users/alice')-[:follows]->(b) RETURN b._key AS name",
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn param_zero_index_error() {
+    let db = CoreDB::new();
+    let result = db.query_params(
+        "SELECT * FROM users WHERE name = $0",
+        &[serde_json::json!("Alice")],
+    );
+    match result {
+        Err(e) => {
+            let err_msg = format!("{e}");
+            assert!(err_msg.contains("$1, not $0"), "error: {err_msg}");
+        }
+        Ok(_) => panic!("expected error for $0 param"),
+    }
+}
+
+#[test]
+fn param_bare_dollar_error() {
+    let db = CoreDB::new();
+    let result = db.query_params(
+        "SELECT * FROM users WHERE name = $",
+        &[serde_json::json!("Alice")],
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn param_null_and_bool() {
+    let mut db = CoreDB::new();
+    // No schema — just put + insert directly to test bool/null param binding.
+    db.put("items/seed", r#"{"_collection":"items","_key":"seed"}"#).unwrap();
+
+    db.execute_params(
+        "INSERT INTO items (_key, active, note) VALUES ($1, $2, $3)",
+        &[serde_json::json!("i1"), serde_json::json!(true), serde_json::Value::Null],
+    ).unwrap();
+
+    let hits = db.query("SELECT * FROM items WHERE active = true").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "items/i1");
+}
+
+// ── Param hardening: math expressions (parse_math_primary) ───────────────────
+
+#[test]
+fn param_math_expr_in_select_from_match() {
+    let mut db = CoreDB::new();
+    db.put("users/alice", r#"{"_collection":"users","_key":"alice","score":10}"#).unwrap();
+    db.put("users/bob",   r#"{"_collection":"users","_key":"bob","score":20}"#).unwrap();
+    db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","weight":5}"#).unwrap();
+    db.link("users/alice", "posts/p1", "wrote", 1.0);
+    db.link("users/bob",   "posts/p1", "wrote", 1.0);
+
+    // SUM(a.score * $1) — param in math expression, GROUP BY b._key
+    let hits = db.query_params(
+        "SELECT b._key AS post, SUM(a.score * $1) AS weighted \
+         FROM MATCH (a:users)-[r:wrote]->(b:posts) \
+         GROUP BY b._key",
+        &[serde_json::json!(3)],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let payload = hits[0].payload.as_ref().unwrap();
+    let weighted = payload.get("weighted").and_then(|v| v.as_f64()).unwrap();
+    // (10 * 3) + (20 * 3) = 90
+    assert!((weighted - 90.0).abs() < 0.01, "expected 90, got {weighted}");
+}
+
+// ── Param hardening: pipeline WHERE (parse_pipe_where_cond) ──────────────────
+
+#[test]
+fn param_pipeline_where_string() {
+    let mut db = CoreDB::new();
+    db.put("users/alice", r#"{"_collection":"users","_key":"alice","name":"Alice"}"#).unwrap();
+    db.put("users/bob",   r#"{"_collection":"users","_key":"bob","name":"Bob"}"#).unwrap();
+    db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hello"}"#).unwrap();
+    db.link("users/alice", "posts/p1", "wrote", 1.0);
+    db.link("users/bob",   "posts/p1", "wrote", 1.0);
+
+    // Pipeline with param in WHERE
+    let hits = db.query_params(
+        "MATCH (u:users WHERE _key = $1)-[:wrote]->(p) RETURN p._key AS post_key",
+        &[serde_json::json!("alice")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let pk = hits[0].payload.as_ref().unwrap().get("post_key")
+        .and_then(|v| v.as_str()).unwrap();
+    assert_eq!(pk, "p1");
+}
+
+#[test]
+fn param_pipeline_where_number() {
+    let mut db = CoreDB::new();
+    db.put("items/a", r#"{"_collection":"items","_key":"a","score":10}"#).unwrap();
+    db.put("items/b", r#"{"_collection":"items","_key":"b","score":20}"#).unwrap();
+    db.put("items/c", r#"{"_collection":"items","_key":"c","score":30}"#).unwrap();
+    db.link("items/b", "items/a", "back", 1.0);
+    db.link("items/c", "items/a", "back", 1.0);
+
+    // WHERE on start node — filter by score > $1, then traverse
+    let hits = db.query_params(
+        "MATCH (s:items WHERE score > $1)-[:back]->(t) RETURN s._key AS key",
+        &[serde_json::json!(15)],
+    ).unwrap().collect();
+    let mut keys: Vec<&str> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap().get("key").unwrap().as_str().unwrap())
+        .collect();
+    keys.sort();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys, vec!["b", "c"]);
+}
+
+// ── Param hardening: pipeline slug (parse_pipe_match_start) ──────────────────
+
+#[test]
+fn param_pipeline_start_slug() {
+    let mut db = CoreDB::new();
+    db.put("users/alice", r#"{"_collection":"users","_key":"alice"}"#).unwrap();
+    db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hi"}"#).unwrap();
+    db.put("posts/p2",    r#"{"_collection":"posts","_key":"p2","title":"bye"}"#).unwrap();
+    db.link("users/alice", "posts/p1", "wrote", 1.0);
+    db.link("users/alice", "posts/p2", "wrote", 1.0);
+
+    let hits = db.query_params(
+        "MATCH ($1)-[:wrote]->(p) RETURN p._key AS pk",
+        &[serde_json::json!("users/alice")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 2);
+}
+
+// ── Param hardening: pipeline math (parse_pipe_math_primary) ─────────────────
+
+#[test]
+fn param_pipeline_math_literal() {
+    let mut db = CoreDB::new();
+    db.put("students/budi", r#"{"_collection":"students","_key":"budi"}"#).unwrap();
+    db.put("answers/a1",    r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
+    db.put("questions/q1",  r#"{"_collection":"questions","_key":"q1","weight":0.5}"#).unwrap();
+    db.link("students/budi", "answers/a1", "answered", 1.0);
+    db.link("answers/a1",    "questions/q1", "for", 1.0);
+
+    // Use $1 as a multiplier in pipeline math expression
+    let hits = db.query_params(
+        "MATCH ('students/budi')-[:answered]->(a)-[:for]->(q) \
+         WITH q._key AS qk, SUM(a.score * q.weight * $1) AS scaled \
+         RETURN qk, scaled ORDER BY scaled DESC",
+        &[serde_json::json!(100)],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let scaled = hits[0].payload.as_ref().unwrap().get("scaled")
+        .and_then(|v| v.as_f64()).unwrap();
+    // 0.8 * 0.5 * 100 = 40.0
+    assert!((scaled - 40.0).abs() < 0.01, "expected 40.0, got {scaled}");
+}
+
+// ── Param hardening: vector array (parse_f32_array_or_param) ─────────────────
+
+#[test]
+fn param_vector_near() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE docs (_key TEXT, emb VECTOR)").unwrap();
+    db.execute("INSERT INTO docs (_key, emb) VALUES ('d1', [1.0, 0.0, 0.0])").unwrap();
+    db.execute("INSERT INTO docs (_key, emb) VALUES ('d2', [0.0, 1.0, 0.0])").unwrap();
+    db.execute("INSERT INTO docs (_key, emb) VALUES ('d3', [0.9, 0.1, 0.0])").unwrap();
+
+    // VECTOR_NEAR with vector passed as $1
+    let hits = db.query_params(
+        "SELECT * FROM docs WHERE VECTOR_NEAR(emb, $1, 2)",
+        &[serde_json::json!([1.0, 0.0, 0.0])],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 2);
+    // d1 and d3 should be closest to [1,0,0]
+    let slugs: Vec<&str> = hits.iter().map(|h| h.slug.as_str()).collect();
+    assert!(slugs.contains(&"docs/d1"));
+    assert!(slugs.contains(&"docs/d3"));
+}
+
+#[test]
+fn param_vector_insert() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE docs (_key TEXT, emb VECTOR)").unwrap();
+
+    // Insert vector via $N param
+    db.execute_params(
+        "INSERT INTO docs (_key, emb) VALUES ($1, $2)",
+        &[serde_json::json!("d1"), serde_json::json!([0.5, 0.5, 0.0])],
+    ).unwrap();
+
+    let hits = db.query("SELECT * FROM docs").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "docs/d1");
+}
+
+// ── Param: DELETE with bindings ──────────────────────────────────────────────
+
+#[test]
+fn param_delete_where() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('a', 'Alice', 30)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('b', 'Bob', 25)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age) VALUES ('c', 'Carol', 40)").unwrap();
+
+    let n = db.execute_params(
+        "DELETE FROM users WHERE name = $1",
+        &[serde_json::json!("Bob")],
+    ).unwrap();
+    assert_eq!(n, 1);
+
+    let hits = db.query("SELECT * FROM users").unwrap().collect();
+    assert_eq!(hits.len(), 2);
+    let slugs: Vec<&str> = hits.iter().map(|h| h.slug.as_str()).collect();
+    assert!(!slugs.contains(&"users/b"));
+}
+
+#[test]
+fn param_delete_edge() {
+    let mut db = CoreDB::new();
+    db.put("users/alice", r#"{"name":"Alice","_collection":"users"}"#).unwrap();
+    db.put("users/bob", r#"{"name":"Bob","_collection":"users"}"#).unwrap();
+    db.link("users/alice", "users/bob", "follows", 1.0);
+
+    // Verify edge exists
+    let hits = db.query(
+        "MATCH ('users/alice')-[:follows]->(b) RETURN b._key AS name",
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+
+    // Delete edge with params
+    db.execute_params(
+        "DELETE ($1)-[:follows]->($2)",
+        &[serde_json::json!("users/alice"), serde_json::json!("users/bob")],
+    ).unwrap();
+
+    // Verify edge removed
+    let hits = db.query(
+        "MATCH ('users/alice')-[:follows]->(b) RETURN b._key AS name",
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 0);
+}
+
+// ── Param: MATCH graph queries with bindings (VIP) ───────────────────────────
+
+#[test]
+fn param_match_slug_start() {
+    let mut db = CoreDB::new();
+    db.put("users/alice", r#"{"_collection":"users","_key":"alice","name":"Alice"}"#).unwrap();
+    db.put("users/bob",   r#"{"_collection":"users","_key":"bob","name":"Bob"}"#).unwrap();
+    db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hello"}"#).unwrap();
+    db.link("users/alice", "posts/p1", "wrote", 1.0);
+    db.link("users/bob",   "posts/p1", "wrote", 1.0);
+
+    // MATCH ($1) — param as the start node slug (pipeline supports RETURN projections)
+    let hits = db.query_params(
+        "MATCH ($1)-[:wrote]->(b) RETURN b._key AS post",
+        &[serde_json::json!("users/alice")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let post = hits[0].payload.as_ref().unwrap().get("post")
+        .and_then(|v| v.as_str()).unwrap();
+    assert_eq!(post, "p1");
+}
+
+#[test]
+fn param_match_where_key() {
+    let mut db = CoreDB::new();
+    db.put("users/alice", r#"{"_collection":"users","_key":"alice","name":"Alice"}"#).unwrap();
+    db.put("users/bob",   r#"{"_collection":"users","_key":"bob","name":"Bob"}"#).unwrap();
+    db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hello"}"#).unwrap();
+    db.put("posts/p2",    r#"{"_collection":"posts","_key":"p2","title":"bye"}"#).unwrap();
+    db.link("users/alice", "posts/p1", "wrote", 1.0);
+    db.link("users/bob",   "posts/p2", "wrote", 1.0);
+
+    // WHERE a._key = $1 — param in MATCH WHERE condition
+    let hits = db.query_params(
+        "SELECT b._key AS post FROM MATCH (a:users)-[r:wrote]->(b:posts) \
+         WHERE a._key = $1",
+        &[serde_json::json!("alice")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let post = hits[0].payload.as_ref().unwrap().get("post")
+        .and_then(|v| v.as_str()).unwrap();
+    assert_eq!(post, "p1");
+}
+
+#[test]
+fn param_match_where_value() {
+    let mut db = CoreDB::new();
+    db.put("items/a", r#"{"_collection":"items","_key":"a","label":"hot"}"#).unwrap();
+    db.put("items/b", r#"{"_collection":"items","_key":"b","label":"cold"}"#).unwrap();
+    db.put("tags/t1", r#"{"_collection":"tags","_key":"t1"}"#).unwrap();
+    db.link("items/a", "tags/t1", "tagged", 1.0);
+    db.link("items/b", "tags/t1", "tagged", 1.0);
+
+    // SELECT FROM MATCH with WHERE field = $1 — param as a comparison value
+    let hits = db.query_params(
+        "SELECT i._key AS item FROM MATCH (i:items)-[:tagged]->(t:tags) \
+         WHERE i.label = $1",
+        &[serde_json::json!("hot")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    let item = hits[0].payload.as_ref().unwrap().get("item")
+        .and_then(|v| v.as_str()).unwrap();
+    assert_eq!(item, "a");
+}
+
+#[test]
+fn param_select_from_match_where_key() {
+    let mut db = CoreDB::new();
+    db.put("students/budi", r#"{"_collection":"students","_key":"budi"}"#).unwrap();
+    db.put("answers/a1",    r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
+    db.put("answers/a2",    r#"{"_collection":"answers","_key":"a2","score":0.9}"#).unwrap();
+    db.link("students/budi", "answers/a1", "answered", 1.0);
+    db.link("students/budi", "answers/a2", "answered", 1.0);
+
+    // SELECT FROM MATCH with WHERE a._key = $1
+    let hits = db.query_params(
+        "SELECT a.score AS score FROM MATCH (s:students)-[:answered]->(a:answers) \
+         WHERE s._key = $1",
+        &[serde_json::json!("budi")],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 2);
+    let mut scores: Vec<f64> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap().get("score").unwrap().as_f64().unwrap())
+        .collect();
+    scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!((scores[0] - 0.8).abs() < 0.01);
+    assert!((scores[1] - 0.9).abs() < 0.01);
+}
+
+// ── Param: UPDATE with multiple conditions ───────────────────────────────────
+
+#[test]
+fn param_update_where_multiple() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT, age INTEGER, active INTEGER)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age, active) VALUES ('a', 'Alice', 30, 1)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age, active) VALUES ('b', 'Bob', 25, 1)").unwrap();
+    db.execute("INSERT INTO users (_key, name, age, active) VALUES ('c', 'Carol', 40, 0)").unwrap();
+
+    // UPDATE with param in SET and WHERE
+    let n = db.execute_params(
+        "UPDATE users SET active = $1 WHERE age > $2",
+        &[serde_json::json!(0), serde_json::json!(28)],
+    ).unwrap();
+    assert_eq!(n, 2); // Alice (30) and Carol (40) updated
+
+    let hits = db.query("SELECT * FROM users WHERE active = 1").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "users/b"); // Only Bob still active
+}
+
+// ── Param: LIMIT and OFFSET ─────────────────────────────────────────────────
+
+#[test]
+fn param_limit_and_offset() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE items (_key TEXT PRIMARY KEY, val INTEGER)").unwrap();
+    for i in 1..=10 {
+        db.execute_params(
+            "INSERT INTO items (_key, val) VALUES ($1, $2)",
+            &[serde_json::json!(format!("i{i}")), serde_json::json!(i)],
+        ).unwrap();
+    }
+
+    // LIMIT with param
+    let hits = db.query_params(
+        "SELECT * FROM items ORDER BY val ASC LIMIT $1",
+        &[serde_json::json!(3)],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 3);
+
+    // OFFSET with param
+    let hits = db.query_params(
+        "SELECT * FROM items ORDER BY val ASC LIMIT $1 OFFSET $2",
+        &[serde_json::json!(2), serde_json::json!(5)],
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 2);
 }

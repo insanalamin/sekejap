@@ -2985,11 +2985,27 @@ impl CoreDB {
     /// Internal: execute an already-parsed mutation.
     fn execute_mutation(&mut self, mutation: sql::CompiledMutation) -> Result<usize, SqlError> {
         match mutation {
-            sql::CompiledMutation::Insert { collection, mut slug, payload_json, vectors } => {
+            sql::CompiledMutation::Insert { collection, mut slug, payload_json, mut vectors } => {
                 let payload_json = if let Some(schema) = self.schemas.get(&collection).cloned() {
                     let mut payload: Value = serde_json::from_str(&payload_json)
                         .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
                     if let Value::Object(ref mut map) = payload {
+                        // Rescue GEO fields that were mis-routed to vectors
+                        vectors.retain(|(field, data)| {
+                            let is_geo = schema.fields.iter().any(|f| {
+                                f.name == *field && matches!(f.ty, sql::FieldType::Geo)
+                            });
+                            if is_geo {
+                                let arr: Vec<Value> = data.iter()
+                                    .map(|&f| serde_json::Number::from_f64(f as f64)
+                                        .map(Value::Number).unwrap_or(Value::Null))
+                                    .collect();
+                                map.insert(field.clone(), Value::Array(arr));
+                                false // remove from vectors
+                            } else {
+                                true // keep as vector
+                            }
+                        });
                         for field in &schema.fields {
                             if map.contains_key(&field.name) {
                                 continue;
@@ -3105,18 +3121,29 @@ impl CoreDB {
                     .collect();
                 let count = hits.len();
                 for (slug, mut payload) in hits {
+                    let mut geo_fields: Vec<&str> = Vec::new();
                     if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
                         if let Some(schema) = self.schemas.get(coll) {
                             if let Some(err) = validate_updates_against_schema(schema, &updates) {
                                 return Err(err);
                             }
+                            for f in &schema.fields {
+                                if matches!(f.ty, sql::FieldType::Geo) {
+                                    geo_fields.push(&f.name);
+                                }
+                            }
                         }
                     }
                     let mut vec_updates: Vec<(String, Vec<f32>)> = Vec::new();
                     for (field, value) in &updates {
-                        if let Some(floats) = value_as_f32_vec(value) {
-                            vec_updates.push((field.clone(), floats));
-                        } else if let Value::Object(ref mut map) = payload {
+                        let is_geo = geo_fields.iter().any(|g| g == field);
+                        if !is_geo {
+                            if let Some(floats) = value_as_f32_vec(value) {
+                                vec_updates.push((field.clone(), floats));
+                                continue;
+                            }
+                        }
+                        if let Value::Object(ref mut map) = payload {
                             map.insert(field.clone(), value.clone());
                         }
                     }
