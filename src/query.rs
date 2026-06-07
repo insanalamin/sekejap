@@ -1744,7 +1744,29 @@ fn extract_simple_value(bytes: &[u8], start: usize) -> Option<(Value, usize)> {
             let v = serde_json::from_slice::<Value>(&bytes[start..end]).ok()?;
             Some((v, end))
         }
-        _ => None, // complex value (object/array)
+        b'[' | b'{' => {
+            // Array or object: find matching bracket/brace
+            let close = if bytes[start] == b'[' { b']' } else { b'}' };
+            let mut depth = 0u32;
+            let mut end = start;
+            let mut in_str = false;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'\\' if in_str => { end += 2; continue; }
+                    b'"' => { in_str = !in_str; }
+                    b if !in_str && b == bytes[start] => { depth += 1; }
+                    b if !in_str && b == close => {
+                        depth -= 1;
+                        if depth == 0 { end += 1; break; }
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+            let v = serde_json::from_slice::<Value>(&bytes[start..end]).ok()?;
+            Some((v, end))
+        }
+        _ => None,
     }
 }
 
