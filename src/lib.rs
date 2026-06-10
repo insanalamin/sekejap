@@ -37,7 +37,7 @@ pub mod vector;
 pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
 
 pub use query::{CmpOp, DestWhere, Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step, WhereValue, WithExpr, WithOutExpr, WithRow, WithStage};
-pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, SqlError, TableSchema};
+pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, FieldDef, FieldType, SqlError, TableSchema};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2231,6 +2231,12 @@ impl CoreDB {
         ddl.push_str(&parts.join(", "));
         ddl.push(')');
         Some(ddl)
+    }
+
+    /// Return the structured schema for a collection, if one was declared via
+    /// `CREATE TABLE`.  Returns `None` for schemaless collections.
+    pub fn table_schema(&self, collection: &str) -> Option<&TableSchema> {
+        self.schemas.get(collection)
     }
 
     /// Get all outgoing edges from a node, resolved to slugs where available.
