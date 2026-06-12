@@ -3237,6 +3237,10 @@ impl CoreDB {
         self.nodes.get(&hash)
     }
 
+    pub(crate) fn collection_name(&self, coll_hash: u64) -> Option<&str> {
+        self.collection_names_map.get(&coll_hash).map(|s| s.as_str())
+    }
+
     pub(crate) fn all_hashes(&self) -> Vec<u64> {
         self.nodes.keys().copied().collect()
     }

@@ -1066,6 +1066,68 @@ impl<'db> Set<'db> {
         Some(hits)
     }
 
+    /// Lazily resolve VECTOR-typed fields for final result hits.
+    /// Only touches vector storage when a VECTOR field is explicitly requested
+    /// (in select_fields) or SELECT * is used and the schema declares VECTOR fields.
+    /// Called after all filtering/limiting — only final rows pay the cost.
+    fn resolve_vectors(db: &CoreDB, hits: &mut [Hit], select_fields: &Option<Vec<String>>, steps: &[Step]) {
+        // Find collection hash from steps
+        let coll_hash = match steps.iter().find_map(|s| {
+            if let Step::Collection(h) = s { Some(*h) } else { None }
+        }) {
+            Some(h) => h,
+            None => return,
+        };
+        // Look up schema to find VECTOR fields
+        let coll_name = match db.collection_name(coll_hash) {
+            Some(n) => n,
+            None => return,
+        };
+        let schema = match db.table_schema(coll_name) {
+            Some(s) => s,
+            None => return,
+        };
+        let vec_fields: Vec<&str> = schema.fields.iter()
+            .filter(|f| matches!(f.ty, crate::sql::FieldType::Vector))
+            .map(|f| f.name.as_str())
+            .collect();
+        if vec_fields.is_empty() { return; }
+
+        // Determine which vector fields to resolve
+        let needed: Vec<&str> = match select_fields {
+            Some(fields) => {
+                // Explicit SELECT: only resolve vector fields that were requested
+                vec_fields.into_iter()
+                    .filter(|vf| fields.iter().any(|f| f == vf))
+                    .collect()
+            }
+            None => {
+                // SELECT *: resolve all vector fields
+                vec_fields
+            }
+        };
+        if needed.is_empty() { return; }
+
+        // Inject vector data into each hit's payload
+        for hit in hits.iter_mut() {
+            let map = match hit.payload.as_mut().and_then(|p| p.as_object_mut()) {
+                Some(m) => m,
+                None => continue,
+            };
+            for &field in &needed {
+                if let Some(vecs) = db.vector_field(field) {
+                    if let Some(data) = vecs.get(&hit.slug_hash) {
+                        let arr: Vec<Value> = data.iter()
+                            .map(|&f| serde_json::Number::from_f64(f as f64)
+                                .map(Value::Number).unwrap_or(Value::Null))
+                            .collect();
+                        map.insert(field.to_string(), Value::Array(arr));
+                    }
+                }
+            }
+        }
+    }
+
     pub fn collect(self) -> Vec<Hit> {
         // Short-circuit for pre-computed aggregate results.
         if let Some(hits) = self.precomputed {
@@ -1510,6 +1572,7 @@ impl<'db> Set<'db> {
                     seen.insert(key)
                 });
             }
+            Self::resolve_vectors(self.db, &mut hits, &select_fields, &self.steps);
             return hits;
         }
 
@@ -1621,6 +1684,7 @@ impl<'db> Set<'db> {
                 seen.insert(key)
             });
         }
+        Self::resolve_vectors(self.db, &mut hits, &select_fields, &self.steps);
         hits
     }
 
