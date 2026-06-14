@@ -779,7 +779,7 @@ struct SelectStmt {
     order_by: Option<OrderKey>,
     limit: Option<usize>,
     offset: Option<usize>,
-    bm25_scores: Vec<(String, String)>,
+    score_projections: Vec<(ScoreExpr, String)>,
 }
 
 struct InsertStmt {
@@ -1053,6 +1053,7 @@ impl Default for IndexHint {
 enum FieldOrBm25 {
     Field(String),
     Bm25 { field: String, query: String },
+    ScoreProjection { expr: ScoreExpr, alias: String },
 }
 
 struct Parser {
@@ -1396,7 +1397,7 @@ impl Parser {
             false
         };
 
-        let (fields, bm25_scores) = self.parse_field_list()?;
+        let (fields, score_projections) = self.parse_field_list()?;
 
         self.expect_kw(Kw::From, "FROM")?;
 
@@ -1543,22 +1544,46 @@ impl Parser {
             order_by,
             limit,
             offset,
-            bm25_scores,
+            score_projections,
         })
     }
 
-    fn parse_field_list(&mut self) -> Result<(Vec<String>, Vec<(String, String)>), SqlError> {
+    fn parse_field_list(&mut self) -> Result<(Vec<String>, Vec<(ScoreExpr, String)>), SqlError> {
         if matches!(self.peek(), Tok::Star) {
             self.advance();
-            return Ok((vec![], vec![]));
+            // Check for trailing score projections: SELECT *, BM25(...) AS score
+            let mut score_projections = Vec::new();
+            while matches!(self.peek(), Tok::Comma) {
+                self.advance();
+                let field = self.parse_field_or_bm25()?;
+                match field {
+                    FieldOrBm25::ScoreProjection { expr, alias } => {
+                        score_projections.push((expr, alias));
+                    }
+                    FieldOrBm25::Bm25 { field, query } => {
+                        let alias = format!("_bm25_{}_score", field);
+                        score_projections.push((ScoreExpr::Bm25 { field, query }, alias));
+                    }
+                    FieldOrBm25::Field(_) => {
+                        return Err(SqlError::InvalidValue("cannot mix * with plain fields; use score functions with AS alias after *".into()));
+                    }
+                }
+            }
+            return Ok((vec![], score_projections));
         }
         let mut fields = Vec::new();
-        let mut bm25_scores = Vec::new();
+        let mut score_projections = Vec::new();
         loop {
             let field = self.parse_field_or_bm25()?;
             match field {
                 FieldOrBm25::Field(f) => fields.push(f),
-                FieldOrBm25::Bm25 { field, query } => bm25_scores.push((field, query)),
+                FieldOrBm25::Bm25 { field, query } => {
+                    let alias = format!("_bm25_{}_score", field);
+                    score_projections.push((ScoreExpr::Bm25 { field, query }, alias));
+                }
+                FieldOrBm25::ScoreProjection { expr, alias } => {
+                    score_projections.push((expr, alias));
+                }
             }
             if matches!(self.peek(), Tok::Comma) {
                 self.advance();
@@ -1566,18 +1591,35 @@ impl Parser {
                 break;
             }
         }
-        Ok((fields, bm25_scores))
+        Ok((fields, score_projections))
     }
 
     fn parse_field_or_bm25(&mut self) -> Result<FieldOrBm25, SqlError> {
         let ident = self.expect_ident()?;
-        if ident.to_uppercase() == "BM25" && matches!(self.peek(), Tok::LParen) {
-            self.advance();
-            let field = self.expect_ident()?;
-            self.expect_comma()?;
-            let query = self.expect_str()?;
-            self.expect_rparen()?;
-            return Ok(FieldOrBm25::Bm25 { field, query });
+        // Score functions → parse as full ScoreExpr, optional AS alias
+        if matches!(self.peek(), Tok::LParen) {
+            let upper = ident.to_uppercase();
+            if matches!(upper.as_str(),
+                "BM25" | "VECTOR_COSINE" | "VECTOR_L2"
+                | "VECTOR_DOT" | "VECTOR_L1" | "ST_DISTANCE_KM"
+            ) {
+                // Back up so parse_score_expr can consume the ident
+                self.pos -= 1;
+                let expr = self.parse_score_expr()?;
+                // Check for optional AS alias
+                if matches!(self.peek(), Tok::Kw(Kw::As)) {
+                    self.advance();
+                    let alias = self.expect_ident()?;
+                    return Ok(FieldOrBm25::ScoreProjection { expr, alias });
+                }
+                // No AS alias — use legacy auto-naming for bare BM25
+                if let ScoreExpr::Bm25 { ref field, ref query } = expr {
+                    return Ok(FieldOrBm25::Bm25 { field: field.clone(), query: query.clone() });
+                }
+                return Err(SqlError::InvalidValue(
+                    "score expression in SELECT requires AS alias".into(),
+                ));
+            }
         }
         if matches!(self.peek(), Tok::LParen) && ident.to_uppercase() == "ST_CENTROID" {
             self.advance();
@@ -5527,7 +5569,7 @@ fn append_tail(
     offset: Option<usize>,
     limit: Option<usize>,
     fields: Vec<String>,
-    bm25_scores: Vec<(String, String)>,
+    score_projections: Vec<(ScoreExpr, String)>,
 ) {
     if let Some(order_key) = order_by {
         match order_key {
@@ -5551,8 +5593,8 @@ fn append_tail(
     if let Some(n) = limit {
         steps.push(Step::Take(n));
     }
-    for (field, query) in bm25_scores {
-        steps.push(Step::Bm25Score(field, query));
+    if !score_projections.is_empty() {
+        steps.push(Step::ScoreProject(score_projections));
     }
     if !fields.is_empty() {
         steps.push(Step::Select(fields));
@@ -5585,7 +5627,7 @@ fn compile(stmt: SelectStmt) -> Vec<Step> {
         order_by,
         limit,
         offset,
-        bm25_scores,
+        score_projections,
     } = stmt;
     let mut steps: Vec<Step> = Vec::new();
 
@@ -5616,7 +5658,7 @@ fn compile(stmt: SelectStmt) -> Vec<Step> {
                 }
             }
             push_group_having_distinct(&mut steps, group_by, having, distinct);
-            append_tail(&mut steps, order_by, offset, limit, fields, bm25_scores);
+            append_tail(&mut steps, order_by, offset, limit, fields, score_projections);
             return steps;
         }
     }
@@ -5645,7 +5687,7 @@ fn compile(stmt: SelectStmt) -> Vec<Step> {
                 steps.push(compile_cond(cond));
             }
             push_group_having_distinct(&mut steps, group_by, having, distinct);
-            append_tail(&mut steps, order_by, offset, limit, fields, bm25_scores);
+            append_tail(&mut steps, order_by, offset, limit, fields, score_projections);
             return steps;
         }
     }
@@ -5659,7 +5701,7 @@ fn compile(stmt: SelectStmt) -> Vec<Step> {
         steps.push(compile_cond(cond));
     }
     push_group_having_distinct(&mut steps, group_by, having, distinct);
-    append_tail(&mut steps, order_by, offset, limit, fields, bm25_scores);
+    append_tail(&mut steps, order_by, offset, limit, fields, score_projections);
     steps
 }
 
@@ -6275,7 +6317,7 @@ mod tests {
                 Step::VectorNear { .. } => "VectorNear",
                 Step::Bm25Filter(..) => "Bm25Filter",
                 Step::Bm25Sort(..) => "Bm25Sort",
-                Step::Bm25Score(..) => "Bm25Score",
+                Step::ScoreProject(..) => "ScoreProject",
                 Step::Intersect(_) => "Intersect",
                 Step::Union(_) => "Union",
                 Step::Subtract(_) => "Subtract",
@@ -6830,7 +6872,17 @@ mod tests {
     fn parse_bm25_select_score() {
         let steps =
             parse_and_compile("SELECT title, BM25(body, 'rust tutorial') FROM articles").unwrap();
-        assert_eq!(step_names(&steps), ["Collection", "Bm25Score", "Select"]);
+        assert_eq!(step_names(&steps), ["Collection", "ScoreProject", "Select"]);
+
+        // With AS alias
+        let steps =
+            parse_and_compile("SELECT title, BM25(body, 'rust tutorial') AS score FROM articles").unwrap();
+        assert_eq!(step_names(&steps), ["Collection", "ScoreProject", "Select"]);
+
+        // SELECT * with score projection
+        let steps =
+            parse_and_compile("SELECT *, BM25(body, 'rust') AS relevance FROM articles").unwrap();
+        assert_eq!(step_names(&steps), ["Collection", "ScoreProject"]);
     }
 
     #[test]

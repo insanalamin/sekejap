@@ -155,8 +155,8 @@ pub enum Step {
     Bm25Filter(String, String, f64),
     /// Sort by BM25 score (field, query, ascending).
     Bm25Sort(String, String, bool),
-    /// Add BM25 score column to result (field, query).
-    Bm25Score(String, String),
+    /// Add score projection columns to result (expr, alias).
+    ScoreProject(Vec<(ScoreExpr, String)>),
 
     // ── Null / logical ────────────────────────────────────────────────────────
     /// `field IS NULL` (negated=false) or `IS NOT NULL` (negated=true).
@@ -242,7 +242,7 @@ pub fn describe_step(step: &Step, db: &CoreDB) -> serde_json::Map<String, Value>
         Step::VectorNear { field, k, .. } => ("Vector Scan", format!("{field} top-{k} nearest")),
         Step::Bm25Filter(f, q, s) => ("BM25 Filter", format!("{f} match '{q}' score > {s}")),
         Step::Bm25Sort(f, q, asc) => ("BM25 Sort", format!("{f} match '{q}' {}", if *asc { "ASC" } else { "DESC" })),
-        Step::Bm25Score(f, q) => ("BM25 Score", format!("score({f}, '{q}')")),
+        Step::ScoreProject(projs) => ("Score Project", format!("{} projection(s)", projs.len())),
         Step::WhereIsNull(f, neg) => {
             let op = if *neg { "IS NOT NULL" } else { "IS NULL" };
             ("Filter", format!("{f} {op}"))
@@ -1142,20 +1142,52 @@ impl<'db> Set<'db> {
             }
         });
 
-        let bm25_scores: Option<(String, String, HashMap<u64, f64>)> =
+        let score_project: Option<&Vec<(ScoreExpr, String)>> =
             self.steps.iter().find_map(|s| {
-                if let Step::Bm25Score(field, query) = s {
-                    let all_scores = self.db.bm25_indexes.get(field).map(|idx| {
-                        idx.search(query, 10000)
-                            .into_iter()
-                            .map(|h| (h.doc_id, h.score))
-                            .collect::<HashMap<_, _>>()
-                    });
-                    all_scores.map(|scores| (field.clone(), query.clone(), scores))
-                } else {
-                    None
-                }
+                if let Step::ScoreProject(projs) = s { Some(projs) } else { None }
             });
+
+        // Pre-compute BM25 + vector score maps for all score projections.
+        let (sp_bm25_maps, sp_vec_maps) = if let Some(projs) = score_project {
+            use crate::vector::{CosineDistance, L2Distance, DotProduct, L1Distance, Distance};
+            let mut bm25_keys: HashSet<(String, String)> = HashSet::new();
+            let mut vec_keys: HashMap<(VecMetric, String), Vec<f32>> = HashMap::new();
+            for (expr, _) in projs {
+                gather_bm25_keys(expr, &mut bm25_keys);
+                gather_vector_keys(expr, &mut vec_keys);
+            }
+            let bm25_maps: HashMap<(String, String), HashMap<u64, f64>> = bm25_keys
+                .into_iter()
+                .filter_map(|(field, query)| {
+                    let index = self.db.bm25_indexes.get(&field)?;
+                    let results = index.search(&query, 10000);
+                    let m: HashMap<u64, f64> =
+                        results.iter().map(|h| (h.doc_id, h.score)).collect();
+                    Some(((field, query), m))
+                })
+                .collect();
+            let vec_maps: HashMap<(VecMetric, String), HashMap<u64, f32>> = vec_keys
+                .into_iter()
+                .filter_map(|((metric, field), query_vec)| {
+                    let field_vecs = self.db.vector_field(&field)?;
+                    let m: HashMap<u64, f32> = field_vecs.iter()
+                        .map(|(&h, v)| {
+                            let score = match &metric {
+                                VecMetric::Cosine => 1.0 - CosineDistance::eval(&query_vec, v),
+                                VecMetric::L2     => L2Distance::eval(&query_vec, v),
+                                VecMetric::Dot    => DotProduct::eval(&query_vec, v),
+                                VecMetric::L1     => L1Distance::eval(&query_vec, v),
+                            };
+                            (h, score)
+                        })
+                        .collect();
+                    Some(((metric, field), m))
+                })
+                .collect();
+            (bm25_maps, vec_maps)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
 
         // ── GROUP BY mode ─────────────────────────────────────────────────────
         // Single-pass: fetch each node's payload exactly once, extract the group
@@ -1479,7 +1511,7 @@ impl<'db> Set<'db> {
         // Determine whether the fast raw-byte field extractor can be used.
         // Requirements: SELECT has fields, no BM25 scoring, and ALL fields are
         // plain top-level names (no functions, JSON path, or `*`).
-        let can_use_fast_path = bm25_scores.is_none()
+        let can_use_fast_path = score_project.is_none()
             && select_fields.as_ref().map_or(false, |fs| {
                 !fs.is_empty() && fs.iter().all(|f| is_simple_field(f))
             });
@@ -1496,7 +1528,7 @@ impl<'db> Set<'db> {
         // few sequential pread() calls (sorted by offset) rather than N
         // individual syscalls.  Large payloads fall back to the head+tail path.
         // This eliminates the N-syscall cost for typical point-attribute queries.
-        if can_use_fast_path && bm25_scores.is_none() {
+        if can_use_fast_path {
             let fields = select_fields.as_ref().unwrap(); // safe: can_use_fast_path requires Some
             let hashes = execute(self.db, &self.steps);
             // Collect which hashes need a full payload and which can be batched.
@@ -1580,11 +1612,22 @@ impl<'db> Set<'db> {
             .into_iter()
             .filter_map(|hash| {
                 let node = self.db.node_data(hash)?;
-                let payload = match (&select_fields, &bm25_scores) {
-                    (None, None) => {
-                        self.db.get_payload(hash)
+                let payload = match &select_fields {
+                    None => {
+                        let mut p = self.db.get_payload(hash);
+                        // Inject score projections into full payload
+                        if let Some(projs) = score_project {
+                            let raw = p.clone().unwrap_or(Value::Null);
+                            let mut map = raw.as_object().cloned().unwrap_or_default();
+                            for (expr, alias) in projs {
+                                let val = eval_score(expr, hash, &Value::Object(map.clone().into()), self.db, &sp_bm25_maps, &sp_vec_maps);
+                                map.insert(alias.clone(), serde_json::json!(val));
+                            }
+                            p = Some(Value::Object(map));
+                        }
+                        p
                     }
-                    (Some(fields), None) if can_use_fast_path => {
+                    Some(fields) if can_use_fast_path && score_project.is_none() => {
                         // Fast path: direct byte-pattern search on head + tail slices.
                         // For large payloads (e.g. 12 MB GeoJSON polygons) this avoids
                         // reading the full blob; metadata fields are found in ≤ 16 KB.
@@ -1628,7 +1671,7 @@ impl<'db> Set<'db> {
                             Some(Value::Object(out))
                         }
                     }
-                    (Some(fields), None) => {
+                    Some(fields) => {
                         let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
                         let mut map = serde_json::Map::new();
                         for f in fields {
@@ -1636,32 +1679,12 @@ impl<'db> Set<'db> {
                                 map.insert(field_output_key(f), v);
                             }
                         }
-                        Some(Value::Object(map))
-                    }
-                    (None, Some((bm25_field, _bm25_query, scores))) => {
-                        let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
-                        let mut map = raw_payload.as_object().cloned().unwrap_or_default();
-                        let score_key = format!("_bm25_{}_score", bm25_field);
-                        if let Some(&s) = scores.get(&hash) {
-                            map.insert(score_key, serde_json::json!(s));
-                        } else {
-                            map.insert(score_key, serde_json::json!(0.0));
-                        }
-                        Some(Value::Object(map))
-                    }
-                    (Some(fields), Some((bm25_field, _bm25_query, scores))) => {
-                        let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
-                        let mut map = serde_json::Map::new();
-                        for f in fields {
-                            if let Some(v) = eval_field_expr(f, &raw_payload) {
-                                map.insert(field_output_key(f), v);
+                        // Inject score projections
+                        if let Some(projs) = score_project {
+                            for (expr, alias) in projs {
+                                let val = eval_score(expr, hash, &raw_payload, self.db, &sp_bm25_maps, &sp_vec_maps);
+                                map.insert(alias.clone(), serde_json::json!(val));
                             }
-                        }
-                        let score_key = format!("_bm25_{}_score", bm25_field);
-                        if let Some(&s) = scores.get(&hash) {
-                            map.insert(score_key, serde_json::json!(s));
-                        } else {
-                            map.insert(score_key, serde_json::json!(0.0));
                         }
                         Some(Value::Object(map))
                     }
@@ -3079,8 +3102,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     });
                 }
             }
-            Step::Bm25Score(_, _) => {
-                // BM25 score annotation happens in collect(), not execute()
+            Step::ScoreProject(_) => {
+                // Score projection annotation happens in collect(), not execute()
             }
 
             // ── Set algebra ──────────────────────────────────────────────────
