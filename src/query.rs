@@ -2005,7 +2005,7 @@ fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool {
             if *negated { !is_null } else { is_null }
         }
         Step::Like(field, pattern, case_insensitive) => {
-            use crate::text_index::query::ilike_matches;
+            use crate::text_index::query::{ilike_matches, like_matches};
             let v = db.get_payload(h).and_then(|p| resolve_field(field, &p));
             v.as_ref()
                 .and_then(|v| v.as_str())
@@ -2013,7 +2013,7 @@ fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool {
                     if *case_insensitive {
                         ilike_matches(s, pattern)
                     } else {
-                        s.contains(pattern.as_str())
+                        like_matches(s, pattern)
                     }
                 })
                 .unwrap_or(false)

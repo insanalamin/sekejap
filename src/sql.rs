@@ -785,7 +785,7 @@ struct SelectStmt {
 struct InsertStmt {
     collection: String,
     fields: Vec<String>,
-    values: Vec<Value>,
+    rows: Vec<Vec<Value>>,
 }
 
 struct DeleteStmt {
@@ -835,6 +835,12 @@ pub enum CompiledMutation {
     Update {
         steps: Vec<Step>,
         updates: Vec<(String, Value)>,
+    },
+    /// Multiple nodes to insert in one statement (multi-row VALUES).
+    /// HNSW indexes are rebuilt once per affected vector field, not per row.
+    InsertBatch {
+        collection: String,
+        items: Vec<(String, String, Vec<(String, Vec<f32>)>)>, // (slug, payload_json, vectors)
     },
     /// Create one or more directed edges via Cypher pattern.
     InsertEdge(Vec<EdgeInsert>),
@@ -2555,8 +2561,9 @@ impl Parser {
         self.parse_polygon_literal()
     }
 
-    /// Parse: INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...)
+    /// Parse: INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...) [, (...), ...]
     /// Called after INSERT has already been consumed.
+    /// Supports multi-row INSERT: VALUES (a, b), (c, d), (e, f)
     fn parse_insert_node(&mut self) -> Result<InsertStmt, SqlError> {
         self.expect_kw(Kw::Into, "INTO")?;
         let collection = self.expect_ident()?;
@@ -2568,6 +2575,7 @@ impl Parser {
         }
         self.expect_rparen()?;
         self.expect_kw(Kw::Values, "VALUES")?;
+        // Parse first tuple
         self.expect_lparen()?;
         let mut values = vec![self.parse_value()?];
         while matches!(self.peek(), Tok::Comma) {
@@ -2575,10 +2583,23 @@ impl Parser {
             values.push(self.parse_value()?);
         }
         self.expect_rparen()?;
+        let mut rows = vec![values];
+        // Parse additional tuples: , (val, val, ...)
+        while matches!(self.peek(), Tok::Comma) {
+            self.advance();
+            self.expect_lparen()?;
+            let mut values = vec![self.parse_value()?];
+            while matches!(self.peek(), Tok::Comma) {
+                self.advance();
+                values.push(self.parse_value()?);
+            }
+            self.expect_rparen()?;
+            rows.push(values);
+        }
         Ok(InsertStmt {
             collection,
             fields,
-            values,
+            rows,
         })
     }
 
@@ -5629,6 +5650,23 @@ fn compile(stmt: SelectStmt) -> Vec<Step> {
         offset,
         score_projections,
     } = stmt;
+
+    // ── Resolve ORDER BY alias → ScoreExpr ───────────────────────────────────────
+    // When the user writes `SELECT BM25(f,'q') AS score ... ORDER BY score DESC`,
+    // the parser sees `score` as a plain field name.  Replace it with the actual
+    // ScoreExpr from the projection so SortByExpr evaluates it correctly.
+    let order_by = match order_by {
+        Some(OrderKey::Fields(ref cols)) if cols.len() == 1 && !score_projections.is_empty() => {
+            let (ref name, ascending) = cols[0];
+            if let Some((expr, _)) = score_projections.iter().find(|(_, alias)| alias == name) {
+                Some(OrderKey::Expr(expr.clone(), ascending))
+            } else {
+                order_by
+            }
+        }
+        other => other,
+    };
+
     let mut steps: Vec<Step> = Vec::new();
 
     // ── Fast-path 1: Collection + WHERE _key = 'val' → O(1) One(hash) ───────────
@@ -5752,17 +5790,23 @@ fn maybe_parse_json_string(value: Value) -> Value {
     value
 }
 
-fn compile_insert(stmt: InsertStmt) -> Result<CompiledMutation, SqlError> {
-    if stmt.fields.len() != stmt.values.len() {
+/// Compile a single row of values (with the given fields and collection) into
+/// (slug, payload_json, vectors). Shared logic for single-row and multi-row INSERT.
+fn compile_insert_row(
+    collection: &str,
+    fields: &[String],
+    values: Vec<Value>,
+) -> Result<(String, String, Vec<(String, Vec<f32>)>), SqlError> {
+    if fields.len() != values.len() {
         return Err(SqlError::FieldValueCountMismatch {
-            fields: stmt.fields.len(),
-            values: stmt.values.len(),
+            fields: fields.len(),
+            values: values.len(),
         });
     }
     // Empty-string sentinel means "_key absent — defer to schema default in execute()".
-    let slug = match stmt.fields.iter().position(|f| f == "_key") {
-        Some(idx) => match &stmt.values[idx] {
-            Value::String(s) => format!("{}/{}", stmt.collection, s),
+    let slug = match fields.iter().position(|f| f == "_key") {
+        Some(idx) => match &values[idx] {
+            Value::String(s) => format!("{}/{}", collection, s),
             other => {
                 return Err(SqlError::InvalidValue(format!(
                     "_key must be a string, got {other}"
@@ -5772,23 +5816,39 @@ fn compile_insert(stmt: InsertStmt) -> Result<CompiledMutation, SqlError> {
         None => String::new(), // deferred: execute() will generate via schema UUID default
     };
     let mut obj = serde_json::Map::new();
-    obj.insert("_collection".into(), Value::String(stmt.collection.clone()));
+    obj.insert("_collection".into(), Value::String(collection.to_string()));
     // _id will be backfilled in execute() when slug is empty
     if !slug.is_empty() {
         obj.insert("_id".into(), Value::String(slug.clone()));
     }
     let mut vectors: Vec<(String, Vec<f32>)> = Vec::new();
-    for (field, value) in stmt.fields.into_iter().zip(stmt.values) {
+    for (field, value) in fields.iter().zip(values) {
         if let Some(floats) = value_as_f32_vec(&value) {
             // Array-of-numbers → vector field, not stored in the JSON payload
-            vectors.push((field, floats));
+            vectors.push((field.clone(), floats));
         } else {
-            obj.insert(field, maybe_parse_json_string(value));
+            obj.insert(field.clone(), maybe_parse_json_string(value));
         }
     }
     let payload_json =
         serde_json::to_string(&obj).map_err(|e| SqlError::InvalidValue(e.to_string()))?;
-    Ok(CompiledMutation::Insert { collection: stmt.collection, slug, payload_json, vectors })
+    Ok((slug, payload_json, vectors))
+}
+
+fn compile_insert(stmt: InsertStmt) -> Result<CompiledMutation, SqlError> {
+    if stmt.rows.len() == 1 {
+        // Single-row: produce Insert (zero overhead for existing queries)
+        let (slug, payload_json, vectors) =
+            compile_insert_row(&stmt.collection, &stmt.fields, stmt.rows.into_iter().next().unwrap())?;
+        Ok(CompiledMutation::Insert { collection: stmt.collection, slug, payload_json, vectors })
+    } else {
+        // Multi-row: produce InsertBatch
+        let mut items = Vec::with_capacity(stmt.rows.len());
+        for row in stmt.rows {
+            items.push(compile_insert_row(&stmt.collection, &stmt.fields, row)?);
+        }
+        Ok(CompiledMutation::InsertBatch { collection: stmt.collection, items })
+    }
 }
 
 fn compile_delete(stmt: DeleteStmt) -> Vec<Step> {
@@ -6913,6 +6973,74 @@ mod tests {
             }
             other => panic!("expected Insert, got {other:?}"),
         }
+    }
+
+    // ── Multi-row INSERT parse tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_insert_multi_row() {
+        let m = parse_mutation(
+            "INSERT INTO users (_key, name, age) VALUES ('a', 'Alice', 30), ('b', 'Bob', 25), ('c', 'Carol', 28)"
+        ).unwrap();
+        match m {
+            CompiledMutation::InsertBatch { collection, items } => {
+                assert_eq!(collection, "users");
+                assert_eq!(items.len(), 3);
+                // First row
+                assert_eq!(items[0].0, "users/a"); // slug
+                let v: Value = serde_json::from_str(&items[0].1).unwrap();
+                assert_eq!(v["name"], "Alice");
+                assert_eq!(v["age"].as_f64(), Some(30.0));
+                // Second row
+                assert_eq!(items[1].0, "users/b");
+                let v: Value = serde_json::from_str(&items[1].1).unwrap();
+                assert_eq!(v["name"], "Bob");
+                // Third row
+                assert_eq!(items[2].0, "users/c");
+                let v: Value = serde_json::from_str(&items[2].1).unwrap();
+                assert_eq!(v["name"], "Carol");
+            }
+            other => panic!("expected InsertBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_single_row_stays_insert() {
+        // Single-row INSERT should produce Insert, not InsertBatch
+        let m = parse_mutation(
+            "INSERT INTO users (_key, name) VALUES ('a', 'Alice')"
+        ).unwrap();
+        assert!(matches!(m, CompiledMutation::Insert { .. }));
+    }
+
+    #[test]
+    fn parse_insert_multi_row_with_params() {
+        let m = parse_mutation_params(
+            "INSERT INTO t (_key, val) VALUES ($1, $2), ($3, $4)",
+            vec![
+                Value::String("k1".into()), serde_json::json!(10),
+                Value::String("k2".into()), serde_json::json!(20),
+            ],
+        ).unwrap();
+        match m {
+            CompiledMutation::InsertBatch { items, .. } => {
+                assert_eq!(items.len(), 2);
+                let v0: Value = serde_json::from_str(&items[0].1).unwrap();
+                assert_eq!(v0["val"].as_f64(), Some(10.0));
+                let v1: Value = serde_json::from_str(&items[1].1).unwrap();
+                assert_eq!(v1["val"].as_f64(), Some(20.0));
+            }
+            other => panic!("expected InsertBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_multi_row_field_count_mismatch() {
+        // Second tuple has wrong number of values
+        let result = parse_mutation(
+            "INSERT INTO t (_key, a, b) VALUES ('k1', 1, 2), ('k2', 3)"
+        );
+        assert!(result.is_err());
     }
 
     // ── INSERT edge parse tests ─────────────────────────────────────────────

@@ -2752,17 +2752,27 @@ impl CoreDB {
             sql::ShowStmt::Tables => {
                 // Use collection_names_map (O(1) per collection) — no node scan needed.
                 // Insert actual counts first, then seed declared-but-empty schemas with 0.
-                let mut counts: std::collections::BTreeMap<String, usize> =
+                let mut stats: std::collections::BTreeMap<String, (usize, u64)> =
                     std::collections::BTreeMap::new();
                 for (hash, name) in &self.collection_names_map {
-                    let count = self.collections.get(hash).map(|v| v.len()).unwrap_or(0);
-                    counts.insert(name.clone(), count);
+                    let (count, size) = self.collections.get(hash)
+                        .map(|members| {
+                            let c = members.len();
+                            let s: u64 = members.iter()
+                                .filter_map(|h| self.nodes.get(h).map(|n| n.payload_len as u64))
+                                .sum();
+                            (c, s)
+                        })
+                        .unwrap_or((0, 0));
+                    stats.insert(name.clone(), (count, size));
                 }
                 for name in self.schemas.keys() {
-                    counts.entry(name.clone()).or_insert(0);
+                    stats.entry(name.clone()).or_insert((0, 0));
                 }
-                Ok(counts.into_iter()
-                    .map(|(name, count)| make_hit(serde_json::json!({ "name": name, "count": count })))
+                Ok(stats.into_iter()
+                    .map(|(name, (count, size_bytes))| make_hit(serde_json::json!({
+                        "name": name, "count": count, "size_bytes": size_bytes
+                    })))
                     .collect())
             }
 
@@ -3058,6 +3068,94 @@ impl CoreDB {
                 }
                 Ok(1)
             }
+            sql::CompiledMutation::InsertBatch { collection, items } => {
+                let schema = self.schemas.get(&collection).cloned();
+                let mut affected_vec_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let count = items.len();
+                for (mut slug, payload_json, mut vectors) in items {
+                    let payload_json = if let Some(ref schema) = schema {
+                        let mut payload: Value = serde_json::from_str(&payload_json)
+                            .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+                        if let Value::Object(ref mut map) = payload {
+                            // Rescue GEO fields that were mis-routed to vectors
+                            vectors.retain(|(field, data)| {
+                                let is_geo = schema.fields.iter().any(|f| {
+                                    f.name == *field && matches!(f.ty, sql::FieldType::Geo)
+                                });
+                                if is_geo {
+                                    let arr: Vec<Value> = data.iter()
+                                        .map(|&f| serde_json::Number::from_f64(f as f64)
+                                            .map(Value::Number).unwrap_or(Value::Null))
+                                        .collect();
+                                    map.insert(field.clone(), Value::Array(arr));
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            for field in &schema.fields {
+                                if map.contains_key(&field.name) {
+                                    continue;
+                                }
+                                if field.default_uuid4 {
+                                    map.insert(
+                                        field.name.clone(),
+                                        Value::String(crate::scalar::uuid_v4()),
+                                    );
+                                } else if let Some((ns, nm)) = &field.default_uuid5 {
+                                    map.insert(
+                                        field.name.clone(),
+                                        Value::String(crate::scalar::uuid_v5(ns, nm)),
+                                    );
+                                }
+                            }
+                            if slug.is_empty() {
+                                match map.get("_key").and_then(|v| v.as_str()) {
+                                    Some(key_val) => {
+                                        slug = format!("{}/{}", collection, key_val);
+                                        map.insert("_id".into(), Value::String(slug.clone()));
+                                    }
+                                    None => {
+                                        return Err(SqlError::MissingField { field: "_key" });
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(err) = validate_payload_against_schema(schema, &payload) {
+                            return Err(err);
+                        }
+                        serde_json::to_string(&payload)
+                            .map_err(|e| SqlError::InvalidValue(e.to_string()))?
+                    } else if slug.is_empty() {
+                        return Err(SqlError::MissingField { field: "_key" });
+                    } else {
+                        payload_json
+                    };
+                    self.put(&slug, &payload_json)
+                        .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+                    // Store vectors without HNSW rebuild — defer to end
+                    for (field, data) in vectors {
+                        let hash = sk_hash(&slug);
+                        self.vectors.entry(field.clone()).or_default().insert(hash, data.clone());
+                        self.wal_write(WalEntry::PutVector {
+                            slug: slug.clone(),
+                            field: field.clone(),
+                            data,
+                        });
+                        affected_vec_fields.insert(field);
+                    }
+                }
+                // Single HNSW rebuild per affected vector field
+                for field in &affected_vec_fields {
+                    let hnsw_declared = self.schemas.values()
+                        .any(|s| s.indexes.vector.contains(field));
+                    if hnsw_declared {
+                        let (m, ef) = self.hnsw_params.get(field.as_str()).copied().unwrap_or((16, 200));
+                        let _ = self.build_hnsw_index(field, m, ef);
+                    }
+                }
+                Ok(count)
+            }
             sql::CompiledMutation::Delete(steps) => {
                 let slugs: Vec<String> = Set::from_steps(self, steps)
                     .collect()
@@ -3126,6 +3224,7 @@ impl CoreDB {
                     })
                     .collect();
                 let count = hits.len();
+                let mut affected_vec_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for (slug, mut payload) in hits {
                     let mut geo_fields: Vec<&str> = Vec::new();
                     if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
@@ -3157,9 +3256,25 @@ impl CoreDB {
                         .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
                     self.put(&slug, &json)
                         .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+                    // Store vectors without HNSW rebuild — defer to end
                     for (field, data) in vec_updates {
-                        self.put_vector(&slug, &field, &data)
-                            .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+                        let hash = sk_hash(&slug);
+                        self.vectors.entry(field.clone()).or_default().insert(hash, data.clone());
+                        self.wal_write(WalEntry::PutVector {
+                            slug: slug.clone(),
+                            field: field.clone(),
+                            data,
+                        });
+                        affected_vec_fields.insert(field);
+                    }
+                }
+                // Single HNSW rebuild per affected vector field
+                for field in &affected_vec_fields {
+                    let hnsw_declared = self.schemas.values()
+                        .any(|s| s.indexes.vector.contains(field));
+                    if hnsw_declared {
+                        let (m, ef) = self.hnsw_params.get(field.as_str()).copied().unwrap_or((16, 200));
+                        let _ = self.build_hnsw_index(field, m, ef);
                     }
                 }
                 Ok(count)
