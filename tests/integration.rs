@@ -4951,3 +4951,300 @@ fn param_limit_and_offset() {
     ).unwrap().collect();
     assert_eq!(hits.len(), 2);
 }
+
+// ── Score projection in SELECT ───────────────────────────────────────────────
+
+/// `SELECT *, BM25(field, 'query') AS score FROM ...` — score in SELECT with alias.
+#[test]
+fn select_bm25_score_projection() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE articles (_key TEXT, title TEXT, body TEXT)").unwrap();
+    db.execute("INSERT INTO articles (_key, title, body) VALUES ('a1', 'rust guide', 'learn rust programming')").unwrap();
+    db.execute("INSERT INTO articles (_key, title, body) VALUES ('a2', 'python guide', 'learn python scripting')").unwrap();
+    db.execute("INSERT INTO articles (_key, title, body) VALUES ('a3', 'go guide', 'learn go programming')").unwrap();
+    db.execute("CREATE INDEX ON articles USING bm25 (title)").unwrap();
+
+    // SELECT *, BM25(...) AS score
+    let hits = db.query("SELECT *, BM25(title, 'rust') AS score FROM articles").unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    for h in &hits {
+        let p = h.payload.as_ref().unwrap();
+        assert!(p.get("score").is_some(), "score field must be present");
+        assert!(p.get("title").is_some(), "title field must still be present");
+    }
+    // a1 has 'rust' in title → score > 0
+    let a1 = hits.iter().find(|h| h.slug == "articles/a1").unwrap();
+    let score = a1.payload.as_ref().unwrap().get("score").unwrap().as_f64().unwrap();
+    assert!(score > 0.0, "a1 should have positive BM25 score");
+    // a2 does not have 'rust' → score = 0
+    let a2 = hits.iter().find(|h| h.slug == "articles/a2").unwrap();
+    let score = a2.payload.as_ref().unwrap().get("score").unwrap().as_f64().unwrap();
+    assert_eq!(score, 0.0, "a2 should have zero BM25 score");
+
+    // SELECT title, BM25(...) AS relevance — explicit fields + score
+    let hits = db.query("SELECT title, BM25(title, 'rust') AS relevance FROM articles").unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    let a1 = hits.iter().find(|h| h.slug == "articles/a1").unwrap();
+    let p = a1.payload.as_ref().unwrap();
+    assert!(p.get("relevance").is_some(), "relevance alias must be present");
+    assert!(p.get("title").is_some(), "title must be present");
+    assert!(p.get("body").is_none(), "body must not be present in explicit select");
+}
+
+/// ORDER BY on a BM25 alias must sort by the actual score, not storage order.
+/// Regression test: `ORDER BY bk DESC LIMIT N` was a no-op because the alias
+/// wasn't resolved to the ScoreExpr before sorting.
+#[test]
+fn order_by_bm25_alias() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE resources (_key TEXT, keywords TEXT)").unwrap();
+    // Insert 5 rows, only 2 contain 'watercourse'
+    db.execute("INSERT INTO resources (_key, keywords) VALUES ('r1', 'river watercourse hydrology')").unwrap();
+    db.execute("INSERT INTO resources (_key, keywords) VALUES ('r2', 'road transport highway')").unwrap();
+    db.execute("INSERT INTO resources (_key, keywords) VALUES ('r3', 'watercourse creek stream')").unwrap();
+    db.execute("INSERT INTO resources (_key, keywords) VALUES ('r4', 'building footprint')").unwrap();
+    db.execute("INSERT INTO resources (_key, keywords) VALUES ('r5', 'land parcel cadastre')").unwrap();
+    db.execute("CREATE INDEX ON resources USING bm25 (keywords)").unwrap();
+
+    let hits = db.query(
+        "SELECT _key, BM25(keywords, 'watercourse') AS bk FROM resources ORDER BY bk DESC LIMIT 3"
+    ).unwrap().collect();
+
+    assert_eq!(hits.len(), 3);
+    // Top results must have positive BM25 scores (the watercourse rows)
+    let bk0 = hits[0].payload.as_ref().unwrap().get("bk").unwrap().as_f64().unwrap();
+    let bk1 = hits[1].payload.as_ref().unwrap().get("bk").unwrap().as_f64().unwrap();
+    assert!(bk0 > 0.0, "first result must have positive BM25 score, got {bk0}");
+    assert!(bk1 > 0.0, "second result must have positive BM25 score, got {bk1}");
+    // Scores must be in descending order
+    assert!(bk0 >= bk1, "results must be sorted descending: {bk0} >= {bk1}");
+}
+
+// ── Multi-row INSERT ─────────────────────────────────────────────────────────
+
+#[test]
+fn multi_row_insert_basic() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE users (_key TEXT, name TEXT, age INTEGER)"#).unwrap();
+    let n = db.execute(
+        "INSERT INTO users (_key, name, age) VALUES ('a', 'Alice', 30), ('b', 'Bob', 25), ('c', 'Carol', 28)"
+    ).unwrap();
+    assert_eq!(n, 3);
+
+    // All three rows should be queryable
+    let hits = db.query("SELECT * FROM users").unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    let names: Vec<&str> = hits.iter()
+        .map(|h| h.payload.as_ref().unwrap()["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Bob"));
+    assert!(names.contains(&"Carol"));
+}
+
+#[test]
+fn multi_row_insert_with_params() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE items (_key TEXT, val INTEGER)"#).unwrap();
+    let n = db.execute_params(
+        "INSERT INTO items (_key, val) VALUES ($1, $2), ($3, $4)",
+        &[
+            serde_json::json!("k1"), serde_json::json!(10),
+            serde_json::json!("k2"), serde_json::json!(20),
+        ],
+    ).unwrap();
+    assert_eq!(n, 2);
+
+    let hits = db.query("SELECT * FROM items ORDER BY val").unwrap().collect();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["val"].as_f64(), Some(10.0));
+    assert_eq!(hits[1].payload.as_ref().unwrap()["val"].as_f64(), Some(20.0));
+}
+
+#[test]
+fn multi_row_insert_with_vectors() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE docs (_key TEXT, emb VECTOR)"#).unwrap();
+    let n = db.execute(
+        "INSERT INTO docs (_key, emb) VALUES ('d1', [1.0, 0.0, 0.0]), ('d2', [0.0, 1.0, 0.0]), ('d3', [0.0, 0.0, 1.0])"
+    ).unwrap();
+    assert_eq!(n, 3);
+
+    // All three vectors should be searchable
+    let hits = db.query(
+        "SELECT * FROM docs WHERE VECTOR_NEAR(emb, [1.0, 0.0, 0.0], 3)"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    // Nearest to [1,0,0] should be d1
+    assert_eq!(hits[0].payload.as_ref().unwrap()["_key"].as_str().unwrap(), "d1");
+}
+
+#[test]
+fn multi_row_insert_single_row_unchanged() {
+    // Single-row INSERT still works exactly as before
+    let mut db = CoreDB::new();
+    let n = db.execute(
+        "INSERT INTO users (_key, name) VALUES ('alice', 'Alice')"
+    ).unwrap();
+    assert_eq!(n, 1);
+    let hits = db.query("SELECT * FROM users").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap()["name"].as_str().unwrap(), "Alice");
+}
+
+// ── Mass UPDATE deferred HNSW rebuild ────────────────────────────────────────
+
+#[test]
+fn mass_update_vector_deferred_hnsw() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE docs (_key TEXT, category TEXT, emb VECTOR)"#).unwrap();
+    // Insert multiple docs with vectors
+    db.execute("INSERT INTO docs (_key, category, emb) VALUES ('d1', 'x', [1.0, 0.0, 0.0])").unwrap();
+    db.execute("INSERT INTO docs (_key, category, emb) VALUES ('d2', 'x', [0.0, 1.0, 0.0])").unwrap();
+    db.execute("INSERT INTO docs (_key, category, emb) VALUES ('d3', 'y', [0.0, 0.0, 1.0])").unwrap();
+
+    // Mass update: set all category='x' docs to new vector
+    let n = db.execute(
+        "UPDATE docs SET emb = [0.5, 0.5, 0.0] WHERE category = 'x'"
+    ).unwrap();
+    assert_eq!(n, 2);
+
+    // After update, VECTOR_NEAR should reflect new vectors
+    let hits = db.query(
+        "SELECT * FROM docs WHERE VECTOR_NEAR(emb, [0.5, 0.5, 0.0], 3)"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    // d1 and d2 should be nearest (they now have [0.5, 0.5, 0.0])
+    let top_keys: Vec<&str> = hits[..2].iter()
+        .map(|h| h.payload.as_ref().unwrap()["_key"].as_str().unwrap())
+        .collect();
+    assert!(top_keys.contains(&"d1"));
+    assert!(top_keys.contains(&"d2"));
+}
+
+#[test]
+fn mass_update_vector_with_params() {
+    let mut db = CoreDB::new();
+    db.execute(r#"CREATE TABLE docs (_key TEXT, category TEXT, emb VECTOR)"#).unwrap();
+    db.execute("INSERT INTO docs (_key, category, emb) VALUES ('d1', 'x', [1.0, 0.0, 0.0])").unwrap();
+    db.execute("INSERT INTO docs (_key, category, emb) VALUES ('d2', 'x', [0.0, 1.0, 0.0])").unwrap();
+    db.execute("INSERT INTO docs (_key, category, emb) VALUES ('d3', 'y', [0.0, 0.0, 1.0])").unwrap();
+
+    // Mass update with param binding for both vector and WHERE
+    let n = db.execute_params(
+        "UPDATE docs SET emb = $1 WHERE category = $2",
+        &[serde_json::json!([0.5, 0.5, 0.0]), serde_json::json!("x")],
+    ).unwrap();
+    assert_eq!(n, 2);
+
+    let hits = db.query(
+        "SELECT * FROM docs WHERE VECTOR_NEAR(emb, [0.5, 0.5, 0.0], 3)"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 3);
+    // d1 and d2 should be nearest
+    let top_keys: Vec<&str> = hits[..2].iter()
+        .map(|h| h.payload.as_ref().unwrap()["_key"].as_str().unwrap())
+        .collect();
+    assert!(top_keys.contains(&"d1"));
+    assert!(top_keys.contains(&"d2"));
+}
+
+// ── Incremental HNSW correctness ─────────────────────────────────────────────
+
+#[test]
+fn incremental_hnsw_correctness() {
+    // Insert 200 vectors one at a time (incremental HNSW insert).
+    // Verify VECTOR_NEAR returns the correct nearest neighbor for several probes.
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE vecs (_key TEXT, embedding VECTOR)").unwrap();
+    db.execute("CREATE INDEX ON vecs USING hnsw (embedding)").unwrap();
+
+    let dim = 32;
+    let n = 200;
+
+    // Deterministic pseudo-random vectors
+    let make_vec = |seed: usize| -> Vec<f32> {
+        (0..dim).map(|i: usize| {
+            let x = ((seed.wrapping_mul(6364136223846793005)
+                .wrapping_add(i.wrapping_mul(1442695040888963407))) >> 33) as f32;
+            (x / u32::MAX as f32) * 2.0 - 1.0
+        }).collect()
+    };
+
+    for i in 0..n {
+        let vec = make_vec(i);
+        let coords: String = vec.iter()
+            .map(|f| format!("{:.6}", f))
+            .collect::<Vec<_>>()
+            .join(", ");
+        db.execute(&format!(
+            "INSERT INTO vecs (_key, embedding) VALUES ('v{}', [{}])", i, coords
+        )).unwrap();
+    }
+
+    // Probe: search for a known vector, should find itself as the closest
+    let probe_vec = make_vec(42);
+    let coords: String = probe_vec.iter()
+        .map(|f| format!("{:.6}", f))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hits = db.query(&format!(
+        "SELECT _key FROM vecs WHERE VECTOR_NEAR(embedding, [{}], 5)", coords
+    )).unwrap().collect();
+
+    assert_eq!(hits.len(), 5, "should return 5 nearest neighbors");
+    // The exact vector should be the first result
+    let first_key = hits[0].payload.as_ref().unwrap()["_key"].as_str().unwrap();
+    assert_eq!(first_key, "v42", "exact match should be nearest");
+
+    // Probe with a different vector
+    let probe_vec2 = make_vec(100);
+    let coords2: String = probe_vec2.iter()
+        .map(|f| format!("{:.6}", f))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hits2 = db.query(&format!(
+        "SELECT _key FROM vecs WHERE VECTOR_NEAR(embedding, [{}], 10)", coords2
+    )).unwrap().collect();
+
+    assert_eq!(hits2.len(), 10, "should return 10 nearest neighbors");
+    let first_key2 = hits2[0].payload.as_ref().unwrap()["_key"].as_str().unwrap();
+    assert_eq!(first_key2, "v100", "exact match should be nearest");
+}
+
+#[test]
+fn incremental_hnsw_remove_and_reinsert() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE items (_key TEXT, emb VECTOR)").unwrap();
+    db.execute("CREATE INDEX ON items USING hnsw (emb)").unwrap();
+
+    // Insert 50 vectors
+    for i in 0..50 {
+        let v: Vec<f32> = (0..16).map(|d| (i * 16 + d) as f32 / 800.0).collect();
+        let coords: String = v.iter().map(|f| format!("{:.6}", f)).collect::<Vec<_>>().join(", ");
+        db.execute(&format!(
+            "INSERT INTO items (_key, emb) VALUES ('item{}', [{}])", i, coords
+        )).unwrap();
+    }
+
+    // Verify search works with 50 items
+    let probe: Vec<f32> = (0..16).map(|d| (25 * 16 + d) as f32 / 800.0).collect();
+    let coords: String = probe.iter().map(|f| format!("{:.6}", f)).collect::<Vec<_>>().join(", ");
+    let hits = db.query(&format!(
+        "SELECT _key FROM items WHERE VECTOR_NEAR(emb, [{}], 5)", coords
+    )).unwrap().collect();
+    assert_eq!(hits.len(), 5);
+    let first = hits[0].payload.as_ref().unwrap()["_key"].as_str().unwrap();
+    assert_eq!(first, "item25");
+
+    // Delete item25 and verify it no longer appears
+    db.execute("DELETE FROM items WHERE _key = 'item25'").unwrap();
+    let hits2 = db.query(&format!(
+        "SELECT _key FROM items WHERE VECTOR_NEAR(emb, [{}], 5)", coords
+    )).unwrap().collect();
+    assert_eq!(hits2.len(), 5);
+    for h in &hits2 {
+        let key = h.payload.as_ref().unwrap()["_key"].as_str().unwrap();
+        assert_ne!(key, "item25", "deleted item should not appear in results");
+    }
+}

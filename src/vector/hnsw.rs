@@ -88,9 +88,25 @@ fn random_unit(seed: u64) -> f64 {
 
 /// In-memory HNSW graph for approximate nearest-neighbour search.
 ///
-/// Node IDs are `u64` slug hashes.  Vectors are NOT stored inside the graph;
-/// they are borrowed from the caller's `HashMap<u64, Vec<f32>>` at both build
-/// and search time.
+/// Implements the Hierarchical Navigable Small World algorithm (Malkov &
+/// Yashunin, 2018) with diversity-heuristic neighbour pruning.
+///
+/// Node IDs are `u64` slug hashes. Vectors are **not** stored inside the
+/// graph — they are borrowed from the caller's `HashMap<u64, Vec<f32>>` at
+/// both build and search time, keeping the graph lightweight.
+///
+/// # Construction
+///
+/// - **Bulk**: [`HnswGraph::build()`] constructs the full graph from a set of
+///   vectors. Best for initial data loads.
+/// - **Incremental**: [`HnswGraph::empty()`] + repeated [`HnswGraph::insert()`]
+///   adds one node at a time in O(log n). Best for online inserts.
+///
+/// # Thread safety
+///
+/// The graph itself is not `Sync`. For concurrent access, wrap it in the
+/// [`Engine`](crate::engine::Engine) (behind the `engine` feature flag)
+/// which provides RwLock-based read/write separation.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct HnswGraph {
     m: usize,
@@ -103,6 +119,21 @@ pub struct HnswGraph {
 }
 
 impl HnswGraph {
+    /// Create an empty HNSW graph with the given connectivity parameter `m`.
+    ///
+    /// Use this when you plan to insert nodes incrementally via
+    /// [`insert()`](Self::insert). For bulk construction, prefer
+    /// [`build()`](Self::build) which calls this internally.
+    ///
+    /// # Parameters
+    ///
+    /// - `m`: max bidirectional connections per node per layer.
+    ///   Clamped to a minimum of 2. Recommended range: 8–32 (16 is a good
+    ///   default). Higher values improve recall at the cost of memory.
+    pub fn empty(m: usize) -> Self {
+        Self::new(m)
+    }
+
     fn new(m: usize) -> Self {
         let m = m.max(2);
         Self {
@@ -187,6 +218,7 @@ impl HnswGraph {
         self.nodes.len()
     }
 
+    /// Returns `true` if the graph contains no nodes.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -194,6 +226,71 @@ impl HnswGraph {
     /// Returns the node ID of the current entry point, if any.
     pub fn entry_point_id(&self) -> Option<u64> {
         self.entry_point.map(|(id, _)| id)
+    }
+
+    /// Insert a single node into an existing HNSW graph in O(log n) time.
+    ///
+    /// This is the incremental counterpart to [`build()`](Self::build).
+    /// Use it when adding vectors one at a time to avoid O(n log n) full
+    /// graph rebuilds.
+    ///
+    /// # Parameters
+    ///
+    /// - `node_id`: the `u64` hash of the node's slug. Must already have a
+    ///   corresponding entry in `vectors`.
+    /// - `vectors`: the full vector store for this field (all nodes, not just
+    ///   the new one). The graph uses these to compute distances during
+    ///   neighbour search.
+    /// - `ef_construction`: beam width (larger = better recall, slower build;
+    ///   200 is a good default).
+    ///
+    /// # No-op conditions
+    ///
+    /// If `node_id` has no entry in `vectors`, the call is silently ignored.
+    /// If the node already exists in the graph, it will be reinserted (the
+    /// old entry's layers are overwritten).
+    pub fn insert<D: Distance>(
+        &mut self,
+        node_id: u64,
+        vectors: &HashMap<u64, Vec<f32>>,
+        ef_construction: usize,
+    ) {
+        self.insert_node::<D>(node_id, vectors, ef_construction);
+    }
+
+    /// Remove a node from the HNSW graph.
+    ///
+    /// Unlinks `node_id` from all neighbour lists across all layers and
+    /// removes its own adjacency data. If the removed node was the graph's
+    /// entry point, a new entry point is chosen (the node with the most
+    /// layers).
+    ///
+    /// This is a **lazy** tombstone-free removal — neighbour connections
+    /// that passed through the removed node are not re-wired. For large
+    /// graphs this has negligible impact on recall. For small graphs
+    /// (< 100 nodes) or high deletion rates, consider a periodic
+    /// [`build()`](Self::build) to restore optimal connectivity.
+    ///
+    /// No-op if `node_id` is not in the graph.
+    pub fn remove(&mut self, node_id: u64) {
+        if let Some(layers) = self.nodes.remove(&node_id) {
+            // Remove node_id from all its neighbors' adjacency lists
+            for layer in &layers {
+                for &nb_id in layer {
+                    if let Some(nb_layers) = self.nodes.get_mut(&nb_id) {
+                        for nb_layer in nb_layers.iter_mut() {
+                            nb_layer.retain(|&id| id != node_id);
+                        }
+                    }
+                }
+            }
+        }
+        // Fix entry point if we just removed it
+        if self.entry_point.map(|(id, _)| id) == Some(node_id) {
+            self.entry_point = self.nodes.iter()
+                .max_by_key(|(_, layers)| layers.len())
+                .map(|(&id, layers)| (id, layers.len().saturating_sub(1)));
+        }
     }
 
     // ── Construction internals ────────────────────────────────────────────────

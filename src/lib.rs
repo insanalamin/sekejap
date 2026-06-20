@@ -26,6 +26,8 @@
 //! ```
 
 pub mod bm25;
+#[cfg(feature = "engine")]
+pub mod engine;
 pub mod geo;
 mod query;
 pub mod scalar;
@@ -402,7 +404,7 @@ pub struct CoreDB {
     /// WAL writer — `Some` when opened from disk, `None` for in-memory.
     wal: Option<WalWriter>,
     /// Data directory path.
-    data_dir: Option<PathBuf>,
+    pub(crate) data_dir: Option<PathBuf>,
     /// Grid-based spatial index for accelerating spatial queries.
     spatial_grid: Option<geo::SpatialGrid>,
     /// GiST trigram indexes for text fields (field_name -> index).
@@ -602,7 +604,10 @@ impl CoreDB {
         //    HNSW: rebuild when any data changed (payloads or vectors).
         let gin_bin_path = dir.join("gin.bin");
         if wal_had_payload {
-            // Payload changed — rebuild GIN + HNSW from current data and refresh gin.bin.
+            // Payload changed — rebuild all declared indexes from current data.
+            // BM25/GIN/HNSW builds are skipped during replay (apply_index guards
+            // on self.replaying) so we must rebuild them all here, once.
+            db.rebuild_declared_bm25_indexes();
             db.rebuild_declared_gin_indexes();
             db.rebuild_declared_hnsw_indexes();
             let _ = db.save_gin_binary(&gin_bin_path);
@@ -3719,13 +3724,16 @@ impl CoreDB {
             .entry(field.to_string())
             .or_default()
             .insert(hash, data.to_vec());
-        // Auto-rebuild HNSW if this field has a declared index.
-        // Uses stored params when available, falls back to sensible defaults.
+        // Incremental HNSW insert: O(log n) instead of full rebuild O(n log n).
         let hnsw_declared = self.schemas.values()
             .any(|s| s.indexes.vector.contains(&field.to_string()));
         if hnsw_declared {
             let (m, ef) = self.hnsw_params.get(field).copied().unwrap_or((16, 200));
-            let _ = self.build_hnsw_index(field, m, ef);
+            let field_vecs = self.vectors.get(field).unwrap();
+            let graph = self.hnsw_indexes
+                .entry(field.to_string())
+                .or_insert_with(|| vector::HnswGraph::empty(m));
+            graph.insert::<CosineDistance>(hash, field_vecs, ef);
         }
         self.wal_write(WalEntry::PutVector {
             slug: slug.to_string(),
@@ -4105,29 +4113,46 @@ impl CoreDB {
         }
 
         // Build the actual in-memory index structure.
+        //
+        // During WAL replay, skip HNSW / GIN / BM25 / spatial / gist builds.
+        // open() rebuilds those once at the end (rebuild_declared_hnsw_indexes,
+        // rebuild_declared_gin_indexes, rebuild_spatial_grid).
+        // Without this guard, each CreateIndex(hnsw) WAL entry would rebuild
+        // the entire HNSW graph — with N tables sharing the same field name
+        // that's N redundant full rebuilds on the same vectors.
+        //
+        // Btree and Hash must still build during replay because put_raw()
+        // maintains them incrementally and needs the field_indexes populated.
         match method {
+            IndexMethod::Hnsw => {
+                if !self.replaying {
+                    for field in fields {
+                        let _ = self.build_hnsw_index(field, 16, 200);
+                    }
+                }
+            }
             IndexMethod::Bm25 => {
-                for field in fields {
-                    self.build_bm25_index(field);
+                if !self.replaying {
+                    for field in fields {
+                        self.build_bm25_index(field);
+                    }
                 }
             }
             IndexMethod::Gin => {
-                for field in fields {
-                    self.build_gin_index(field);
+                if !self.replaying {
+                    for field in fields {
+                        self.build_gin_index(field);
+                    }
                 }
             }
             IndexMethod::Gist => {
-                self.rebuild_text_indexes();
+                if !self.replaying {
+                    self.rebuild_text_indexes();
+                }
             }
             IndexMethod::Spatial => {
-                self.rebuild_spatial_grid();
-            }
-            IndexMethod::Hnsw => {
-                for field in fields {
-                    // Silently skip when no vectors exist yet — the index
-                    // will be (re)built automatically when vectors are inserted
-                    // via put_vector(), or explicitly via REINDEX.
-                    let _ = self.build_hnsw_index(field, 16, 200);
+                if !self.replaying {
+                    self.rebuild_spatial_grid();
                 }
             }
             IndexMethod::Btree => {
@@ -4146,6 +4171,23 @@ impl CoreDB {
     }
 
     /// Rebuild all declared GIN indexes from all currently loaded nodes.
+    /// Rebuild all declared BM25 indexes from current data.
+    ///
+    /// Called after WAL replay in `open()` because BM25 builds are skipped
+    /// during replay (apply_index guards on self.replaying).
+    fn rebuild_declared_bm25_indexes(&mut self) {
+        let fields: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            self.schemas.values()
+                .flat_map(|s| s.indexes.bm25.iter().cloned())
+                .filter(|f| seen.insert(f.clone()))
+                .collect()
+        };
+        for field in fields {
+            self.build_bm25_index(&field);
+        }
+    }
+
     ///
     /// Called after WAL replay in `open()` to ensure GIN is fresh regardless
     /// of the order in which WAL entries were written (e.g. CreateIndex before Put).
