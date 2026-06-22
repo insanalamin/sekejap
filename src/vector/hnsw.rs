@@ -1,7 +1,8 @@
 //! In-memory HNSW (Hierarchical Navigable Small World) graph.
 //!
 //! Adapted from HyperHNSW (sekejap-full) for single-threaded use with
-//! HashMap-backed vector storage.  No extra dependencies.
+//! pluggable vector storage via the [`VectorAccess`] trait. No extra
+//! dependencies.
 //!
 //! # Algorithm
 //! Standard HNSW as described in Malkov & Yashunin (2018):
@@ -20,6 +21,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::vector::access::VectorAccess;
 use crate::vector::Distance;
 
 // ── Candidate types ───────────────────────────────────────────────────────────
@@ -92,8 +94,8 @@ fn random_unit(seed: u64) -> f64 {
 /// Yashunin, 2018) with diversity-heuristic neighbour pruning.
 ///
 /// Node IDs are `u64` slug hashes. Vectors are **not** stored inside the
-/// graph — they are borrowed from the caller's `HashMap<u64, Vec<f32>>` at
-/// both build and search time, keeping the graph lightweight.
+/// graph — they are accessed through any type implementing [`VectorAccess`],
+/// keeping the graph lightweight.
 ///
 /// # Construction
 ///
@@ -165,14 +167,17 @@ impl HnswGraph {
     /// # Parameters
     /// - `m`: max connections per node (recommended 8–32; 16 is a good default)
     /// - `ef_construction`: beam width during build (recommended 100–400; 200 is good)
-    pub fn build<D: Distance>(
-        field_vecs: &HashMap<u64, Vec<f32>>,
+    pub fn build<D: Distance, V: VectorAccess>(
+        field_vecs: &V,
         m: usize,
         ef_construction: usize,
-    ) -> Self {
+    ) -> Self
+    where
+        V: IterableVectors,
+    {
         let mut graph = Self::new(m);
-        for (&node_id, _) in field_vecs {
-            graph.insert_node::<D>(node_id, field_vecs, ef_construction);
+        for (node_id, _) in field_vecs.iter_vectors() {
+            graph.insert_node::<D, V>(node_id, field_vecs, ef_construction);
         }
         graph
     }
@@ -183,10 +188,10 @@ impl HnswGraph {
     /// - Returns node IDs sorted ascending by distance (closest first).
     ///
     /// Falls back gracefully: if the graph is empty the result is empty.
-    pub fn search<D: Distance>(
+    pub fn search<D: Distance, V: VectorAccess>(
         &self,
         query: &[f32],
-        vectors: &HashMap<u64, Vec<f32>>,
+        vectors: &V,
         k: usize,
         ef: usize,
     ) -> Vec<u64> {
@@ -197,7 +202,7 @@ impl HnswGraph {
 
         // Greedy descent through upper layers (ef=1 → move to nearest at each hop).
         for level in (1..=ep_level).rev() {
-            let cands = search_layer::<D>(&self.nodes, query, ep_id, 1, level, vectors);
+            let cands = search_layer::<D, V>(&self.nodes, query, ep_id, 1, level, vectors);
             if let Some(best) = cands.into_iter().min_by(|a, b| {
                 a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal)
             }) {
@@ -207,7 +212,7 @@ impl HnswGraph {
 
         // Beam search at layer 0.
         let ef_actual = ef.max(k);
-        let mut results = search_layer::<D>(&self.nodes, query, ep_id, ef_actual, 0, vectors);
+        let mut results = search_layer::<D, V>(&self.nodes, query, ep_id, ef_actual, 0, vectors);
         results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
         results.truncate(k);
         results.into_iter().map(|c| c.id).collect()
@@ -249,13 +254,13 @@ impl HnswGraph {
     /// If `node_id` has no entry in `vectors`, the call is silently ignored.
     /// If the node already exists in the graph, it will be reinserted (the
     /// old entry's layers are overwritten).
-    pub fn insert<D: Distance>(
+    pub fn insert<D: Distance, V: VectorAccess>(
         &mut self,
         node_id: u64,
-        vectors: &HashMap<u64, Vec<f32>>,
+        vectors: &V,
         ef_construction: usize,
     ) {
-        self.insert_node::<D>(node_id, vectors, ef_construction);
+        self.insert_node::<D, V>(node_id, vectors, ef_construction);
     }
 
     /// Remove a node from the HNSW graph.
@@ -295,13 +300,13 @@ impl HnswGraph {
 
     // ── Construction internals ────────────────────────────────────────────────
 
-    fn insert_node<D: Distance>(
+    fn insert_node<D: Distance, V: VectorAccess>(
         &mut self,
         node_id: u64,
-        vectors: &HashMap<u64, Vec<f32>>,
+        vectors: &V,
         ef_construction: usize,
     ) {
-        let query = match vectors.get(&node_id) {
+        let query = match vectors.get(node_id) {
             Some(v) => v,
             None => return,
         };
@@ -329,7 +334,7 @@ impl HnswGraph {
         let mut curr_ep = ep_id;
         for level in (max_level + 1..=ep_level).rev() {
             let cands =
-                search_layer::<D>(&self.nodes, query, curr_ep, 1, level, vectors);
+                search_layer::<D, V>(&self.nodes, query, curr_ep, 1, level, vectors);
             if let Some(best) = cands.into_iter().min_by(|a, b| {
                 a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal)
             }) {
@@ -339,7 +344,7 @@ impl HnswGraph {
 
         // ── Phase 2: connect at each shared level ─────────────────────────────
         for level in (0..=max_level.min(ep_level)).rev() {
-            let cands = search_layer::<D>(
+            let cands = search_layer::<D, V>(
                 &self.nodes,
                 query,
                 curr_ep,
@@ -356,7 +361,7 @@ impl HnswGraph {
             }
 
             let m_max = self.m_max(level);
-            let neighbors = select_neighbors_heuristic::<D>(&cands, m_max, vectors);
+            let neighbors = select_neighbors_heuristic::<D, V>(&cands, m_max, vectors);
 
             // Write the new node's neighbour list at this level.
             if let Some(node_layers) = self.nodes.get_mut(&node_id) {
@@ -390,8 +395,8 @@ impl HnswGraph {
                         .and_then(|ls| ls.get(level))
                         .cloned()
                         .unwrap_or_default();
-                    let nb_vec = vectors.get(&nb_id).cloned().unwrap_or_default();
-                    let pruned = prune_neighbors::<D>(&nb_vec, &current, m_max, vectors);
+                    let nb_vec: Vec<f32> = vectors.get(nb_id).map(|s| s.to_vec()).unwrap_or_default();
+                    let pruned = prune_neighbors::<D, V>(&nb_vec, &current, m_max, vectors);
                     if let Some(nb_layers) = self.nodes.get_mut(&nb_id) {
                         if level < nb_layers.len() {
                             nb_layers[level] = pruned;
@@ -408,20 +413,38 @@ impl HnswGraph {
     }
 }
 
+// ── Iterable vectors (needed for build) ──────────────────────────────────────
+
+/// Extension trait for vector stores that support iteration.
+///
+/// Required by [`HnswGraph::build()`] which needs to enumerate all vectors.
+/// Separated from [`VectorAccess`] because mmap-backed stores can implement
+/// `get()` cheaply but `iter()` requires scanning the offset index.
+pub trait IterableVectors {
+    /// Iterate over all `(node_id, vector)` pairs.
+    fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, &[f32])> + '_>;
+}
+
+impl IterableVectors for HashMap<u64, Vec<f32>> {
+    fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, &[f32])> + '_> {
+        Box::new(self.iter().map(|(&id, v)| (id, v.as_slice())))
+    }
+}
+
 // ── Module-level search helpers ───────────────────────────────────────────────
 
 /// Beam search restricted to one layer of the graph.
 ///
 /// Returns all explored candidates sorted ascending by distance.
-fn search_layer<D: Distance>(
+fn search_layer<D: Distance, V: VectorAccess>(
     nodes: &HashMap<u64, Vec<Vec<u64>>>,
     query: &[f32],
     entry_point: u64,
     ef: usize,
     layer: usize,
-    vectors: &HashMap<u64, Vec<f32>>,
+    vectors: &V,
 ) -> Vec<MinCand> {
-    let d0 = match vectors.get(&entry_point) {
+    let d0 = match vectors.get(entry_point) {
         Some(v) => D::eval(query, v),
         None => return vec![],
     };
@@ -455,7 +478,7 @@ fn search_layer<D: Distance>(
             }
             visited.insert(nb);
 
-            let d = match vectors.get(&nb) {
+            let d = match vectors.get(nb) {
                 Some(v) => D::eval(query, v),
                 None => continue,
             };
@@ -484,10 +507,10 @@ fn search_layer<D: Distance>(
 ///
 /// Accepts a candidate whose closest already-selected neighbour is farther from
 /// it than the query is.  Fills remaining slots from discarded candidates.
-fn select_neighbors_heuristic<D: Distance>(
+fn select_neighbors_heuristic<D: Distance, V: VectorAccess>(
     candidates: &[MinCand],
     m: usize,
-    vectors: &HashMap<u64, Vec<f32>>,
+    vectors: &V,
 ) -> Vec<u64> {
     if candidates.len() <= m {
         return candidates.iter().map(|c| c.id).collect();
@@ -501,14 +524,14 @@ fn select_neighbors_heuristic<D: Distance>(
         if result.len() >= m {
             break;
         }
-        let cv = match vectors.get(&candidate.id) {
+        let cv = match vectors.get(candidate.id) {
             Some(v) => v,
             None => continue,
         };
         // Accept only if no already-chosen neighbour is closer to this candidate
         // than the query itself.
         for &sel_id in &result {
-            if let Some(sv) = vectors.get(&sel_id) {
+            if let Some(sv) = vectors.get(sel_id) {
                 if D::eval(cv, sv) < candidate.dist {
                     discarded.push(candidate);
                     continue 'outer;
@@ -530,22 +553,22 @@ fn select_neighbors_heuristic<D: Distance>(
 }
 
 /// Re-select neighbours for an existing node after its list grew too large.
-fn prune_neighbors<D: Distance>(
+fn prune_neighbors<D: Distance, V: VectorAccess>(
     query: &[f32],
     current: &[u64],
     m: usize,
-    vectors: &HashMap<u64, Vec<f32>>,
+    vectors: &V,
 ) -> Vec<u64> {
     let mut candidates: Vec<MinCand> = current
         .iter()
         .filter_map(|&id| {
             vectors
-                .get(&id)
+                .get(id)
                 .map(|v| MinCand { id, dist: D::eval(query, v) })
         })
         .collect();
     candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
-    select_neighbors_heuristic::<D>(&candidates, m, vectors)
+    select_neighbors_heuristic::<D, V>(&candidates, m, vectors)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -570,14 +593,14 @@ mod tests {
     #[test]
     fn build_and_search_basic() {
         let vecs = make_vecs(20, 8);
-        let graph = HnswGraph::build::<CosineDistance>(&vecs, 4, 40);
+        let graph = HnswGraph::build::<CosineDistance, _>(&vecs, 4, 40);
         assert_eq!(graph.len(), 20);
 
         // Query identical to node 0's vector → the top result must have
         // cosine distance ≈ 0 (several nodes may share the same vector due
         // to the `i % dim` construction).
         let query = vecs[&0].clone();
-        let results = graph.search::<CosineDistance>(&query, &vecs, 3, 10);
+        let results = graph.search::<CosineDistance, _>(&query, &vecs, 3, 10);
         assert!(!results.is_empty());
         let top_dist = CosineDistance::eval(&query, &vecs[&results[0]]);
         assert!(
@@ -589,9 +612,9 @@ mod tests {
     #[test]
     fn search_returns_at_most_k() {
         let vecs = make_vecs(50, 16);
-        let graph = HnswGraph::build::<CosineDistance>(&vecs, 8, 100);
+        let graph = HnswGraph::build::<CosineDistance, _>(&vecs, 8, 100);
         let query = vecs[&0].clone();
-        let results = graph.search::<CosineDistance>(&query, &vecs, 5, 20);
+        let results = graph.search::<CosineDistance, _>(&query, &vecs, 5, 20);
         assert!(results.len() <= 5);
     }
 
@@ -600,7 +623,7 @@ mod tests {
         let graph = HnswGraph::new(8);
         let vecs: HashMap<u64, Vec<f32>> = HashMap::new();
         let query = vec![1.0f32, 0.0, 0.0];
-        let results = graph.search::<CosineDistance>(&query, &vecs, 5, 10);
+        let results = graph.search::<CosineDistance, _>(&query, &vecs, 5, 10);
         assert!(results.is_empty());
     }
 
@@ -608,8 +631,8 @@ mod tests {
     fn single_node_graph() {
         let mut vecs = HashMap::new();
         vecs.insert(42u64, vec![1.0f32, 0.0, 0.0]);
-        let graph = HnswGraph::build::<CosineDistance>(&vecs, 4, 20);
-        let results = graph.search::<CosineDistance>(&[1.0, 0.0, 0.0], &vecs, 1, 5);
+        let graph = HnswGraph::build::<CosineDistance, _>(&vecs, 4, 20);
+        let results = graph.search::<CosineDistance, _>(&[1.0, 0.0, 0.0], &vecs, 1, 5);
         assert_eq!(results, vec![42u64]);
     }
 
@@ -632,7 +655,7 @@ mod tests {
             vecs.insert(i as u64, v);
         }
 
-        let graph = HnswGraph::build::<CosineDistance>(&vecs, 16, 200);
+        let graph = HnswGraph::build::<CosineDistance, _>(&vecs, 16, 200);
         let query = vecs[&0].clone();
         let k = 10;
 
@@ -645,7 +668,7 @@ mod tests {
         let ground_truth: HashSet<u64> = brute.iter().take(k).map(|(id, _)| *id).collect();
 
         let hnsw_results: HashSet<u64> =
-            graph.search::<CosineDistance>(&query, &vecs, k, k * 3).into_iter().collect();
+            graph.search::<CosineDistance, _>(&query, &vecs, k, k * 3).into_iter().collect();
 
         let hits = ground_truth.intersection(&hnsw_results).count();
         // Expect at least 70% recall (typically >90% with m=16, ef=30).

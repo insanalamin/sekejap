@@ -40,6 +40,7 @@ pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
 
 pub use query::{CmpOp, DestWhere, Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step, WhereValue, WithExpr, WithOutExpr, WithRow, WithStage};
 pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, FieldDef, FieldType, SqlError, TableSchema};
+pub use storage::edgestore::EdgeMode;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -123,64 +124,9 @@ pub(crate) struct PayloadStore {
     inner: PayloadInner,
 }
 
-// ── Read-only mmap for payloads.bin ──────────────────────────────────────────
-// Eliminates per-read pread syscalls — reads become pointer dereferences
-// with OS-managed page faults and readahead.  Zero new dependencies:
-// mmap/munmap/madvise are system C library functions always linked by Rust.
+// ── Read-only mmap (shared between PayloadStore and VectorStore) ─────────────
 #[cfg(unix)]
-struct MmapView {
-    ptr: *const u8,
-    len: usize,
-}
-
-#[cfg(unix)]
-unsafe impl Send for MmapView {}
-#[cfg(unix)]
-unsafe impl Sync for MmapView {}
-
-#[cfg(unix)]
-impl MmapView {
-    fn try_new(file: &std::fs::File, len: usize) -> Option<Self> {
-        if len == 0 { return None; }
-        use std::os::unix::io::AsRawFd;
-        extern "C" {
-            fn mmap(
-                addr: *mut std::ffi::c_void, length: usize,
-                prot: i32, flags: i32, fd: i32, offset: i64,
-            ) -> *mut std::ffi::c_void;
-            fn madvise(addr: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
-        }
-        const PROT_READ: i32 = 1;
-        const MAP_PRIVATE: i32 = 2;
-        let ptr = unsafe {
-            mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
-        };
-        if ptr == !0usize as *mut std::ffi::c_void { // MAP_FAILED
-            return None;
-        }
-        // MADV_NORMAL (0) — let OS use default readahead policy.
-        // Sorted-offset access patterns in batch reads benefit from readahead.
-        unsafe { madvise(ptr, len, 0); }
-        Some(Self { ptr: ptr as *const u8, len })
-    }
-
-    #[inline]
-    fn slice(&self, offset: usize, read_len: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(read_len)?;
-        if end > self.len { return None; }
-        unsafe { Some(std::slice::from_raw_parts(self.ptr.add(offset), read_len)) }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for MmapView {
-    fn drop(&mut self) {
-        extern "C" {
-            fn munmap(addr: *mut std::ffi::c_void, length: usize) -> i32;
-        }
-        unsafe { munmap(self.ptr as *mut std::ffi::c_void, self.len); }
-    }
-}
+use storage::mmap::MmapView;
 
 enum PayloadInner {
     Memory { data: Vec<u8> },
@@ -348,12 +294,8 @@ pub struct NodeData {
     pub payload_len: u32,
 }
 
-pub(crate) struct EdgeEntry {
-    pub other: u64,     // neighbour hash (to for fwd, from for rev)
-    pub edge_type: u64, // hash of the edge type label
-    pub strength: f32,
-    pub meta: Option<Value>,
-}
+// EdgeEntry removed — replaced by storage::edgestore::Edge.
+pub(crate) use storage::edgestore::Edge;
 
 // ── EdgeHit ───────────────────────────────────────────────────────────────────
 
@@ -391,16 +333,12 @@ pub(crate) struct BfsPath {
 pub struct CoreDB {
     nodes: HashMap<u64, NodeData>,
     slug_map: HashMap<String, u64>,
-    /// from_hash → outgoing edges
-    adj_fwd: HashMap<u64, Vec<EdgeEntry>>,
-    /// to_hash → incoming edges
-    adj_rev: HashMap<u64, Vec<EdgeEntry>>,
+    /// Graph edges (forward + reverse adjacency, edge type names, metadata).
+    edges: storage::edgestore::EdgeStore,
     /// collection_hash → member slug hashes
     collections: HashMap<u64, Vec<u64>>,
     /// collection_hash → collection name (for O(1) SHOW TABLES without node scan)
     collection_names_map: HashMap<u64, String>,
-    /// edge_type_hash → original name  (needed to rebuild snapshots)
-    edge_type_names: HashMap<u64, String>,
     /// WAL writer — `Some` when opened from disk, `None` for in-memory.
     wal: Option<WalWriter>,
     /// Data directory path.
@@ -419,8 +357,13 @@ pub struct CoreDB {
     /// Table schemas (collection name -> schema).
     /// Persisted in WAL/snapshot.
     schemas: HashMap<String, sql::TableSchema>,
-    /// Vector store: field_name → (slug_hash → vector)
-    vectors: HashMap<String, HashMap<u64, Vec<f32>>>,
+    /// Vector store: field_name → per-field store.
+    ///
+    /// Memory mode wraps `HashMap<u64, Vec<f32>>`; disk mode (Phase 4) will
+    /// use an append-only binary file read via mmap.  Vectors are always
+    /// serialised to the JSON snapshot for recoverability — the binary file
+    /// is a performance optimisation that can be regenerated from the snapshot.
+    vectors: HashMap<String, storage::vecstore::VectorStore>,
     /// HNSW approximate-NN indexes: field_name → graph.
     /// Built explicitly via [`CoreDB::build_hnsw_index`].
     /// Secondary index — never affects the main store on error.
@@ -441,6 +384,22 @@ pub struct CoreDB {
     replaying: bool,
 }
 
+/// Configuration for [`CoreDB::open_with_config`].
+pub struct Config {
+    /// How edges are stored.  [`EdgeMode::Fat`] keeps metadata in RAM
+    /// (original behaviour); [`EdgeMode::Compact`] puts metadata on disk
+    /// and uses ~2.7× less RAM per edge.
+    pub edge_mode: EdgeMode,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            edge_mode: EdgeMode::Compact,
+        }
+    }
+}
+
 impl Default for CoreDB {
     fn default() -> Self {
         Self::new()
@@ -455,11 +414,9 @@ impl CoreDB {
         Self {
             nodes: HashMap::new(),
             slug_map: HashMap::new(),
-            adj_fwd: HashMap::new(),
-            adj_rev: HashMap::new(),
+            edges: storage::edgestore::EdgeStore::new_fat(),
             collections: HashMap::new(),
             collection_names_map: HashMap::new(),
-            edge_type_names: HashMap::new(),
             wal: None,
             data_dir: None,
             spatial_grid: None,
@@ -478,6 +435,15 @@ impl CoreDB {
 
     /// Open (or create) a persistent database in `dir`.
     ///
+    /// Uses [`EdgeMode::Compact`] by default (disk-first edge metadata).
+    /// For the original all-in-RAM behaviour, use
+    /// [`open_with_config`](Self::open_with_config) with [`EdgeMode::Fat`].
+    pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_config(dir, Config::default())
+    }
+
+    /// Open (or create) a persistent database with explicit configuration.
+    ///
     /// On startup:
     /// 1. Loads the latest snapshot (if any).
     /// 2. Replays WAL entries written after the snapshot.
@@ -489,12 +455,23 @@ impl CoreDB {
     /// # Errors
     /// Returns an error if the directory cannot be created, the snapshot
     /// cannot be parsed, or the WAL file cannot be opened.
-    pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open_with_config(dir: impl AsRef<Path>, config: Config) -> io::Result<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
 
         let mut db = Self::new();
         db.data_dir = Some(dir.to_path_buf());
+
+        // Apply edge storage mode from config.
+        #[cfg(unix)]
+        match config.edge_mode {
+            EdgeMode::Compact => {
+                db.edges = storage::edgestore::EdgeStore::open_compact(dir)?;
+            }
+            EdgeMode::Fat => { /* new() already created a Fat store */ }
+        }
+        #[cfg(not(unix))]
+        let _ = &config;
 
         // 1. Load snapshot (peek before touching payloads.bin).
         //    Disk-backed snapshots store only metadata — payloads stay in payloads.bin.
@@ -532,7 +509,8 @@ impl CoreDB {
         // Open payload store: preserve existing payloads.bin for disk-backed snapshots,
         // truncate to zero otherwise (WAL replay or legacy snapshot will refill it).
         let pay_path = dir.join("payloads.bin");
-        let preserve = snap.as_ref().map_or(false, |s| s.is_disk_backed);
+        let preserve      = snap.as_ref().map_or(false, |s| s.is_disk_backed);
+        let has_vec_files = snap.as_ref().map_or(false, |s| s.has_vector_files);
         if preserve && pay_path.exists() {
             let existing_len = std::fs::metadata(&pay_path)?.len();
             db.payload_store = PayloadStore::open_existing(&pay_path, existing_len)?;
@@ -542,6 +520,31 @@ impl CoreDB {
 
         if let Some(snap) = snap {
             db.load_snapshot(snap);
+        }
+
+        // Open disk-backed vector stores directly from .bin files.
+        // When has_vector_files is set, load_snapshot() skipped parsing vectors
+        // from JSON — instead we mmap the binary files (header scan only, no
+        // float data loaded into RAM).  This must happen BEFORE WAL replay so
+        // that PutVector entries append to the existing disk stores.
+        #[cfg(unix)]
+        if has_vec_files {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if let Some(field) = name
+                        .strip_prefix("vectors_")
+                        .and_then(|s| s.strip_suffix(".bin"))
+                    {
+                        if !field.is_empty() && !db.vectors.contains_key(field) {
+                            let store =
+                                storage::vecstore::VectorStore::open_disk(dir, field)?;
+                            db.vectors.insert(field.to_string(), store);
+                        }
+                    }
+                }
+            }
         }
 
         // One-time migration: if the snapshot was large (legacy had embedded gin_indexes),
@@ -592,6 +595,11 @@ impl CoreDB {
             }
         }
 
+        // Remap edge metadata mmap so reads cover data written during
+        // snapshot load + WAL replay.
+        #[cfg(unix)]
+        db.edges.remap_meta();
+
         // 3. Open WAL in append mode
         db.wal = Some(WalWriter::open(&wal_path)?);
 
@@ -622,6 +630,29 @@ impl CoreDB {
             // so here vectors are unchanged — no rebuild needed).
         }
         let _ = wal_had_graph; // used only to determine topology was replayed (no index rebuild needed)
+
+        // 6. Migrate in-memory vectors to disk-backed stores.
+        //    Stores already opened as disk (from .bin files) are left alone.
+        //    Only memory-mode stores (from legacy snapshot or WAL-only fields)
+        //    are written out to binary files and switched to disk mode.
+        #[cfg(unix)]
+        {
+            let fields: Vec<String> = db.vectors.keys().cloned().collect();
+            for field in fields {
+                if db.vectors.get(&field).map_or(false, |s| s.is_disk()) {
+                    continue; // already disk-backed — nothing to migrate
+                }
+                if let Some(mem_store) = db.vectors.remove(&field) {
+                    let mut disk_store =
+                        storage::vecstore::VectorStore::open_disk(dir, &field)?;
+                    for (id, data) in mem_store.iter() {
+                        disk_store.put(id, data.to_vec());
+                    }
+                    disk_store.remap();
+                    db.vectors.insert(field, disk_store);
+                }
+            }
+        }
 
         Ok(db)
     }
@@ -792,32 +823,8 @@ impl CoreDB {
                     }
                 }
             }
-            // Cascade-delete edges: collect neighbour hashes before mutating.
-            // Forward edges (this node → others): remove the corresponding
-            // back-pointers from each target's adj_rev.
-            let fwd_targets: Vec<u64> = self.adj_fwd
-                .get(&hash)
-                .map(|es| es.iter().map(|e| e.other).collect())
-                .unwrap_or_default();
-            for target in fwd_targets {
-                if let Some(rev) = self.adj_rev.get_mut(&target) {
-                    rev.retain(|e| e.other != hash);
-                }
-            }
-            // Reverse edges (others → this node): remove the corresponding
-            // forward-pointers from each source's adj_fwd.
-            let rev_sources: Vec<u64> = self.adj_rev
-                .get(&hash)
-                .map(|es| es.iter().map(|e| e.other).collect())
-                .unwrap_or_default();
-            for source in rev_sources {
-                if let Some(fwd) = self.adj_fwd.get_mut(&source) {
-                    fwd.retain(|e| e.other != hash);
-                }
-            }
-
-            self.adj_fwd.remove(&hash);
-            self.adj_rev.remove(&hash);
+            // Cascade-delete edges involving this node (both directions).
+            self.edges.remove_node(hash);
 
             if let Some(grid) = &mut self.spatial_grid {
                 grid.remove(hash);
@@ -826,7 +833,7 @@ impl CoreDB {
             // Keep vector index consistent with main data: remove all field
             // entries for this node so orphan vectors never accumulate.
             for field_vecs in self.vectors.values_mut() {
-                field_vecs.remove(&hash);
+                field_vecs.remove(hash);
             }
 
             // If this node was the HNSW entry point, the graph can no longer
@@ -845,7 +852,7 @@ impl CoreDB {
                     match self.vectors.get(&field) {
                         Some(field_vecs) => {
                             let (m, ef) = self.hnsw_params.get(&field).copied().unwrap_or((16, 200));
-                            self.hnsw_indexes.insert(field, HnswGraph::build::<CosineDistance>(field_vecs, m, ef));
+                            self.hnsw_indexes.insert(field, HnswGraph::build::<CosineDistance, _>(field_vecs, m, ef));
                         }
                         None => { self.hnsw_indexes.remove(&field); }
                     }
@@ -1306,15 +1313,15 @@ impl CoreDB {
 
         if let Some(field_vecs) = self.vectors.get(field) {
             let filtered: HashMap<u64, Vec<f32>> = field_vecs.iter()
-                .filter(|(h, _)| member_hashes.contains(*h))
-                .map(|(h, v)| (*h, v.clone()))
+                .filter(|(h, _)| member_hashes.contains(h))
+                .map(|(h, v)| (h, v.to_vec()))
                 .collect();
 
             if filtered.is_empty() {
                 self.hnsw_indexes.remove(field);
             } else {
                 use vector::CosineDistance;
-                let graph = vector::HnswGraph::build::<CosineDistance>(&filtered, 16, 200);
+                let graph = vector::HnswGraph::build::<CosineDistance, _>(&filtered, 16, 200);
                 self.hnsw_indexes.insert(field.to_string(), graph);
             }
         } else {
@@ -1326,19 +1333,7 @@ impl CoreDB {
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
-        self.edge_type_names.insert(type_h, edge_type.to_string());
-        self.adj_fwd.entry(from_h).or_default().push(EdgeEntry {
-            other: to_h,
-            edge_type: type_h,
-            strength,
-            meta: None,
-        });
-        self.adj_rev.entry(to_h).or_default().push(EdgeEntry {
-            other: from_h,
-            edge_type: type_h,
-            strength,
-            meta: None,
-        });
+        self.edges.link(from_h, to_h, type_h, edge_type, strength);
     }
 
     fn link_meta_raw(
@@ -1353,19 +1348,7 @@ impl CoreDB {
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
-        self.edge_type_names.insert(type_h, edge_type.to_string());
-        self.adj_fwd.entry(from_h).or_default().push(EdgeEntry {
-            other: to_h,
-            edge_type: type_h,
-            strength,
-            meta: Some(meta.clone()),
-        });
-        self.adj_rev.entry(to_h).or_default().push(EdgeEntry {
-            other: from_h,
-            edge_type: type_h,
-            strength,
-            meta: Some(meta),
-        });
+        self.edges.link_meta(from_h, to_h, type_h, edge_type, strength, meta);
         Ok(())
     }
 
@@ -1373,12 +1356,7 @@ impl CoreDB {
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
-        if let Some(edges) = self.adj_fwd.get_mut(&from_h) {
-            edges.retain(|e| !(e.other == to_h && e.edge_type == type_h));
-        }
-        if let Some(edges) = self.adj_rev.get_mut(&to_h) {
-            edges.retain(|e| !(e.other == from_h && e.edge_type == type_h));
-        }
+        self.edges.unlink(from_h, to_h, type_h);
     }
 
     // ── WAL helpers ───────────────────────────────────────────────────────────
@@ -1430,7 +1408,7 @@ impl CoreDB {
             }
             WalEntry::PutVector { slug, field, data } => {
                 let hash = sk_hash(&slug);
-                self.vectors.entry(field).or_default().insert(hash, data);
+                self.vectors.entry(field).or_default().put(hash, data);
             }
             WalEntry::CreateIndex { collection, method, fields } => {
                 use sql::IndexMethod;
@@ -1664,7 +1642,14 @@ impl CoreDB {
             self.payload_store.reset(new_slab);
         }
 
-        // 2. Write snapshot atomically (tmp → rename) — AFTER payload compaction
+        // 2. Compact disk-backed vector stores (reclaim dead space from
+        //    overwrites and deletes).
+        #[cfg(unix)]
+        for store in self.vectors.values_mut() {
+            store.compact()?;
+        }
+
+        // 3. Write snapshot atomically (tmp → rename) — AFTER payload compaction
         //    so disk-backed SnapNode offsets match the new payloads.bin layout.
         let snap_json = serde_json::to_vec(&self.build_snapshot())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1800,7 +1785,7 @@ impl CoreDB {
         };
 
         let mut edges: Vec<SnapEdge> = Vec::new();
-        for (&from_h, edge_list) in &self.adj_fwd {
+        for (&from_h, edge_list) in self.edges.iter_fwd() {
             let from_slug = match self.nodes.get(&from_h) {
                 Some(n) => n.slug.clone(),
                 None => continue, // dangling edge, skip
@@ -1811,16 +1796,16 @@ impl CoreDB {
                     None => continue,
                 };
                 let edge_type = self
-                    .edge_type_names
-                    .get(&e.edge_type)
-                    .cloned()
+                    .edges
+                    .type_name(e.edge_type)
+                    .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("{:016x}", e.edge_type));
                 edges.push(SnapEdge {
                     from: from_slug.clone(),
                     to: to_slug,
                     edge_type,
                     strength: e.strength,
-                    meta: e.meta.clone(),
+                    meta: self.edges.edge_meta(e),
                 });
             }
         }
@@ -1828,15 +1813,23 @@ impl CoreDB {
         // Collect vectors — only for hashes that still resolve to a live node.
         // This auto-prunes any orphan entries left by bugs or direct HashMap
         // manipulation; main data is always the authority.
+        //
+        // When all vector stores are disk-backed, vectors live in
+        // `vectors_{field}.bin` files — skip serialising them into JSON
+        // (shrinks the snapshot from ~100 MB to ~10 MB for typical datasets).
+        let has_vector_files = !self.vectors.is_empty()
+            && self.vectors.values().all(|s| s.is_disk());
         let mut snap_vectors: Vec<SnapVector> = Vec::new();
-        for (field, field_vecs) in &self.vectors {
-            for (&hash, data) in field_vecs {
-                if let Some(node) = self.nodes.get(&hash) {
-                    snap_vectors.push(SnapVector {
-                        slug: node.slug.clone(),
-                        field: field.clone(),
-                        data: data.clone(),
-                    });
+        if !has_vector_files {
+            for (field, field_vecs) in &self.vectors {
+                for (hash, data) in field_vecs.iter() {
+                    if let Some(node) = self.nodes.get(&hash) {
+                        snap_vectors.push(SnapVector {
+                            slug: node.slug.clone(),
+                            field: field.clone(),
+                            data: data.to_vec(),
+                        });
+                    }
                 }
             }
         }
@@ -1872,6 +1865,7 @@ impl CoreDB {
         Snapshot {
             version: SNAPSHOT_FORMAT_VERSION,
             is_disk_backed: is_disk,
+            has_vector_files,
             nodes,
             edges,
             schemas: Some(self.schemas.values().cloned().collect()),
@@ -1923,10 +1917,14 @@ impl CoreDB {
         }
         // Restore vector index from snapshot — WAL replay will add anything
         // written after the snapshot was taken.
-        if let Some(vecs) = snap.vectors {
-            for sv in vecs {
-                let hash = sk_hash(&sv.slug);
-                self.vectors.entry(sv.field).or_default().insert(hash, sv.data);
+        // When has_vector_files is set, vectors live in .bin files — skip JSON
+        // loading (they'll be opened as disk stores before WAL replay).
+        if !snap.has_vector_files {
+            if let Some(vecs) = snap.vectors {
+                for sv in vecs {
+                    let hash = sk_hash(&sv.slug);
+                    self.vectors.entry(sv.field).or_default().put(hash, sv.data);
+                }
             }
         }
         // Restore HNSW graphs — rebuild if the stored version doesn't match.
@@ -2196,7 +2194,7 @@ impl CoreDB {
 
     /// Returns the number of directed edges currently stored.
     pub fn edge_count(&self) -> usize {
-        self.adj_fwd.values().map(|v| v.len()).sum()
+        self.edges.edge_count()
     }
 
     /// Returns all distinct collection names present in the graph, sorted.
@@ -2247,18 +2245,18 @@ impl CoreDB {
     /// Get all outgoing edges from a node, resolved to slugs where available.
     pub fn edges_from(&self, slug: &str) -> Vec<EdgeHit> {
         let hash = sk_hash(slug);
-        self.adj_fwd
-            .get(&hash)
+        self.edges
+            .fwd_edges(hash)
             .map(|edges| {
                 edges
                     .iter()
                     .map(|e| EdgeHit {
                         from_slug: Some(slug.to_string()),
                         to_slug: self.nodes.get(&e.other).map(|n| n.slug.clone()),
-                        edge_type: self.edge_type_names.get(&e.edge_type).cloned(),
+                        edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
                         strength: e.strength,
-                        meta: e.meta.clone(),
+                        meta: self.edges.edge_meta(e),
                     })
                     .collect()
             })
@@ -2268,18 +2266,18 @@ impl CoreDB {
     /// Get all incoming edges to a node, resolved to slugs where available.
     pub fn edges_to(&self, slug: &str) -> Vec<EdgeHit> {
         let hash = sk_hash(slug);
-        self.adj_rev
-            .get(&hash)
+        self.edges
+            .rev_edges(hash)
             .map(|edges| {
                 edges
                     .iter()
                     .map(|e| EdgeHit {
                         from_slug: self.nodes.get(&e.other).map(|n| n.slug.clone()),
                         to_slug: Some(slug.to_string()),
-                        edge_type: self.edge_type_names.get(&e.edge_type).cloned(),
+                        edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
                         strength: e.strength,
-                        meta: e.meta.clone(),
+                        meta: self.edges.edge_meta(e),
                     })
                     .collect()
             })
@@ -2292,15 +2290,15 @@ impl CoreDB {
         let mut result = Vec::new();
         for (&node_h, node) in &self.nodes {
             if node.collection.is_empty() || sk_hash(&node.collection) != col_h { continue; }
-            if let Some(edges) = self.adj_fwd.get(&node_h) {
+            if let Some(edges) = self.edges.fwd_edges(node_h) {
                 for e in edges {
                     result.push(EdgeHit {
                         from_slug: Some(node.slug.clone()),
                         to_slug: self.nodes.get(&e.other).map(|n| n.slug.clone()),
-                        edge_type: self.edge_type_names.get(&e.edge_type).cloned(),
+                        edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
                         strength: e.strength,
-                        meta: e.meta.clone(),
+                        meta: self.edges.edge_meta(e),
                     });
                 }
             }
@@ -2338,11 +2336,11 @@ impl CoreDB {
         let hash = sk_hash(slug);
         let mut seen = std::collections::HashSet::new();
         let mut types = Vec::new();
-        if let Some(edges) = self.adj_fwd.get(&hash) {
+        if let Some(edges) = self.edges.fwd_edges(hash) {
             for e in edges {
-                if let Some(label) = self.edge_type_names.get(&e.edge_type) {
+                if let Some(label) = self.edges.type_name(e.edge_type) {
                     if seen.insert(e.edge_type) {
-                        types.push(label.clone());
+                        types.push(label.to_string());
                     }
                 }
             }
@@ -2368,11 +2366,11 @@ impl CoreDB {
         let mut types = Vec::new();
         for (&node_h, node) in &self.nodes {
             if node.collection.is_empty() || sk_hash(&node.collection) != col_h { continue; }
-            if let Some(edges) = self.adj_fwd.get(&node_h) {
+            if let Some(edges) = self.edges.fwd_edges(node_h) {
                 for e in edges {
-                    if let Some(label) = self.edge_type_names.get(&e.edge_type) {
+                    if let Some(label) = self.edges.type_name(e.edge_type) {
                         if seen.insert(e.edge_type) {
-                            types.push(label.clone());
+                            types.push(label.to_string());
                         }
                     }
                 }
@@ -2401,10 +2399,10 @@ impl CoreDB {
         for (&from_h, node) in &self.nodes {
             if node.collection.is_empty() { continue; }
             let from_col = node.collection.clone();
-            if let Some(edges) = self.adj_fwd.get(&from_h) {
+            if let Some(edges) = self.edges.fwd_edges(from_h) {
                 for e in edges {
-                    let edge_label = match self.edge_type_names.get(&e.edge_type) {
-                        Some(l) => l.clone(),
+                    let edge_label = match self.edges.type_name(e.edge_type) {
+                        Some(l) => l.to_string(),
                         None => continue,
                     };
                     let to_col = match self.nodes.get(&e.other) {
@@ -2660,12 +2658,12 @@ impl CoreDB {
         queue.push_back(start);
 
         while let Some(current) = queue.pop_front() {
-            if let Some(edges) = self.adj_fwd.get(&current) {
+            if let Some(edges) = self.edges.fwd_edges(current) {
                 for e in edges {
                     if parent.contains_key(&e.other) {
                         continue; // already visited
                     }
-                    parent.insert(e.other, (current, e.edge_type, e.strength, e.meta.clone()));
+                    parent.insert(e.other, (current, e.edge_type, e.strength, self.edges.edge_meta(e)));
                     if e.other == end {
                         // Reconstruct path: walk parent map from end → start, then reverse.
                         let mut node_hashes: Vec<u64> = Vec::new();
@@ -2700,7 +2698,7 @@ impl CoreDB {
                                 EdgeHit {
                                     from_slug: self.nodes.get(&w[0]).map(|n| n.slug.clone()),
                                     to_slug: self.nodes.get(&w[1]).map(|n| n.slug.clone()),
-                                    edge_type: self.edge_type_names.get(&edge_type_hash).cloned(),
+                                    edge_type: self.edges.type_name(edge_type_hash).map(|s| s.to_string()),
                                     edge_type_hash,
                                     strength,
                                     meta,
@@ -2794,10 +2792,10 @@ impl CoreDB {
                             } else {
                                 node.collection.clone()
                             };
-                            if let Some(edges) = self.adj_fwd.get(&from_h) {
+                            if let Some(edges) = self.edges.fwd_edges(from_h) {
                                 for edge in edges {
-                                    let label = match self.edge_type_names.get(&edge.edge_type) {
-                                        Some(l) => l.clone(),
+                                    let label = match self.edges.type_name(edge.edge_type) {
+                                        Some(l) => l.to_string(),
                                         None => continue,
                                     };
                                     let to_col = match self.nodes.get(&edge.other)
@@ -2829,10 +2827,10 @@ impl CoreDB {
                             std::collections::HashMap::new();
                         for (&node_h, node) in &self.nodes {
                             if !node.collection.is_empty() && sk_hash(&node.collection) == col_h {
-                                if let Some(edges) = self.adj_fwd.get(&node_h) {
+                                if let Some(edges) = self.edges.fwd_edges(node_h) {
                                     for edge in edges {
-                                        if let Some(label) = self.edge_type_names.get(&edge.edge_type) {
-                                            *counts.entry(label.clone()).or_insert(0) += 1;
+                                        if let Some(label) = self.edges.type_name(edge.edge_type) {
+                                            *counts.entry(label.to_string()).or_insert(0) += 1;
                                         }
                                     }
                                 }
@@ -2858,14 +2856,14 @@ impl CoreDB {
                             std::collections::HashMap::new();
                         for (&node_h, node) in &self.nodes {
                             if !node.collection.is_empty() && sk_hash(&node.collection) == from_h {
-                                if let Some(edges) = self.adj_fwd.get(&node_h) {
+                                if let Some(edges) = self.edges.fwd_edges(node_h) {
                                     for edge in edges {
                                         let in_to = self.nodes.get(&edge.other)
                                             .map(|n| !n.collection.is_empty() && sk_hash(&n.collection) == to_col_h)
                                             .unwrap_or(false);
                                         if in_to {
-                                            if let Some(label) = self.edge_type_names.get(&edge.edge_type) {
-                                                *counts.entry(label.clone()).or_insert(0) += 1;
+                                            if let Some(label) = self.edges.type_name(edge.edge_type) {
+                                                *counts.entry(label.to_string()).or_insert(0) += 1;
                                             }
                                         }
                                     }
@@ -3141,7 +3139,8 @@ impl CoreDB {
                     // Store vectors without HNSW rebuild — defer to end
                     for (field, data) in vectors {
                         let hash = sk_hash(&slug);
-                        self.vectors.entry(field.clone()).or_default().insert(hash, data.clone());
+                        self.ensure_vector_store(&field);
+                        self.vectors.get_mut(&field).unwrap().put(hash, data.clone());
                         self.wal_write(WalEntry::PutVector {
                             slug: slug.clone(),
                             field: field.clone(),
@@ -3264,7 +3263,8 @@ impl CoreDB {
                     // Store vectors without HNSW rebuild — defer to end
                     for (field, data) in vec_updates {
                         let hash = sk_hash(&slug);
-                        self.vectors.entry(field.clone()).or_default().insert(hash, data.clone());
+                        self.ensure_vector_store(&field);
+                        self.vectors.get_mut(&field).unwrap().put(hash, data.clone());
                         self.wal_write(WalEntry::PutVector {
                             slug: slug.clone(),
                             field: field.clone(),
@@ -3365,16 +3365,20 @@ impl CoreDB {
         self.nodes.keys().copied().collect()
     }
 
-    pub(crate) fn fwd_edges(&self, hash: u64) -> Option<&Vec<EdgeEntry>> {
-        self.adj_fwd.get(&hash)
+    pub(crate) fn fwd_edges(&self, hash: u64) -> Option<&[Edge]> {
+        self.edges.fwd_edges(hash)
     }
 
-    pub(crate) fn rev_edges(&self, hash: u64) -> Option<&Vec<EdgeEntry>> {
-        self.adj_rev.get(&hash)
+    pub(crate) fn rev_edges(&self, hash: u64) -> Option<&[Edge]> {
+        self.edges.rev_edges(hash)
     }
 
     pub(crate) fn resolve_edge_type(&self, hash: u64) -> Option<String> {
-        self.edge_type_names.get(&hash).cloned()
+        self.edges.type_name(hash).map(|s| s.to_string())
+    }
+
+    pub(crate) fn edge_meta(&self, edge: &Edge) -> Option<Value> {
+        self.edges.edge_meta(edge)
     }
 
     pub(crate) fn collection_members(&self, hash: u64) -> Option<&Vec<u64>> {
@@ -3720,10 +3724,11 @@ impl CoreDB {
     /// Returns the slug hash on success.
     pub fn put_vector(&mut self, slug: &str, field: &str, data: &[f32]) -> Result<u64, serde_json::Error> {
         let hash = sk_hash(slug);
-        self.vectors
-            .entry(field.to_string())
-            .or_default()
-            .insert(hash, data.to_vec());
+        self.ensure_vector_store(field);
+        self.vectors.get_mut(field).unwrap().put(hash, data.to_vec());
+        // Remap so the freshly-appended vector is visible via mmap get().
+        #[cfg(unix)]
+        self.vectors.get_mut(field).unwrap().remap();
         // Incremental HNSW insert: O(log n) instead of full rebuild O(n log n).
         let hnsw_declared = self.schemas.values()
             .any(|s| s.indexes.vector.contains(&field.to_string()));
@@ -3733,7 +3738,7 @@ impl CoreDB {
             let graph = self.hnsw_indexes
                 .entry(field.to_string())
                 .or_insert_with(|| vector::HnswGraph::empty(m));
-            graph.insert::<CosineDistance>(hash, field_vecs, ef);
+            graph.insert::<CosineDistance, _>(hash, field_vecs, ef);
         }
         self.wal_write(WalEntry::PutVector {
             slug: slug.to_string(),
@@ -3748,17 +3753,34 @@ impl CoreDB {
     /// Returns `None` if the node has no vector for that field.
     pub fn get_vector(&self, slug: &str, field: &str) -> Option<&[f32]> {
         let hash = sk_hash(slug);
-        self.vectors.get(field)?.get(&hash).map(|v| v.as_slice())
+        use crate::vector::VectorAccess;
+        self.vectors.get(field)?.get(hash)
     }
 
     /// Access all vectors for a given field (used by the query executor).
-    pub(crate) fn vector_field(&self, field: &str) -> Option<&HashMap<u64, Vec<f32>>> {
+    pub(crate) fn vector_field(&self, field: &str) -> Option<&storage::vecstore::VectorStore> {
         self.vectors.get(field)
     }
 
     /// Access the HNSW index for a field (used by the query executor).
     pub(crate) fn hnsw_index(&self, field: &str) -> Option<&vector::HnswGraph> {
         self.hnsw_indexes.get(field)
+    }
+
+    /// Ensure a VectorStore exists for `field`. Creates a disk-backed store
+    /// when a data directory is configured, otherwise a memory-backed one.
+    fn ensure_vector_store(&mut self, field: &str) {
+        if self.vectors.contains_key(field) {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(ref dir) = self.data_dir {
+            if let Ok(store) = storage::vecstore::VectorStore::open_disk(dir, field) {
+                self.vectors.insert(field.to_string(), store);
+                return;
+            }
+        }
+        self.vectors.insert(field.to_string(), storage::vecstore::VectorStore::new());
     }
 
     // ── Btree field index ──────────────────────────────────────────────────────
@@ -4063,6 +4085,11 @@ impl CoreDB {
         m: usize,
         ef_construction: usize,
     ) -> Result<(), String> {
+        // Ensure mmap covers any recently-appended vectors.
+        #[cfg(unix)]
+        if let Some(store) = self.vectors.get_mut(field) {
+            store.remap();
+        }
         let field_vecs = self
             .vectors
             .get(field)
@@ -4070,7 +4097,7 @@ impl CoreDB {
 
         // Build entirely into a local — zero writes to self until this line.
         let graph =
-            vector::HnswGraph::build::<CosineDistance>(field_vecs, m, ef_construction);
+            vector::HnswGraph::build::<CosineDistance, _>(field_vecs, m, ef_construction);
 
         // Atomic replace: old index (if any) is dropped here.
         self.hnsw_indexes.insert(field.to_string(), graph);
@@ -4437,7 +4464,8 @@ impl<'db> Transaction<'db> {
                 TxnOp::Unlink(from, to, et) => { self.db.unlink_raw(from, to, et); }
                 TxnOp::PutVector(slug, field, data) => {
                     let hash = sk_hash(slug);
-                    self.db.vectors.entry(field.clone()).or_default().insert(hash, data.clone());
+                    self.db.ensure_vector_store(field);
+                    self.db.vectors.get_mut(field).unwrap().put(hash, data.clone());
                 }
             }
         }
@@ -4574,6 +4602,11 @@ struct Snapshot {
     /// offset/len/collection/spatial_meta but no payload field.
     #[serde(default)]
     is_disk_backed: bool,
+    /// true = vectors live in per-field `vectors_{field}.bin` files, not in the
+    /// `vectors` JSON array.  On open(), the binary files are mmap'd directly
+    /// instead of parsing vectors from JSON and migrating to disk.
+    #[serde(default)]
+    has_vector_files: bool,
     nodes: Vec<SnapNode>,
     edges: Vec<SnapEdge>,
     #[serde(skip_serializing_if = "Option::is_none")]

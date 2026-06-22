@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/flutter", "skcli"]
 
 [workspace.package]
-version = "0.8.18"
+version = "0.8.19"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -77,4 +77,8 @@ harness = false
 
 [[bench]]
 name = "vector_10k_4096"
+harness = false
+
+[[bench]]
+name = "edge_store_benchmark"
 harness = false

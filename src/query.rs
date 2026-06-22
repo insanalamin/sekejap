@@ -1,6 +1,7 @@
 //! Chainable query builder and executor.
 
 use crate::{sk_hash, CoreDB, FieldKey};
+use crate::vector::VectorAccess;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -609,7 +610,7 @@ impl<'db> Set<'db> {
                             edge_type: db.resolve_edge_type(e.edge_type),
                             edge_type_hash: e.edge_type,
                             strength: e.strength,
-                            meta: e.meta.clone(),
+                            meta: db.edge_meta(e),
                         })
                 } else {
                     // Backward: look in fwd_edges of dest for a source
@@ -622,7 +623,7 @@ impl<'db> Set<'db> {
                             edge_type: db.resolve_edge_type(e.edge_type),
                             edge_type_hash: e.edge_type,
                             strength: e.strength,
-                            meta: e.meta.clone(),
+                            meta: db.edge_meta(e),
                         })
                 }?;
                 let hit = Hit {
@@ -1116,7 +1117,7 @@ impl<'db> Set<'db> {
             };
             for &field in &needed {
                 if let Some(vecs) = db.vector_field(field) {
-                    if let Some(data) = vecs.get(&hit.slug_hash) {
+                    if let Some(data) = VectorAccess::get(vecs, hit.slug_hash) {
                         let arr: Vec<Value> = data.iter()
                             .map(|&f| serde_json::Number::from_f64(f as f64)
                                 .map(Value::Number).unwrap_or(Value::Null))
@@ -1171,7 +1172,7 @@ impl<'db> Set<'db> {
                 .filter_map(|((metric, field), query_vec)| {
                     let field_vecs = self.db.vector_field(&field)?;
                     let m: HashMap<u64, f32> = field_vecs.iter()
-                        .map(|(&h, v)| {
+                        .map(|(h, v)| {
                             let score = match &metric {
                                 VecMetric::Cosine => 1.0 - CosineDistance::eval(&query_vec, v),
                                 VecMetric::L2     => L2Distance::eval(&query_vec, v),
@@ -3037,7 +3038,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             // HNSW STARTER: approximate search over all vectors.
                             let ef = (*k * 3).max(50);
                             candidates =
-                                hnsw.search::<CosineDistance>(query, field_vecs, *k, ef);
+                                hnsw.search::<CosineDistance, _>(query, field_vecs, *k, ef);
                             // Skip to next step — HNSW result is already top-k.
                             continue;
                         }
@@ -3047,7 +3048,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         // STARTER: scan all vectors in this field
                         field_vecs
                             .iter()
-                            .map(|(&h, v)| (h, CosineDistance::eval(query, v)))
+                            .map(|(h, v)| (h, CosineDistance::eval(query, v)))
                             .collect()
                     } else {
                         // FILTER: re-rank only the existing candidates
@@ -3055,7 +3056,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         field_vecs
                             .iter()
                             .filter(|(h, _)| set.contains(h))
-                            .map(|(&h, v)| (h, CosineDistance::eval(query, v)))
+                            .map(|(h, v)| (h, CosineDistance::eval(query, v)))
                             .collect()
                     };
                     scored.sort_unstable_by(|a, b| {
@@ -3243,7 +3244,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 use crate::vector::{CosineDistance, L2Distance, DotProduct, L1Distance, Distance};
                 if let Some(field_vecs) = db.vector_field(field) {
                     let mut scored: Vec<(u64, f32)> = candidates.iter().map(|&h| {
-                        let dist = field_vecs.get(&h).map(|v| match metric {
+                        let dist = VectorAccess::get(field_vecs, h).map(|v| match metric {
                             VecMetric::Cosine => CosineDistance::eval(query, v),
                             VecMetric::L2     => L2Distance::eval(query, v),
                             // Negate dot product so higher similarity → lower sort key → first.
@@ -3286,7 +3287,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         let m: HashMap<u64, f32> = candidates
                             .iter()
                             .map(|&h| {
-                                let score = field_vecs.get(&h).map(|v| match &metric {
+                                let score = VectorAccess::get(field_vecs, h).map(|v| match &metric {
                                     VecMetric::Cosine => 1.0 - CosineDistance::eval(&query_vec, v),
                                     VecMetric::L2     => L2Distance::eval(&query_vec, v),
                                     VecMetric::Dot    => DotProduct::eval(&query_vec, v),

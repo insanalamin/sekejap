@@ -9,7 +9,9 @@
 //! Index:
 //! - [`HnswGraph`] — in-memory HNSW for approximate k-NN search
 
+pub mod access;
 pub mod hnsw;
+pub use access::VectorAccess;
 pub use hnsw::HnswGraph;
 
 #[cfg(target_arch = "x86_64")]
