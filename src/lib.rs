@@ -382,6 +382,9 @@ pub struct CoreDB {
     /// Guards expensive per-entry rebuilds (e.g. HNSW entry-point check in remove_raw)
     /// that must not fire O(N) times during replay — open() handles those once at the end.
     replaying: bool,
+    /// SQL transaction buffer. `Some` when a `BEGIN` has been issued;
+    /// mutations are queued here until `COMMIT` (replay) or `ROLLBACK` (drop).
+    pending_txn: Option<Vec<sql::CompiledMutation>>,
 }
 
 /// Configuration for [`CoreDB::open_with_config`].
@@ -430,6 +433,7 @@ impl CoreDB {
             hnsw_params: HashMap::new(),
             payload_store: PayloadStore::new(),
             replaying: false,
+            pending_txn: None,
         }
     }
 
@@ -573,18 +577,57 @@ impl CoreDB {
         let mut wal_had_graph   = false;
         if wal_path.exists() {
             db.replaying = true;
+            // Transaction-aware replay: entries between TxnBegin and TxnEnd
+            // are buffered and applied together. If TxnEnd is missing (crash
+            // during COMMIT), the entire group is discarded.
+            let mut txn_buf: Option<Vec<WalEntry>> = None;
             let corrupted = WalReader::open(&wal_path)?.replay_all(|entry| {
                 match &entry {
-                    WalEntry::Put { .. }
-                    | WalEntry::Remove { .. }
-                    | WalEntry::PutVector { .. } => wal_had_payload = true,
-                    WalEntry::Link { .. }
-                    | WalEntry::LinkMeta { .. }
-                    | WalEntry::Unlink { .. } => wal_had_graph = true,
+                    WalEntry::TxnBegin => {
+                        txn_buf = Some(Vec::new());
+                        return;
+                    }
+                    WalEntry::TxnEnd => {
+                        if let Some(buf) = txn_buf.take() {
+                            for e in buf {
+                                match &e {
+                                    WalEntry::Put { .. }
+                                    | WalEntry::Remove { .. }
+                                    | WalEntry::PutVector { .. } => wal_had_payload = true,
+                                    WalEntry::Link { .. }
+                                    | WalEntry::LinkMeta { .. }
+                                    | WalEntry::Unlink { .. } => wal_had_graph = true,
+                                    _ => {}
+                                }
+                                db.replay(e);
+                            }
+                        }
+                        return;
+                    }
                     _ => {}
                 }
-                db.replay(entry);
+                if let Some(buf) = &mut txn_buf {
+                    buf.push(entry);
+                } else {
+                    match &entry {
+                        WalEntry::Put { .. }
+                        | WalEntry::Remove { .. }
+                        | WalEntry::PutVector { .. } => wal_had_payload = true,
+                        WalEntry::Link { .. }
+                        | WalEntry::LinkMeta { .. }
+                        | WalEntry::Unlink { .. } => wal_had_graph = true,
+                        _ => {}
+                    }
+                    db.replay(entry);
+                }
             });
+            if txn_buf.is_some() {
+                eprintln!(
+                    "sekejap: WAL at `{}` had an incomplete transaction — \
+                     discarded uncommitted entries.",
+                    wal_path.display()
+                );
+            }
             db.replaying = false;
             if corrupted {
                 eprintln!(
@@ -1447,6 +1490,9 @@ impl CoreDB {
                     let _ = self.alter_table_raw(&collection, op);
                 }
             }
+            // Transaction markers are handled by the replay loop in open_with_config(),
+            // not by individual entry replay. If they reach here, skip them.
+            WalEntry::TxnBegin | WalEntry::TxnEnd => {}
             WalEntry::Unknown => { /* forward-compat: skip entries from newer binaries */ }
         }
     }
@@ -3003,6 +3049,47 @@ impl CoreDB {
 
     /// Internal: execute an already-parsed mutation.
     fn execute_mutation(&mut self, mutation: sql::CompiledMutation) -> Result<usize, SqlError> {
+        // ── Transaction control ──────────────────────────────────────
+        match &mutation {
+            sql::CompiledMutation::Begin => {
+                if self.pending_txn.is_some() {
+                    return Err(SqlError::TransactionError(
+                        "BEGIN inside an active transaction (nested BEGIN not supported)".into(),
+                    ));
+                }
+                self.pending_txn = Some(Vec::new());
+                return Ok(0);
+            }
+            sql::CompiledMutation::Commit => {
+                let buf = self.pending_txn.take().ok_or_else(|| {
+                    SqlError::TransactionError("COMMIT without an active transaction".into())
+                })?;
+                self.wal_write(WalEntry::TxnBegin);
+                let mut total = 0usize;
+                for op in buf {
+                    total += self.execute_mutation(op)?;
+                }
+                self.wal_write(WalEntry::TxnEnd);
+                let _ = self.sync();
+                return Ok(total);
+            }
+            sql::CompiledMutation::Rollback => {
+                if self.pending_txn.take().is_none() {
+                    return Err(SqlError::TransactionError(
+                        "ROLLBACK without an active transaction".into(),
+                    ));
+                }
+                return Ok(0);
+            }
+            _ => {}
+        }
+
+        // If inside a transaction, buffer the mutation instead of executing it.
+        if let Some(buf) = &mut self.pending_txn {
+            buf.push(mutation);
+            return Ok(0);
+        }
+
         match mutation {
             sql::CompiledMutation::Insert { collection, mut slug, payload_json, mut vectors } => {
                 let payload_json = if let Some(schema) = self.schemas.get(&collection).cloned() {
@@ -3348,6 +3435,10 @@ impl CoreDB {
                 self.wal_write(WalEntry::AlterTable { collection, op_json });
                 Ok(count)
             }
+            // Handled by the transaction control block above; unreachable here.
+            sql::CompiledMutation::Begin
+            | sql::CompiledMutation::Commit
+            | sql::CompiledMutation::Rollback => unreachable!(),
         }
     }
 

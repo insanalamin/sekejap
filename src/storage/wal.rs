@@ -78,6 +78,12 @@ pub(crate) enum WalEntry {
         /// JSON-serialised `AlterTableOp` — keeps the WAL self-contained.
         op_json: String,
     },
+    /// Transaction boundary: marks the start of an atomic group.
+    /// All entries between `TxnBegin` and `TxnEnd` are replayed
+    /// together or discarded together on crash recovery.
+    TxnBegin,
+    /// Transaction boundary: marks the end of an atomic group.
+    TxnEnd,
     /// Forward-compatibility catch-all: entries written by a newer binary
     /// with an unknown `op` value are silently skipped on replay.
     #[serde(other)]

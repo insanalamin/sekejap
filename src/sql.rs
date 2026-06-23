@@ -106,6 +106,8 @@ pub enum SqlError {
     ParamOutOfRange { index: usize, count: usize },
     /// Parameter $N has the wrong type.
     ParamTypeMismatch { index: usize, expected: &'static str },
+    /// Transaction protocol error (nested BEGIN, COMMIT/ROLLBACK without active transaction).
+    TransactionError(String),
 }
 
 impl fmt::Display for SqlError {
@@ -144,6 +146,7 @@ impl fmt::Display for SqlError {
                 f,
                 "parameter ${index}: expected {expected}"
             ),
+            SqlError::TransactionError(msg) => write!(f, "transaction error: {msg}"),
         }
     }
 }
@@ -272,6 +275,10 @@ enum Kw {
     Any,
     None_,
     Single,
+    // Transaction control
+    Begin,
+    Commit,
+    Rollback,
 }
 
 fn kw_to_str(kw: &Kw) -> &'static str {
@@ -345,6 +352,9 @@ fn kw_to_str(kw: &Kw) -> &'static str {
         Kw::Any => "any",
         Kw::None_ => "none",
         Kw::Single => "single",
+        Kw::Begin => "begin",
+        Kw::Commit => "commit",
+        Kw::Rollback => "rollback",
     }
 }
 
@@ -419,6 +429,9 @@ fn keyword(s: &str) -> Option<Kw> {
         "ANY" => Some(Kw::Any),
         "NONE" => Some(Kw::None_),
         "SINGLE" => Some(Kw::Single),
+        "BEGIN" => Some(Kw::Begin),
+        "COMMIT" => Some(Kw::Commit),
+        "ROLLBACK" => Some(Kw::Rollback),
         _ => None,
     }
 }
@@ -892,6 +905,12 @@ pub enum CompiledMutation {
         method: IndexMethod,
         fields: Vec<String>,
     },
+    /// BEGIN: start a SQL transaction.
+    Begin,
+    /// COMMIT: apply all buffered mutations atomically.
+    Commit,
+    /// ROLLBACK: discard all buffered mutations.
+    Rollback,
 }
 
 /// The specific alteration to apply in an `ALTER TABLE` statement.
@@ -6290,11 +6309,23 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
             parser.expect_rparen()?;
             Ok(CompiledMutation::Reindex { collection, method, fields })
         }
+        Tok::Kw(Kw::Begin) => {
+            parser.advance();
+            Ok(CompiledMutation::Begin)
+        }
+        Tok::Kw(Kw::Commit) => {
+            parser.advance();
+            Ok(CompiledMutation::Commit)
+        }
+        Tok::Kw(Kw::Rollback) => {
+            parser.advance();
+            Ok(CompiledMutation::Rollback)
+        }
         Tok::Eof => Err(SqlError::UnexpectedEnd {
-            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, or REINDEX",
+            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, REINDEX, BEGIN, COMMIT, or ROLLBACK",
         }),
         other => Err(SqlError::UnexpectedToken {
-            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, or REINDEX",
+            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, REINDEX, BEGIN, COMMIT, or ROLLBACK",
             got: format!("{other:?}"),
         }),
     }
