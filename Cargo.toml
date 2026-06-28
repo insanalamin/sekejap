@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/flutter", "skcli"]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -30,6 +30,7 @@ serde      = { version = "1", features = ["derive"] }
 seahash    = "4"
 crc32fast  = "1.4"
 roaring    = "0.10"
+fst        = { version = "0.4", features = ["levenshtein"] }
 memchr     = "2"
 chrono     = "0.4"
 uuid       = { version = "1", features = ["v4", "v5"] }

@@ -49,6 +49,8 @@ pub enum ScoreExpr {
     Field(String),
     /// BM25 relevance score: `BM25(field, 'query')`.
     Bm25 { field: String, query: String },
+    /// Positional search relevance: `SEARCH_SCORE('query')`.
+    SearchScore { query: String },
     /// Cosine similarity (1 − cosine distance): `VECTOR_COSINE(field, [vec])`.
     VectorCosine { field: String, query: Vec<f32> },
     /// Squared Euclidean distance: `VECTOR_L2(field, [vec])`.
@@ -152,6 +154,8 @@ pub enum Step {
     },
 
     // ── BM25 full-text filter ──────────────────────────────────────────────
+    /// Positional search index filter: keep only docs matching all query terms.
+    SearchFilter(String),
     /// BM25 score > min_score on field.
     Bm25Filter(String, String, f64),
     /// Sort by BM25 score (field, query, ascending).
@@ -241,6 +245,7 @@ pub fn describe_step(step: &Step, db: &CoreDB) -> serde_json::Map<String, Value>
         Step::StLength(f, km) => ("Spatial Filter", format!("ST_Length({f}) > {km}km")),
         Step::StArea(f, km2) => ("Spatial Filter", format!("ST_Area({f}) > {km2}km²")),
         Step::VectorNear { field, k, .. } => ("Vector Scan", format!("{field} top-{k} nearest")),
+        Step::SearchFilter(q) => ("Search Filter", format!("SEARCH('{q}')")),
         Step::Bm25Filter(f, q, s) => ("BM25 Filter", format!("{f} match '{q}' score > {s}")),
         Step::Bm25Sort(f, q, asc) => ("BM25 Sort", format!("{f} match '{q}' {}", if *asc { "ASC" } else { "DESC" })),
         Step::ScoreProject(projs) => ("Score Project", format!("{} projection(s)", projs.len())),
@@ -2094,6 +2099,14 @@ fn eval_score(
                 .copied()
                 .unwrap_or(0.0)
         }
+        ScoreExpr::SearchScore { query } => {
+            for idx in db.search_indexes.values() {
+                if let Some(slot) = idx.hash_to_slot(hash) {
+                    return idx.score(query, slot);
+                }
+            }
+            0.0
+        }
         ScoreExpr::VectorCosine { field, .. } => {
             vec_maps.get(&(VecMetric::Cosine, field.clone()))
                 .and_then(|m| m.get(&hash)).map(|&s| s as f64).unwrap_or(0.0)
@@ -3070,6 +3083,29 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
 
+            Step::SearchFilter(query) => {
+                if candidates.is_empty() {
+                    candidates = db.all_hashes();
+                }
+                if let Some(coll) = current_coll_hash {
+                    if let Some(coll_name) = db.collection_name(coll) {
+                        let key = CoreDB::search_index_key(coll_name);
+                        if let Some(idx) = db.search_indexes.get(&key) {
+                            let matching = idx.search(query);
+                            let match_set: std::collections::HashSet<u64> = matching.iter()
+                                .filter_map(|slot| idx.slot_to_hash(slot))
+                                .collect();
+                            candidates.retain(|h| match_set.contains(h));
+                        } else {
+                            candidates.clear();
+                        }
+                    } else {
+                        candidates.clear();
+                    }
+                } else {
+                    candidates.clear();
+                }
+            }
             Step::Bm25Filter(field, query, min_score) => {
                 // BM25(field, 'query') > min_score
                 if candidates.is_empty() {

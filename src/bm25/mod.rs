@@ -39,7 +39,7 @@
 mod dict;
 mod index;
 mod postings;
-mod tokenizer;
+pub mod tokenizer;
 
 pub use index::{Bm25Index, DEFAULT_REBUILD_THRESHOLD};
 pub use tokenizer::tokenize;

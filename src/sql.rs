@@ -770,6 +770,8 @@ enum CondExpr {
     /// `cond_group OR cond_group [OR …]`
     /// Each inner Vec is one AND-group.
     Or(Vec<Vec<CondExpr>>),
+    /// `SEARCH('query text')` — positional search index filter.
+    Search { query: String },
 }
 
 enum OrderKey {
@@ -989,6 +991,8 @@ pub enum IndexMethod {
     Spatial,
     /// HNSW: approximate nearest-neighbour vector search (Phase 2).
     Hnsw,
+    /// Search: positional inverted index with RoaringBitmaps.
+    Search,
 }
 
 impl std::fmt::Display for IndexMethod {
@@ -1001,6 +1005,7 @@ impl std::fmt::Display for IndexMethod {
             Self::Bm25    => "bm25",
             Self::Spatial => "spatial",
             Self::Hnsw    => "hnsw",
+            Self::Search  => "search",
         };
         f.write_str(s)
     }
@@ -1045,6 +1050,9 @@ pub struct IndexHint {
     /// or explicitly via WITH (vector: ['field']). Reserved for Phase 2 HNSW.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vector: Vec<String>,
+    /// Positional search indexes — each entry is a list of fields covered by one index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search: Vec<Vec<String>>,
     /// Version at which each index was last built.
     /// Key: `"method:field"` — e.g. `"gin:name"`, `"btree:price"`.
     /// Absent key (or stored 0) means built before versioning was introduced → rebuild.
@@ -1068,6 +1076,7 @@ impl Default for IndexHint {
             bm25: Vec::new(),
             spatial: Vec::new(),
             vector: Vec::new(),
+            search: Vec::new(),
             build_versions: std::collections::HashMap::new(),
         }
     }
@@ -2158,6 +2167,14 @@ impl Parser {
             return self.parse_field_compare(func_field);
         }
 
+        // SEARCH('query text') — positional search index filter
+        if upper == "SEARCH" {
+            self.expect_lparen()?;
+            let query = self.expect_str()?;
+            self.expect_rparen()?;
+            return Ok(CondExpr::Search { query });
+        }
+
         // BM25 full-text search: BM25(field, 'query') > min_score
         if upper == "BM25" {
             let bm25_expr = self.parse_bm25_function()?;
@@ -2477,6 +2494,12 @@ impl Parser {
                         self.expect_rparen()?;
                         Ok(ScoreExpr::Bm25 { field, query })
                     }
+                    "SEARCH_SCORE" => {
+                        self.expect_lparen()?;
+                        let query = self.expect_str()?;
+                        self.expect_rparen()?;
+                        Ok(ScoreExpr::SearchScore { query })
+                    }
                     "VECTOR_COSINE" => {
                         self.expect_lparen()?;
                         let field = self.expect_ident()?;
@@ -2526,7 +2549,7 @@ impl Parser {
                 }
             }
             other => Err(SqlError::UnexpectedToken {
-                expected: "score expression (number, field, BM25, VECTOR_COSINE, VECTOR_L2, VECTOR_DOT, VECTOR_L1, ST_DISTANCE_KM, or parentheses)",
+                expected: "score expression (number, field, BM25, SEARCH_SCORE, VECTOR_COSINE, VECTOR_L2, VECTOR_DOT, VECTOR_L1, ST_DISTANCE_KM, or parentheses)",
                 got: format!("{other:?}"),
             }),
         }
@@ -3174,8 +3197,9 @@ impl Parser {
             "bm25"    => IndexMethod::Bm25,
             "spatial" => IndexMethod::Spatial,
             "hnsw"    => IndexMethod::Hnsw,
+            "search"  => IndexMethod::Search,
             other => return Err(SqlError::UnexpectedToken {
-                expected: "btree, hash, gin, gist, bm25, spatial, or hnsw",
+                expected: "btree, hash, gin, gist, bm25, spatial, hnsw, or search",
                 got: other.to_string(),
             }),
         };
@@ -5592,6 +5616,7 @@ fn compile_cond(cond: CondExpr) -> Step {
         CondExpr::Bm25Func { .. } => unreachable!("Bm25Func should not reach compile_cond"),
         CondExpr::VectorNear { field, query, k } => Step::VectorNear { field, query, k },
         CondExpr::IsNull { field, negated } => Step::WhereIsNull(field, negated),
+        CondExpr::Search { query } => Step::SearchFilter(query),
         CondExpr::Not(inner) => Step::WhereNot(Box::new(compile_cond(*inner))),
         CondExpr::Or(groups) => Step::WhereOr(
             groups
@@ -6261,8 +6286,9 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
                         "BM25"    => IndexMethod::Bm25,
                         "SPATIAL" => IndexMethod::Spatial,
                         "HNSW"    => IndexMethod::Hnsw,
+                        "SEARCH"  => IndexMethod::Search,
                         other => return Err(SqlError::UnexpectedToken {
-                            expected: "BTREE, HASH, GIN, GIST, BM25, SPATIAL, or HNSW",
+                            expected: "BTREE, HASH, GIN, GIST, BM25, SPATIAL, HNSW, or SEARCH",
                             got: other.to_string(),
                         }),
                     };
@@ -6295,8 +6321,9 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
                 "bm25"    => IndexMethod::Bm25,
                 "spatial" => IndexMethod::Spatial,
                 "hnsw"    => IndexMethod::Hnsw,
+                "search"  => IndexMethod::Search,
                 other => return Err(SqlError::UnexpectedToken {
-                    expected: "btree, hash, gin, gist, bm25, spatial, or hnsw",
+                    expected: "btree, hash, gin, gist, bm25, spatial, hnsw, or search",
                     got: other.to_string(),
                 }),
             };
@@ -6406,6 +6433,7 @@ mod tests {
                 Step::StLength(..) => "StLength",
                 Step::StArea(..) => "StArea",
                 Step::VectorNear { .. } => "VectorNear",
+                Step::SearchFilter(..) => "SearchFilter",
                 Step::Bm25Filter(..) => "Bm25Filter",
                 Step::Bm25Sort(..) => "Bm25Sort",
                 Step::ScoreProject(..) => "ScoreProject",

@@ -31,6 +31,7 @@ pub mod engine;
 pub mod geo;
 mod query;
 pub mod scalar;
+pub mod search;
 pub mod sql;
 mod storage;
 pub mod text_index;
@@ -354,6 +355,9 @@ pub struct CoreDB {
     /// BM25 full-text indexes for ranked search (field_name -> index).
     /// Built explicitly via build_bm25_index() for relevance-ranked results.
     bm25_indexes: HashMap<String, bm25::Bm25Index>,
+    /// Positional search indexes: index_key → SearchIndex.
+    /// Key is fields joined with "+", e.g. "title+body".
+    pub(crate) search_indexes: HashMap<String, search::SearchIndex>,
     /// Table schemas (collection name -> schema).
     /// Persisted in WAL/snapshot.
     schemas: HashMap<String, sql::TableSchema>,
@@ -426,6 +430,7 @@ impl CoreDB {
             text_indexes: HashMap::new(),
             gin_indexes: HashMap::new(),
             bm25_indexes: HashMap::new(),
+            search_indexes: HashMap::new(),
             schemas: HashMap::new(),
             vectors: HashMap::new(),
             hnsw_indexes: HashMap::new(),
@@ -654,20 +659,27 @@ impl CoreDB {
         //    GIN: only rebuild when payload-mutating entries (Put/Remove) were in WAL.
         //    HNSW: rebuild when any data changed (payloads or vectors).
         let gin_bin_path = dir.join("gin.bin");
+        let search_bin_path = dir.join("search.bin");
         if wal_had_payload {
             // Payload changed — rebuild all declared indexes from current data.
-            // BM25/GIN/HNSW builds are skipped during replay (apply_index guards
+            // BM25/GIN/HNSW/Search builds are skipped during replay (apply_index guards
             // on self.replaying) so we must rebuild them all here, once.
             db.rebuild_declared_bm25_indexes();
             db.rebuild_declared_gin_indexes();
             db.rebuild_declared_hnsw_indexes();
+            db.rebuild_declared_search_indexes();
             let _ = db.save_gin_binary(&gin_bin_path);
+            let _ = db.save_search_binary(&search_bin_path);
         } else {
             // No payload changes — try loading GIN from gin.bin. If missing or
             // stale, rebuild once (covers first open after CREATE INDEX, etc.).
             if !db.load_gin_binary(&gin_bin_path) {
                 db.rebuild_declared_gin_indexes();
                 let _ = db.save_gin_binary(&gin_bin_path);
+            }
+            if !db.load_search_binary(&search_bin_path) {
+                db.rebuild_declared_search_indexes();
+                let _ = db.save_search_binary(&search_bin_path);
             }
             // HNSW: rebuild only when vectors changed (PutVector is part of wal_had_payload,
             // so here vectors are unchanged — no rebuild needed).
@@ -1215,17 +1227,24 @@ impl CoreDB {
 
         // Remove the hint from this collection's schema.
         let removed = if let Some(schema) = self.schemas.get_mut(collection) {
-            let list = match method {
-                IndexMethod::Btree                  => &mut schema.indexes.range,
-                IndexMethod::Hash                   => &mut schema.indexes.hash,
-                IndexMethod::Gin | IndexMethod::Gist => &mut schema.indexes.fulltext,
-                IndexMethod::Bm25                   => &mut schema.indexes.bm25,
-                IndexMethod::Spatial                => &mut schema.indexes.spatial,
-                IndexMethod::Hnsw                   => &mut schema.indexes.vector,
-            };
-            let before = list.len();
-            list.retain(|f| f != field);
-            list.len() < before
+            if matches!(method, IndexMethod::Search) {
+                let before = schema.indexes.search.len();
+                schema.indexes.search.retain(|fields| !fields.contains(&field.to_string()));
+                schema.indexes.search.len() < before
+            } else {
+                let list = match method {
+                    IndexMethod::Btree                  => &mut schema.indexes.range,
+                    IndexMethod::Hash                   => &mut schema.indexes.hash,
+                    IndexMethod::Gin | IndexMethod::Gist => &mut schema.indexes.fulltext,
+                    IndexMethod::Bm25                   => &mut schema.indexes.bm25,
+                    IndexMethod::Spatial                => &mut schema.indexes.spatial,
+                    IndexMethod::Hnsw                   => &mut schema.indexes.vector,
+                    IndexMethod::Search                 => unreachable!(),
+                };
+                let before = list.len();
+                list.retain(|f| f != field);
+                list.len() < before
+            }
         } else {
             false
         };
@@ -1269,6 +1288,13 @@ impl CoreDB {
             IndexMethod::Spatial => {
                 // Spatial grid covers all GEO nodes regardless of collection;
                 // removing the hint is sufficient — no rebuild needed.
+            }
+            IndexMethod::Search => {
+                // Clear all search indexes for this collection, then rebuild
+                // only those still declared in the schema.
+                let key = Self::search_index_key(collection);
+                self.search_indexes.remove(&key);
+                self.rebuild_declared_search_indexes();
             }
         }
 
@@ -1719,6 +1745,10 @@ impl CoreDB {
         // Regenerate gin.bin so the next open loads GIN instantly.
         if let Some(ref gin_bin_path) = self.data_dir.as_ref().map(|d| d.join("gin.bin")) {
             let _ = self.save_gin_binary(gin_bin_path);
+        }
+        // Regenerate search.bin so the next open loads search indexes instantly.
+        if let Some(ref search_bin_path) = self.data_dir.as_ref().map(|d| d.join("search.bin")) {
+            let _ = self.save_search_binary(search_bin_path);
         }
 
         Ok(())
@@ -4216,17 +4246,25 @@ impl CoreDB {
                 fields: vec![],
                 indexes: sql::IndexHint::default(),
             });
-        for field in fields {
-            let list = match method {
-                IndexMethod::Bm25    => &mut schema.indexes.bm25,
-                IndexMethod::Hnsw    => &mut schema.indexes.vector,
-                IndexMethod::Spatial => &mut schema.indexes.spatial,
-                IndexMethod::Gin | IndexMethod::Gist => &mut schema.indexes.fulltext,
-                IndexMethod::Btree   => &mut schema.indexes.range,
-                IndexMethod::Hash    => &mut schema.indexes.hash,
-            };
-            if !list.contains(field) {
-                list.push(field.clone());
+        if matches!(method, IndexMethod::Search) {
+            let field_list: Vec<String> = fields.to_vec();
+            if !schema.indexes.search.contains(&field_list) {
+                schema.indexes.search.push(field_list);
+            }
+        } else {
+            for field in fields {
+                let list = match method {
+                    IndexMethod::Bm25    => &mut schema.indexes.bm25,
+                    IndexMethod::Hnsw    => &mut schema.indexes.vector,
+                    IndexMethod::Spatial => &mut schema.indexes.spatial,
+                    IndexMethod::Gin | IndexMethod::Gist => &mut schema.indexes.fulltext,
+                    IndexMethod::Btree   => &mut schema.indexes.range,
+                    IndexMethod::Hash    => &mut schema.indexes.hash,
+                    IndexMethod::Search  => unreachable!(),
+                };
+                if !list.contains(field) {
+                    list.push(field.clone());
+                }
             }
         }
 
@@ -4283,6 +4321,11 @@ impl CoreDB {
                     self.build_field_index(collection, field);
                 }
             }
+            IndexMethod::Search => {
+                if !self.replaying {
+                    self.build_search_index(collection, fields);
+                }
+            }
         }
 
         Ok(())
@@ -4320,6 +4363,110 @@ impl CoreDB {
         for field in fields {
             self.build_gin_index(&field);
         }
+    }
+
+    /// Canonical key for a search index: fields joined with "+".
+    pub(crate) fn search_index_key(coll_name: &str) -> String {
+        // We store one search index per collection, keyed by collection name.
+        // If multiple USING search indexes exist on the same collection with
+        // different field sets, later ones overwrite earlier ones.
+        coll_name.to_string()
+    }
+
+    /// Build a positional search index for a collection.
+    fn build_search_index(&mut self, collection: &str, fields: &[String]) {
+        let coll_hash = sk_hash(collection);
+        let members = match self.collections.get(&coll_hash) {
+            Some(m) => m.clone(),
+            None => return,
+        };
+
+        let docs = members.iter().filter_map(|&hash| {
+            let node = self.nodes.get(&hash)?;
+            let payload = self.get_payload(hash)?;
+            let _ = node; // ensure node exists
+            let field_values: Vec<String> = fields.iter().map(|f| {
+                payload.get(f)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            }).collect();
+            Some(search::index::DocFields { hash, field_values })
+        });
+
+        let idx = search::SearchIndex::build(fields.to_vec(), docs);
+        let key = Self::search_index_key(collection);
+        self.search_indexes.insert(key, idx);
+    }
+
+    /// Rebuild all declared search indexes from current data.
+    fn rebuild_declared_search_indexes(&mut self) {
+        let declared: Vec<(String, Vec<String>)> = self.schemas.values()
+            .flat_map(|s| {
+                s.indexes.search.iter().map(|fields| (s.collection.clone(), fields.clone()))
+            })
+            .collect();
+        for (coll, fields) in declared {
+            self.build_search_index(&coll, &fields);
+        }
+    }
+
+    fn save_search_binary(&self, path: &std::path::Path) -> io::Result<()> {
+        use std::io::Write;
+        if self.search_indexes.is_empty() {
+            return Ok(());
+        }
+        let tmp = path.with_extension("bin.tmp");
+        let mut f = std::io::BufWriter::new(
+            std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?
+        );
+        f.write_all(b"SKSRCH01")?;
+        f.write_all(&(self.search_indexes.len() as u32).to_le_bytes())?;
+        for (key, idx) in &self.search_indexes {
+            let key_bytes = key.as_bytes();
+            f.write_all(&(key_bytes.len() as u16).to_le_bytes())?;
+            f.write_all(key_bytes)?;
+            idx.write_binary(&mut f)?;
+        }
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn load_search_binary(&mut self, path: &std::path::Path) -> bool {
+        use std::io::Read;
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        if data.len() < 12 || &data[..8] != b"SKSRCH01" {
+            return false;
+        }
+        let mut cursor = std::io::Cursor::new(&data[8..]);
+        let mut count_buf = [0u8; 4];
+        if cursor.read_exact(&mut count_buf).is_err() { return false; }
+        let count = u32::from_le_bytes(count_buf) as usize;
+        let mut loaded = HashMap::new();
+        for _ in 0..count {
+            let mut key_len_buf = [0u8; 2];
+            if cursor.read_exact(&mut key_len_buf).is_err() { return false; }
+            let key_len = u16::from_le_bytes(key_len_buf) as usize;
+            let mut key_buf = vec![0u8; key_len];
+            if cursor.read_exact(&mut key_buf).is_err() { return false; }
+            let key = match String::from_utf8(key_buf) {
+                Ok(k) => k,
+                Err(_) => return false,
+            };
+            match search::SearchIndex::read_binary(&mut cursor) {
+                Ok(idx) => { loaded.insert(key, idx); }
+                Err(_) => return false,
+            }
+        }
+        for (key, idx) in loaded {
+            self.search_indexes.insert(key, idx);
+        }
+        true
     }
 
     /// Rebuild all declared HNSW indexes from all currently loaded vectors.

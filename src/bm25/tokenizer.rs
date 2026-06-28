@@ -29,6 +29,32 @@ pub fn tokenize(text: &str) -> Vec<String> {
     terms
 }
 
+/// Tokenize text into terms with their positions in the token stream.
+/// Returns (term, position) pairs where position is the 0-based token index.
+pub fn tokenize_with_positions(text: &str) -> Vec<(String, usize)> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+    let mut current = String::new();
+
+    for c in text.to_lowercase().chars() {
+        if c.is_alphanumeric() {
+            current.push(c);
+        } else if !current.is_empty() {
+            if current.len() >= 3 {
+                result.push((current.clone(), pos));
+                pos += 1;
+            }
+            current.clear();
+        }
+    }
+
+    if !current.is_empty() && current.len() >= 3 {
+        result.push((current, pos));
+    }
+
+    result
+}
+
 /// Tokenize and deduplicate, preserving frequency count.
 pub fn tokenize_with_freq(text: &str) -> HashSet<(String, u32)> {
     let tokens = tokenize(text);
