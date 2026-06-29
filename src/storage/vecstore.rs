@@ -288,7 +288,7 @@ impl VectorStore {
                     write_pos += record_len as u64;
                 }
 
-                // Atomic rename: tmp → real.
+                tmp_file.sync_all()?;
                 std::fs::rename(&tmp_path, &*path)?;
 
                 // Re-open and re-mmap the compacted file.

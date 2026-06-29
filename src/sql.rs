@@ -1151,6 +1151,14 @@ impl Parser {
         }
     }
 
+    fn expect_usize(&mut self) -> Result<usize, SqlError> {
+        let n = self.expect_num()?;
+        if n < 0.0 || !n.is_finite() {
+            return Err(SqlError::InvalidValue(format!("expected non-negative integer, got {n}")));
+        }
+        Ok(n as usize)
+    }
+
     fn expect_num(&mut self) -> Result<f64, SqlError> {
         match self.advance() {
             Tok::Num(n) => Ok(n),
@@ -1558,11 +1566,11 @@ impl Parser {
             match self.peek() {
                 Tok::Kw(Kw::Limit) => {
                     self.advance();
-                    limit = Some(self.expect_num()? as usize);
+                    limit = Some(self.expect_usize()?);
                 }
                 Tok::Kw(Kw::Offset) => {
                     self.advance();
-                    offset = Some(self.expect_num()? as usize);
+                    offset = Some(self.expect_usize()?);
                 }
                 _ => break,
             }
@@ -2328,7 +2336,7 @@ impl Parser {
         self.expect_comma()?;
         let query = self.parse_f32_array_or_param()?;
         self.expect_comma()?;
-        let k = self.expect_num()? as usize;
+        let k = self.expect_usize()?;
         self.expect_rparen()?;
         Ok(CondExpr::VectorNear { field, query, k })
     }
@@ -3317,7 +3325,7 @@ impl Parser {
         let mut limit = None;
         if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
             self.advance();
-            limit = Some(self.expect_num()? as usize);
+            limit = Some(self.expect_usize()?);
         }
 
         Ok(MatchStmt {
@@ -3995,7 +4003,7 @@ impl Parser {
         // ── LIMIT ─────────────────────────────────────────────────────────
         let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
             self.advance();
-            Some(self.expect_num()? as usize)
+            Some(self.expect_usize()?)
         } else {
             None
         };
@@ -4214,7 +4222,7 @@ impl Parser {
         // ── LIMIT ─────────────────────────────────────────────────────────
         let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
             self.advance();
-            Some(self.expect_num()? as usize)
+            Some(self.expect_usize()?)
         } else {
             None
         };
@@ -4383,7 +4391,7 @@ impl Parser {
         // LIMIT
         let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
             self.advance();
-            Some(self.expect_num()? as usize)
+            Some(self.expect_usize()?)
         } else { None };
 
         Ok(ShortestSelectStmt { from_slug, to_slug, start_bind, end_bind, path_bind, returns, predicates, order_by, limit })
@@ -4619,7 +4627,7 @@ impl Parser {
         // LIMIT
         let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
             self.advance();
-            Some(self.expect_num()? as usize)
+            Some(self.expect_usize()?)
         } else { None };
 
         Ok(MultiFromStmt { sources, returns, order_by, limit })
@@ -5177,7 +5185,7 @@ impl Parser {
         // ── LIMIT ──
         let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
             self.advance();
-            Some(self.expect_num()? as usize)
+            Some(self.expect_usize()?)
         } else {
             None
         };

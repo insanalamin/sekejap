@@ -1863,6 +1863,90 @@ fn extract_simple_value(bytes: &[u8], start: usize) -> Option<(Value, usize)> {
     }
 }
 
+/// Find the end-of-value position starting at `start` without allocating a `Value`.
+/// Returns the byte index ONE PAST the last byte of the JSON value.
+pub(crate) fn find_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start)? {
+        b'"' => {
+            let mut i = start + 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'"' => return Some(i + 1),
+                    b'\\' => i += 2,
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        b't' if bytes.get(start..start + 4) == Some(b"true") => Some(start + 4),
+        b'f' if bytes.get(start..start + 5) == Some(b"false") => Some(start + 5),
+        b'n' if bytes.get(start..start + 4) == Some(b"null") => Some(start + 4),
+        b'-' | b'0'..=b'9' => {
+            let mut i = start;
+            while i < bytes.len()
+                && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\n' | b'\r' | b'\t')
+            {
+                i += 1;
+            }
+            Some(i)
+        }
+        b'[' | b'{' => {
+            let open = bytes[start];
+            let close = if open == b'[' { b']' } else { b'}' };
+            let mut depth = 0u32;
+            let mut i = start;
+            let mut in_str = false;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if in_str => { i += 2; continue; }
+                    b'"' => in_str = !in_str,
+                    b if !in_str && b == open => depth += 1,
+                    b if !in_str && b == close => {
+                        depth -= 1;
+                        if depth == 0 { return Some(i + 1); }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Splice a single field in raw JSON bytes.
+/// If the field exists, its value is replaced with `new_value_bytes`.
+/// If the field does not exist, it is appended before the closing `}`.
+/// Returns `None` only if the raw bytes are malformed.
+pub(crate) fn splice_json_field(bytes: &[u8], field: &str, new_value_bytes: &[u8]) -> Option<Vec<u8>> {
+    let needle = format!("\"{}\":", field);
+    if let Some(pos) = rfind_bytes(bytes, needle.as_bytes()) {
+        let val_start_raw = pos + needle.len();
+        let val_start = bytes[val_start_raw..]
+            .iter()
+            .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .map(|off| val_start_raw + off)
+            .unwrap_or(val_start_raw);
+        let val_end = find_value_end(bytes, val_start)?;
+        let mut out = Vec::with_capacity(bytes.len() - (val_end - val_start) + new_value_bytes.len());
+        out.extend_from_slice(&bytes[..val_start]);
+        out.extend_from_slice(new_value_bytes);
+        out.extend_from_slice(&bytes[val_end..]);
+        Some(out)
+    } else {
+        let close = bytes.iter().rposition(|&b| b == b'}')?;
+        let has_content = bytes[..close].iter().any(|&b| !matches!(b, b'{' | b' ' | b'\t' | b'\n' | b'\r'));
+        let mut out = Vec::with_capacity(bytes.len() + needle.len() + new_value_bytes.len() + 2);
+        out.extend_from_slice(&bytes[..close]);
+        if has_content { out.push(b','); }
+        out.extend_from_slice(needle.as_bytes());
+        out.extend_from_slice(new_value_bytes);
+        out.extend_from_slice(&bytes[close..]);
+        Some(out)
+    }
+}
+
 /// Search `bytes` for each requested field name using a direct byte pattern search
 /// (`"<field>":`) and extract its simple value.
 ///
@@ -1872,7 +1956,7 @@ fn extract_simple_value(bytes: &[u8], start: usize) -> Option<(Value, usize)> {
 ///
 /// This function does NOT require `bytes` to start at `{`.  It works on any
 /// slice of a JSON payload (head, tail, or full blob).
-fn extract_fields_by_search(
+pub(crate) fn extract_fields_by_search(
     bytes: &[u8],
     fields: &[String],
 ) -> serde_json::Map<String, Value> {

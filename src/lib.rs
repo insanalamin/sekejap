@@ -389,6 +389,12 @@ pub struct CoreDB {
     /// SQL transaction buffer. `Some` when a `BEGIN` has been issued;
     /// mutations are queued here until `COMMIT` (replay) or `ROLLBACK` (drop).
     pending_txn: Option<Vec<sql::CompiledMutation>>,
+    /// When true, `wal_write` appends without fsync.
+    /// Used by batch operations (UPDATE, DELETE, COMMIT) to coalesce syncs.
+    defer_wal_sync: bool,
+    /// Exclusive file lock held for the lifetime of the database.
+    /// Prevents concurrent access from multiple processes.
+    _lock_file: Option<std::fs::File>,
 }
 
 /// Configuration for [`CoreDB::open_with_config`].
@@ -439,6 +445,8 @@ impl CoreDB {
             payload_store: PayloadStore::new(),
             replaying: false,
             pending_txn: None,
+            defer_wal_sync: false,
+            _lock_file: None,
         }
     }
 
@@ -468,8 +476,24 @@ impl CoreDB {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
 
+        // Acquire exclusive file lock to prevent concurrent access.
+        let lock_file = {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(dir.join("db.lock"))?;
+            f.try_lock().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "database is locked by another process",
+                )
+            })?;
+            Some(f)
+        };
+
         let mut db = Self::new();
         db.data_dir = Some(dir.to_path_buf());
+        db._lock_file = lock_file;
 
         // Apply edge storage mode from config.
         #[cfg(unix)]
@@ -564,8 +588,12 @@ impl CoreDB {
         if snap_file_size > 500 * 1024 * 1024 {
             if let Ok(snap_json) = serde_json::to_vec(&db.build_snapshot()) {
                 let snap_tmp = snap_path.with_extension("json.tmp");
-                if std::fs::write(&snap_tmp, &snap_json).is_ok() {
-                    let _ = std::fs::rename(&snap_tmp, &snap_path);
+                if let Ok(mut sf) = std::fs::File::create(&snap_tmp) {
+                    if std::io::Write::write_all(&mut sf, &snap_json).is_ok()
+                        && sf.sync_all().is_ok()
+                    {
+                        let _ = std::fs::rename(&snap_tmp, &snap_path);
+                    }
                 }
             }
         }
@@ -726,7 +754,13 @@ impl CoreDB {
 
         // Auto-timestamps: preserve existing _created_unix, always update _updated_unix
         {
-            let obj = payload.as_object_mut().expect("payload must be object");
+            let obj = match payload.as_object_mut() {
+                Some(o) => o,
+                None => return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "payload must be a JSON object",
+                ))),
+            };
             let created_unix = if obj.contains_key("_created_unix") {
                 obj.get("_created_unix").cloned()
             } else {
@@ -1434,6 +1468,17 @@ impl CoreDB {
         if let Some(wal) = &mut self.wal {
             wal.append(&entry)
                 .expect("sekejap: WAL write failed — disk error");
+            if !self.defer_wal_sync {
+                wal.sync()
+                    .expect("sekejap: WAL fsync failed — disk error");
+            }
+        }
+    }
+
+    fn wal_flush(&mut self) {
+        if let Some(wal) = &mut self.wal {
+            wal.sync()
+                .expect("sekejap: WAL fsync failed — disk error");
         }
     }
 
@@ -1530,6 +1575,15 @@ impl CoreDB {
     ///
     /// Returns the slug hash on success.
     pub fn put(&mut self, slug: &str, payload_json: &str) -> Result<u64, serde_json::Error> {
+        // Validate JSON before writing anything.
+        serde_json::from_str::<Value>(payload_json)?;
+
+        // WAL first — if we crash after this but before put_raw, replay recovers.
+        self.wal_write(WalEntry::Put {
+            slug: slug.to_string(),
+            payload: payload_json.to_string(),
+        });
+
         // Check before put_raw so we know whether this is a new node or an update.
         let node_hash = sk_hash(slug);
         let is_update = self.nodes.contains_key(&node_hash);
@@ -1540,7 +1594,6 @@ impl CoreDB {
         if let Ok(payload) = serde_json::from_str::<Value>(payload_json) {
             if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
                 let coll_hash = sk_hash(coll);
-                // Collect declared GIN fields and their text values (releases borrow).
                 let gin_updates: Vec<(String, Option<String>)> = self.schemas.values()
                     .filter(|s| sk_hash(&s.collection) == coll_hash)
                     .flat_map(|s| s.indexes.fulltext.iter().map(|f| {
@@ -1552,14 +1605,11 @@ impl CoreDB {
                     .collect();
                 for (gin_field, text_opt) in gin_updates {
                     if is_update {
-                        // Update: full rebuild to remove old trigrams for this doc.
                         self.build_gin_index(&gin_field);
                     } else if let Some(text) = text_opt {
-                        // New node: incremental O(trigrams) insert.
                         if let Some(gin_idx) = self.gin_indexes.get_mut(gin_field.as_str()) {
                             gin_idx.insert_doc(hash, &text);
                         } else {
-                            // GIN not yet built (e.g. first doc after CREATE INDEX on empty).
                             self.build_gin_index(&gin_field);
                         }
                     }
@@ -1567,10 +1617,6 @@ impl CoreDB {
             }
         }
 
-        self.wal_write(WalEntry::Put {
-            slug: slug.to_string(),
-            payload: payload_json.to_string(),
-        });
         Ok(hash)
     }
 
@@ -1579,30 +1625,34 @@ impl CoreDB {
         &mut self,
         items: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<Vec<u64>, serde_json::Error> {
-        items
+        self.defer_wal_sync = true;
+        let result: Result<Vec<u64>, _> = items
             .into_iter()
             .map(|(slug, json)| self.put(slug, json))
-            .collect()
+            .collect();
+        self.defer_wal_sync = false;
+        self.wal_flush();
+        result
     }
 
     /// Remove a node by slug. Also removes its collection membership and edges.
     pub fn remove(&mut self, slug: &str) {
-        self.remove_raw(slug);
         self.wal_write(WalEntry::Remove {
             slug: slug.to_string(),
         });
+        self.remove_raw(slug);
     }
 
     /// Create a directed edge: `from` → `to` with a type label and strength.
     /// Nodes do not need to exist before linking.
     pub fn link(&mut self, from: &str, to: &str, edge_type: &str, strength: f32) {
-        self.link_raw(from, to, edge_type, strength);
         self.wal_write(WalEntry::Link {
             from: from.to_string(),
             to: to.to_string(),
             edge_type: edge_type.to_string(),
             strength,
         });
+        self.link_raw(from, to, edge_type, strength);
     }
 
     /// Like `link` but attaches a JSON metadata object to the edge.
@@ -1614,7 +1664,7 @@ impl CoreDB {
         strength: f32,
         meta_json: &str,
     ) -> Result<(), serde_json::Error> {
-        self.link_meta_raw(from, to, edge_type, strength, meta_json)?;
+        serde_json::from_str::<Value>(meta_json)?;
         self.wal_write(WalEntry::LinkMeta {
             from: from.to_string(),
             to: to.to_string(),
@@ -1622,17 +1672,18 @@ impl CoreDB {
             strength,
             meta: meta_json.to_string(),
         });
+        self.link_meta_raw(from, to, edge_type, strength, meta_json)?;
         Ok(())
     }
 
     /// Remove all directed edges from → to with the given type.
     pub fn unlink(&mut self, from: &str, to: &str, edge_type: &str) {
-        self.unlink_raw(from, to, edge_type);
         self.wal_write(WalEntry::Unlink {
             from: from.to_string(),
             to: to.to_string(),
             edge_type: edge_type.to_string(),
         });
+        self.unlink_raw(from, to, edge_type);
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────
@@ -1680,6 +1731,7 @@ impl CoreDB {
                             }
                         }
                     }
+                    tmp_file.sync_all()?;
                 }
                 #[cfg(not(unix))]
                 let _ = write_cursor; // non-unix fallback — no-op
@@ -1727,7 +1779,11 @@ impl CoreDB {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let snap_tmp = dir.join("snapshot.json.tmp");
         let snap_path = dir.join("snapshot.json");
-        std::fs::write(&snap_tmp, &snap_json)?;
+        {
+            let mut sf = std::fs::File::create(&snap_tmp)?;
+            std::io::Write::write_all(&mut sf, &snap_json)?;
+            sf.sync_all()?;
+        }
         std::fs::rename(&snap_tmp, &snap_path)?;
 
         // 3. Truncate WAL: close current writer → rename → open fresh → delete old
@@ -1773,6 +1829,7 @@ impl CoreDB {
             gin.write_binary(&mut f, GIN_INDEX_VERSION)?;
         }
         f.flush()?;
+        f.get_ref().sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -3094,13 +3151,15 @@ impl CoreDB {
                 let buf = self.pending_txn.take().ok_or_else(|| {
                     SqlError::TransactionError("COMMIT without an active transaction".into())
                 })?;
+                self.defer_wal_sync = true;
                 self.wal_write(WalEntry::TxnBegin);
                 let mut total = 0usize;
                 for op in buf {
                     total += self.execute_mutation(op)?;
                 }
                 self.wal_write(WalEntry::TxnEnd);
-                let _ = self.sync();
+                self.defer_wal_sync = false;
+                self.wal_flush();
                 return Ok(total);
             }
             sql::CompiledMutation::Rollback => {
@@ -3255,14 +3314,14 @@ impl CoreDB {
                         .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
                     // Store vectors without HNSW rebuild — defer to end
                     for (field, data) in vectors {
-                        let hash = sk_hash(&slug);
-                        self.ensure_vector_store(&field);
-                        self.vectors.get_mut(&field).unwrap().put(hash, data.clone());
                         self.wal_write(WalEntry::PutVector {
                             slug: slug.clone(),
                             field: field.clone(),
-                            data,
+                            data: data.clone(),
                         });
+                        let hash = sk_hash(&slug);
+                        self.ensure_vector_store(&field);
+                        self.vectors.get_mut(&field).unwrap().put(hash, data);
                         affected_vec_fields.insert(field);
                     }
                 }
@@ -3284,13 +3343,17 @@ impl CoreDB {
                     .map(|h| h.slug)
                     .collect();
                 let count = slugs.len();
+                self.defer_wal_sync = true;
                 for slug in &slugs {
                     self.remove(slug);
                 }
+                self.defer_wal_sync = false;
+                self.wal_flush();
                 Ok(count)
             }
             sql::CompiledMutation::InsertEdge(edges) => {
                 let count = edges.len();
+                self.defer_wal_sync = true;
                 for edge in edges {
                     match edge.props_json {
                         Some(json) => self
@@ -3299,13 +3362,18 @@ impl CoreDB {
                         None => self.link(&edge.from, &edge.to, &edge.edge_type, edge.strength),
                     }
                 }
+                self.defer_wal_sync = false;
+                self.wal_flush();
                 Ok(count)
             }
             sql::CompiledMutation::DeleteEdge(edges) => {
                 let count = edges.len();
+                self.defer_wal_sync = true;
                 for edge in edges {
                     self.unlink(&edge.from, &edge.to, &edge.edge_type);
                 }
+                self.defer_wal_sync = false;
+                self.wal_flush();
                 Ok(count)
             }
             sql::CompiledMutation::MatchInsert {
@@ -3321,6 +3389,7 @@ impl CoreDB {
                     .map(|h| h.slug)
                     .collect();
                 let count = source_slugs.len();
+                self.defer_wal_sync = true;
                 for src_slug in source_slugs {
                     match &props {
                         Some(json) => {
@@ -3332,89 +3401,216 @@ impl CoreDB {
                         }
                     }
                 }
+                self.defer_wal_sync = false;
+                self.wal_flush();
                 Ok(count)
             }
             sql::CompiledMutation::Update { steps, updates } => {
-                let hits: Vec<(String, Value)> = Set::from_steps(self, steps)
-                    .collect()
-                    .into_iter()
-                    .filter_map(|h| {
-                        let n = self.nodes.get(&h.slug_hash)?;
-                        let payload = self.payload_store.get(n.payload_offset, n.payload_len)?;
-                        Some((n.slug.clone(), payload))
+                // Decide: splice fast path (no vector/geo field updates) or full-parse slow path
+                let has_vec = updates.iter().any(|(_, v)| value_as_f32_vec(v).is_some());
+                let has_geo = !has_vec && self.schemas.values().any(|schema| {
+                    updates.iter().any(|(field, _)| {
+                        schema.fields.iter().any(|f| &f.name == field && matches!(f.ty, sql::FieldType::Geo))
                     })
-                    .collect();
-                let count = hits.len();
-                let mut affected_vec_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for (slug, mut payload) in hits {
-                    let mut geo_fields: Vec<&str> = Vec::new();
-                    if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
-                        if let Some(schema) = self.schemas.get(coll) {
-                            if let Some(err) = validate_updates_against_schema(schema, &updates) {
-                                return Err(err);
+                });
+
+                if !has_vec && !has_geo {
+                    // ── FAST PATH: byte-level splice (zero serde per row) ──────────
+                    let hits: Vec<(String, u64, Vec<u8>)> = Set::from_steps(self, steps)
+                        .collect()
+                        .into_iter()
+                        .filter_map(|h| {
+                            let n = self.nodes.get(&h.slug_hash)?;
+                            let raw = self.payload_store.get_raw(n.payload_offset, n.payload_len)?;
+                            Some((n.slug.clone(), h.slug_hash, raw))
+                        })
+                        .collect();
+                    let count = hits.len();
+                    if count == 0 { return Ok(0); }
+
+                    // Schema validation (once for the batch)
+                    let coll_name = self.nodes.get(&hits[0].1)
+                        .map(|n| n.collection.clone()).unwrap_or_default();
+                    if let Some(schema) = self.schemas.get(&coll_name) {
+                        if let Some(err) = validate_updates_against_schema(schema, &updates) {
+                            return Err(err);
+                        }
+                    }
+                    let coll_hash = if !coll_name.is_empty() { Some(sk_hash(&coll_name)) } else { None };
+
+                    // Pre-serialize each update value once (not per row)
+                    let update_bytes: Vec<(&str, Vec<u8>)> = updates.iter()
+                        .map(|(f, v)| (f.as_str(), serde_json::to_vec(v).unwrap()))
+                        .collect();
+
+                    // Which updated fields have btree indexes?
+                    let indexed_fields: Vec<&str> = if let Some(ch) = coll_hash {
+                        updates.iter()
+                            .filter(|(f, _)| self.field_indexes.contains_key(&(ch, f.clone())))
+                            .map(|(f, _)| f.as_str())
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let now_bytes = now.to_string().into_bytes();
+
+                    self.defer_wal_sync = true;
+
+                    for (slug, hash, raw) in hits {
+                        // Remove old btree entries for indexed fields being updated
+                        if let Some(ch) = coll_hash {
+                            let field_names: Vec<String> = indexed_fields.iter().map(|f| f.to_string()).collect();
+                            let extracted = crate::query::extract_fields_by_search(&raw, &field_names);
+                            for &field in &indexed_fields {
+                                if let Some(old_val) = extracted.get(field) {
+                                    if let Some(old_key) = FieldKey::from_json(old_val) {
+                                        if let Some(btree) = self.field_indexes.get_mut(&(ch, field.to_string())) {
+                                            if let Some(ids) = btree.get_mut(&old_key) {
+                                                ids.retain(|&id| id != hash);
+                                                if ids.is_empty() { btree.remove(&old_key); }
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            for f in &schema.fields {
-                                if matches!(f.ty, sql::FieldType::Geo) {
-                                    geo_fields.push(&f.name);
+                        }
+
+                        // Splice each field + _updated_unix directly in raw bytes
+                        let mut buf = raw;
+                        for (field, val_bytes) in &update_bytes {
+                            if let Some(spliced) = crate::query::splice_json_field(&buf, field, val_bytes) {
+                                buf = spliced;
+                            }
+                        }
+                        if let Some(spliced) = crate::query::splice_json_field(&buf, "_updated_unix", &now_bytes) {
+                            buf = spliced;
+                        }
+
+                        // Payload store first (takes &[u8]), then WAL (takes String)
+                        let (offset, len) = self.payload_store.append(&buf);
+                        let json_str = String::from_utf8(buf)
+                            .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+                        self.wal_write(WalEntry::Put { slug: slug.clone(), payload: json_str });
+
+                        if let Some(node) = self.nodes.get_mut(&hash) {
+                            node.payload_offset = offset;
+                            node.payload_len = len;
+                        }
+
+                        // Add new btree entries for indexed fields
+                        if let Some(ch) = coll_hash {
+                            for &field in &indexed_fields {
+                                if let Some((_, new_val)) = updates.iter().find(|(f, _)| f == field) {
+                                    if let Some(new_key) = FieldKey::from_json(new_val) {
+                                        if let Some(btree) = self.field_indexes.get_mut(&(ch, field.to_string())) {
+                                            let ids = btree.entry(new_key).or_default();
+                                            if !ids.contains(&hash) { ids.push(hash); }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    let mut vec_updates: Vec<(String, Vec<f32>)> = Vec::new();
-                    for (field, value) in &updates {
-                        let is_geo = geo_fields.iter().any(|g| g == field);
-                        if !is_geo {
-                            if let Some(floats) = value_as_f32_vec(value) {
-                                vec_updates.push((field.clone(), floats));
-                                continue;
+
+                    // Rebuild GIN/BM25 for any updated fulltext fields
+                    for (field, _) in &updates {
+                        if self.gin_indexes.contains_key(field.as_str()) {
+                            self.build_gin_index(field);
+                        }
+                        if self.bm25_indexes.contains_key(field.as_str()) {
+                            self.build_bm25_index(field);
+                        }
+                    }
+
+                    self.defer_wal_sync = false;
+                    self.wal_flush();
+                    Ok(count)
+                } else {
+                    // ── SLOW PATH: full parse (vector/geo field updates) ──────────
+                    let hits: Vec<(String, Value)> = Set::from_steps(self, steps)
+                        .collect()
+                        .into_iter()
+                        .filter_map(|h| {
+                            let n = self.nodes.get(&h.slug_hash)?;
+                            let payload = self.payload_store.get(n.payload_offset, n.payload_len)?;
+                            Some((n.slug.clone(), payload))
+                        })
+                        .collect();
+                    let count = hits.len();
+                    self.defer_wal_sync = true;
+                    let mut affected_vec_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for (slug, mut payload) in hits {
+                        let mut geo_fields: Vec<&str> = Vec::new();
+                        if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
+                            if let Some(schema) = self.schemas.get(coll) {
+                                if let Some(err) = validate_updates_against_schema(schema, &updates) {
+                                    return Err(err);
+                                }
+                                for f in &schema.fields {
+                                    if matches!(f.ty, sql::FieldType::Geo) {
+                                        geo_fields.push(&f.name);
+                                    }
+                                }
                             }
                         }
-                        if let Value::Object(ref mut map) = payload {
-                            map.insert(field.clone(), value.clone());
+                        let mut vec_updates: Vec<(String, Vec<f32>)> = Vec::new();
+                        for (field, value) in &updates {
+                            let is_geo = geo_fields.iter().any(|g| g == field);
+                            if !is_geo {
+                                if let Some(floats) = value_as_f32_vec(value) {
+                                    vec_updates.push((field.clone(), floats));
+                                    continue;
+                                }
+                            }
+                            if let Value::Object(ref mut map) = payload {
+                                map.insert(field.clone(), value.clone());
+                            }
+                        }
+                        let json = serde_json::to_string(&payload)
+                            .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+                        self.put(&slug, &json)
+                            .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+                        for (field, data) in vec_updates {
+                            self.wal_write(WalEntry::PutVector {
+                                slug: slug.clone(),
+                                field: field.clone(),
+                                data: data.clone(),
+                            });
+                            let hash = sk_hash(&slug);
+                            self.ensure_vector_store(&field);
+                            self.vectors.get_mut(&field).unwrap().put(hash, data);
+                            affected_vec_fields.insert(field);
                         }
                     }
-                    let json = serde_json::to_string(&payload)
-                        .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
-                    self.put(&slug, &json)
-                        .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
-                    // Store vectors without HNSW rebuild — defer to end
-                    for (field, data) in vec_updates {
-                        let hash = sk_hash(&slug);
-                        self.ensure_vector_store(&field);
-                        self.vectors.get_mut(&field).unwrap().put(hash, data.clone());
-                        self.wal_write(WalEntry::PutVector {
-                            slug: slug.clone(),
-                            field: field.clone(),
-                            data,
-                        });
-                        affected_vec_fields.insert(field);
+                    for field in &affected_vec_fields {
+                        let hnsw_declared = self.schemas.values()
+                            .any(|s| s.indexes.vector.contains(field));
+                        if hnsw_declared {
+                            let (m, ef) = self.hnsw_params.get(field.as_str()).copied().unwrap_or((16, 200));
+                            let _ = self.build_hnsw_index(field, m, ef);
+                        }
                     }
+                    self.defer_wal_sync = false;
+                    self.wal_flush();
+                    Ok(count)
                 }
-                // Single HNSW rebuild per affected vector field
-                for field in &affected_vec_fields {
-                    let hnsw_declared = self.schemas.values()
-                        .any(|s| s.indexes.vector.contains(field));
-                    if hnsw_declared {
-                        let (m, ef) = self.hnsw_params.get(field.as_str()).copied().unwrap_or((16, 200));
-                        let _ = self.build_hnsw_index(field, m, ef);
-                    }
-                }
-                Ok(count)
             }
             sql::CompiledMutation::CreateTable { collection, schema } => {
-                self.schemas.insert(collection.clone(), schema.clone());
                 let schema_json = serde_json::to_string(&schema)
                     .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
-                self.wal_write(WalEntry::CreateTable { collection, schema_json });
+                self.wal_write(WalEntry::CreateTable { collection: collection.clone(), schema_json });
+                self.schemas.insert(collection, schema.clone());
                 Ok(1)
             }
             sql::CompiledMutation::CreateIndex { name: _, collection, method, fields } => {
-                self.apply_index(&collection, &method, &fields)?;
                 self.wal_write(WalEntry::CreateIndex {
-                    collection,
+                    collection: collection.clone(),
                     method: method.to_string(),
-                    fields,
+                    fields: fields.clone(),
                 });
+                self.apply_index(&collection, &method, &fields)?;
                 Ok(1)
             }
             sql::CompiledMutation::Reindex { collection, method, fields } => {
@@ -3438,8 +3634,8 @@ impl CoreDB {
                     }
                 }
 
+                self.wal_write(WalEntry::DropTable { collection: collection.clone() });
                 let count = self.drop_table_raw(&collection);
-                self.wal_write(WalEntry::DropTable { collection });
                 Ok(count)
             }
             sql::CompiledMutation::DropIndex { collection, method, field, if_exists } => {
@@ -3461,8 +3657,8 @@ impl CoreDB {
             sql::CompiledMutation::AlterTable { collection, op } => {
                 let op_json = serde_json::to_string(&op)
                     .map_err(|e| sql::SqlError::InvalidValue(e.to_string()))?;
+                self.wal_write(WalEntry::AlterTable { collection: collection.clone(), op_json });
                 let count = self.alter_table_raw(&collection, op)?;
-                self.wal_write(WalEntry::AlterTable { collection, op_json });
                 Ok(count)
             }
             // Handled by the transaction control block above; unreachable here.
@@ -3844,13 +4040,16 @@ impl CoreDB {
     ///
     /// Returns the slug hash on success.
     pub fn put_vector(&mut self, slug: &str, field: &str, data: &[f32]) -> Result<u64, serde_json::Error> {
+        self.wal_write(WalEntry::PutVector {
+            slug: slug.to_string(),
+            field: field.to_string(),
+            data: data.to_vec(),
+        });
         let hash = sk_hash(slug);
         self.ensure_vector_store(field);
         self.vectors.get_mut(field).unwrap().put(hash, data.to_vec());
-        // Remap so the freshly-appended vector is visible via mmap get().
         #[cfg(unix)]
         self.vectors.get_mut(field).unwrap().remap();
-        // Incremental HNSW insert: O(log n) instead of full rebuild O(n log n).
         let hnsw_declared = self.schemas.values()
             .any(|s| s.indexes.vector.contains(&field.to_string()));
         if hnsw_declared {
@@ -3861,11 +4060,6 @@ impl CoreDB {
                 .or_insert_with(|| vector::HnswGraph::empty(m));
             graph.insert::<CosineDistance, _>(hash, field_vecs, ef);
         }
-        self.wal_write(WalEntry::PutVector {
-            slug: slug.to_string(),
-            field: field.to_string(),
-            data: data.to_vec(),
-        });
         Ok(hash)
     }
 
@@ -4429,6 +4623,7 @@ impl CoreDB {
             idx.write_binary(&mut f)?;
         }
         f.flush()?;
+        f.get_ref().sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)?;
         Ok(())
