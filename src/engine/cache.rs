@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use object_store::path::Path as ObjPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::runtime::Runtime;
 
 pub const BLOCK_SIZE: usize = 64 * 1024; // 64 KB
@@ -194,7 +194,7 @@ impl BlockCache {
 
         let data = self.runtime.block_on(async {
             self.store
-                .get_range(&self.obj_path, block_start as usize..block_end)
+                .get_range(&self.obj_path, block_start..block_end as u64)
                 .await
                 .ok()
         })?;

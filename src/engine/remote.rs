@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use tokio::runtime::Runtime;
 
 use super::manifest::{Manifest, Segment};
@@ -337,15 +337,15 @@ impl RemoteSync {
     async fn download_file(&self, segment: &Segment, local_path: &Path) -> Result<(), String> {
         let obj_path = self.obj_path(&segment.name);
         let tmp_path = local_path.with_extension("s3tmp");
-        let total = segment.size as usize;
+        let total = segment.size as u64;
 
         let mut file = std::fs::File::create(&tmp_path)
             .map_err(|e| format!("creating tmp {}: {e}", segment.name))?;
         let mut hasher = crc32fast::Hasher::new();
-        let mut offset = 0usize;
+        let mut offset = 0u64;
 
         while offset < total {
-            let end = std::cmp::min(offset + CHUNK_SIZE, total);
+            let end = std::cmp::min(offset + CHUNK_SIZE as u64, total);
             let bytes = self
                 .store
                 .get_range(&obj_path, offset..end)

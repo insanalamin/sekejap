@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/flutter", "skcli"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -34,7 +34,7 @@ fst        = { version = "0.4", features = ["levenshtein"] }
 memchr     = "2"
 chrono     = "0.4"
 uuid       = { version = "1", features = ["v4", "v5"] }
-object_store = { version = "0.11", optional = true, features = ["aws"] }
+object_store = { version = "0.14", optional = true, features = ["aws"] }
 tokio        = { version = "1",    optional = true, features = ["rt"] }
 
 [features]
