@@ -35,7 +35,7 @@ s3 = ["sekejap/s3"]
 sekejap = { path = "../.." }
 
 # Python bindings
-pyo3 = { version = "0.22", features = ["extension-module", "auto-initialize", "generate-import-lib"] }
+pyo3 = { version = "0.22", features = ["extension-module", "generate-import-lib"] }
 
 # Serialization
 serde_json = "1.0"
