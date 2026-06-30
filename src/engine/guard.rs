@@ -47,6 +47,16 @@ impl ReadWriteGuard {
         self.inner.try_write().ok()
     }
 
+    /// Replace the inner [`CoreDB`] with a new one (hot-swap).
+    ///
+    /// Takes an exclusive write lock, swaps the database, and returns
+    /// the old instance. In-flight reads (holding a read guard) continue
+    /// on the old data; new reads see the replacement.
+    pub fn replace(&self, new_db: CoreDB) -> CoreDB {
+        let mut guard = self.write();
+        std::mem::replace(&mut *guard, new_db)
+    }
+
     /// Consume the guard and return the inner [`CoreDB`].
     ///
     /// # Panics

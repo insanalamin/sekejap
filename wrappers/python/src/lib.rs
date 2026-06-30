@@ -151,6 +151,70 @@ impl PyDB {
         Ok(Self { inner: Some(inner) })
     }
 
+    /// Open a read-only database backed by S3.
+    ///
+    /// Payloads are fetched on demand via S3 ``GET_RANGE`` and cached in an
+    /// LRU cache bounded by ``cache_budget_bytes``.
+    ///
+    /// If ``cache_dir`` is provided, evicted blocks are spilled to disk
+    /// (bounded by ``cache_budget_bytes``). Otherwise blocks are cached in
+    /// RAM only.
+    ///
+    /// Args:
+    ///     url: S3 URL, e.g. ``"s3://bucket/prefix"``.
+    ///     access_key_id: AWS access key.
+    ///     secret_access_key: AWS secret key.
+    ///     region: AWS region, e.g. ``"ap-southeast-1"``.
+    ///     cache_budget_bytes: Cache size in bytes (RAM or disk depending on ``cache_dir``).
+    ///     cache_dir (str, optional): Directory for disk-backed block cache.
+    ///     endpoint (str, optional): Custom S3 endpoint (for MinIO, R2, etc.).
+    ///     allow_http (bool): Allow plain HTTP connections. Default ``False``.
+    ///
+    /// Example::
+    ///
+    ///     # RAM cache (256 MB)
+    ///     db = DB.open_s3("s3://bucket/data", "AKID", "secret", "ap-southeast-1",
+    ///                     cache_budget_bytes=256 * 1024 * 1024)
+    ///
+    ///     # Disk cache (10 GB)
+    ///     db = DB.open_s3("s3://bucket/data", "AKID", "secret", "ap-southeast-1",
+    ///                     cache_budget_bytes=10 * 1024**3, cache_dir="/tmp/cache")
+    #[cfg(feature = "s3")]
+    #[staticmethod]
+    #[pyo3(signature = (url, access_key_id, secret_access_key, region, cache_budget_bytes, cache_dir=None, endpoint=None, allow_http=false))]
+    fn open_s3(
+        url: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        region: &str,
+        cache_budget_bytes: u64,
+        cache_dir: Option<&str>,
+        endpoint: Option<&str>,
+        allow_http: bool,
+    ) -> PyResult<Self> {
+        use ::sekejap::engine::remote::{S3Credentials, RemoteSync};
+        use ::sekejap::engine::cache::CacheBudget;
+
+        let mut creds = S3Credentials::new(access_key_id, secret_access_key, region);
+        if let Some(ep) = endpoint {
+            creds = creds.endpoint(ep);
+        }
+        if allow_http {
+            creds = creds.allow_http(true);
+        }
+
+        let remote = RemoteSync::from_url(url, &creds).map_err(db_err)?;
+        let budget = CacheBudget::new(cache_budget_bytes);
+
+        let inner = CoreDB::open_s3(
+            &remote,
+            budget,
+            cache_dir.map(std::path::Path::new),
+        ).map_err(db_err)?;
+
+        Ok(Self { inner: Some(inner) })
+    }
+
     // ── Nodes ─────────────────────────────────────────────────────────────────
 
     /// Store a node. ``json`` must contain ``_collection`` and ``_key``.

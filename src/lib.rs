@@ -137,6 +137,10 @@ enum PayloadInner {
         #[cfg(unix)]
         mmap: Option<MmapView>,
     },
+    #[cfg(feature = "s3")]
+    Remote {
+        cache: std::sync::Mutex<engine::cache::BlockCache>,
+    },
 }
 
 impl PayloadStore {
@@ -176,6 +180,28 @@ impl PayloadStore {
         } })
     }
 
+    /// Create a remote-backed store that fetches blocks from S3 on demand.
+    #[cfg(feature = "s3")]
+    fn new_remote(
+        store: std::sync::Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+        total_remote_len: u64,
+        budget: engine::cache::CacheBudget,
+    ) -> Result<Self, String> {
+        let cache = engine::cache::BlockCache::new(
+            store,
+            prefix,
+            "payloads.bin",
+            total_remote_len,
+            budget,
+        )?;
+        Ok(Self {
+            inner: PayloadInner::Remote {
+                cache: std::sync::Mutex::new(cache),
+            },
+        })
+    }
+
     fn is_disk(&self) -> bool {
         matches!(self.inner, PayloadInner::Disk { .. })
     }
@@ -208,6 +234,10 @@ impl PayloadStore {
                 *total_len += bytes.len() as u64;
                 (offset, bytes.len() as u32)
             }
+            #[cfg(feature = "s3")]
+            PayloadInner::Remote { .. } => {
+                panic!("sekejap: cannot write to remote payload store (read-only)");
+            }
         }
     }
 
@@ -224,6 +254,7 @@ impl PayloadStore {
 
     /// Read `read_len` bytes starting at an arbitrary absolute byte offset.
     /// Uses mmap when available (zero syscalls), falls back to pread.
+    /// Remote variant fetches via block cache from S3.
     pub(crate) fn get_raw_at(&self, abs_offset: u64, read_len: usize) -> Option<Vec<u8>> {
         if read_len == 0 {
             return Some(vec![]);
@@ -253,6 +284,10 @@ impl PayloadStore {
                 let _ = (file, abs_offset, read_len);
                 None
             }
+            #[cfg(feature = "s3")]
+            PayloadInner::Remote { cache } => {
+                cache.lock().ok()?.get_raw_at(abs_offset, read_len)
+            }
         }
     }
 
@@ -270,6 +305,8 @@ impl PayloadStore {
             PayloadInner::Disk { mmap, .. } => {
                 mmap.as_ref()?.slice(abs_offset as usize, read_len)
             }
+            #[cfg(feature = "s3")]
+            PayloadInner::Remote { .. } => None,
         }
     }
 
@@ -403,12 +440,16 @@ pub struct Config {
     /// (original behaviour); [`EdgeMode::Compact`] puts metadata on disk
     /// and uses ~2.7× less RAM per edge.
     pub edge_mode: EdgeMode,
+    /// When `true`, skip the exclusive file lock and WAL writer.
+    /// The database will not accept writes — use for read replicas.
+    pub read_only: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             edge_mode: EdgeMode::Compact,
+            read_only: false,
         }
     }
 }
@@ -459,6 +500,149 @@ impl CoreDB {
         Self::open_with_config(dir, Config::default())
     }
 
+    /// Open a database in read-only mode (no lock, no WAL writer).
+    ///
+    /// Suitable for read replicas that sync their local directory from S3.
+    /// Write operations will silently skip WAL persistence.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_config(
+            dir,
+            Config { read_only: true, ..Config::default() },
+        )
+    }
+
+    /// Open a read-only database backed by S3 remote storage.
+    ///
+    /// Downloads only the snapshot (node index, ~100 B/node) and loads it
+    /// into RAM. Payloads stay on S3 — each `get_payload()` call fetches
+    /// the relevant 64 KB block via `GET_RANGE` and caches it in a bounded
+    /// LRU. No local `payloads.bin` file is needed.
+    ///
+    /// This allows querying a 1 TB dataset from a machine with 50 GB of disk:
+    /// the node index stays in RAM (~hundreds of MB), the block cache keeps
+    /// hot payload blocks on local storage, and cold blocks are fetched on
+    /// demand from S3.
+    /// Open a read-only database backed by S3.
+    ///
+    /// Payloads are fetched on demand via S3 `GET_RANGE` and cached in an
+    /// LRU cache bounded by `cache_budget`.
+    ///
+    /// - Without `cache_dir`: budget controls RAM cache size. Evicted blocks
+    ///   are discarded.
+    /// - With `cache_dir`: budget controls disk cache size (RAM tier is 256 MB).
+    ///   Evicted blocks are spilled to disk and survive restarts.
+    #[cfg(feature = "s3")]
+    pub fn open_s3(
+        remote: &engine::remote::RemoteSync,
+        cache_budget: engine::cache::CacheBudget,
+        cache_dir: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        Self::open_s3_inner(remote, cache_budget, cache_dir)
+    }
+
+    #[cfg(feature = "s3")]
+    fn open_s3_inner(
+        remote: &engine::remote::RemoteSync,
+        cache_budget: engine::cache::CacheBudget,
+        cache_dir: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        let manifest = remote
+            .get_manifest()?
+            .ok_or("no manifest found on remote")?;
+
+        // Find payloads.bin size from manifest.
+        let payload_size = manifest
+            .segments
+            .iter()
+            .find(|s| s.name == "payloads.bin")
+            .map(|s| s.size)
+            .unwrap_or(0);
+
+        // Fetch snapshot.json via RemoteSync (reuses its existing Runtime/connection).
+        let snap_bytes = remote.fetch_file("snapshot.json")?;
+
+        let snap: Snapshot = serde_json::from_slice(&snap_bytes)
+            .map_err(|e| format!("parsing snapshot: {e}"))?;
+
+        let mut block_cache = if cache_dir.is_some() {
+            // Disk-cached mode: budget controls disk tier, RAM is default 256MB.
+            engine::cache::BlockCache::new(
+                remote.store(),
+                remote.prefix(),
+                "payloads.bin",
+                payload_size,
+                cache_budget,
+            )?
+        } else {
+            // RAM-only mode: budget controls RAM tier, no disk.
+            engine::cache::BlockCache::new(
+                remote.store(),
+                remote.prefix(),
+                "payloads.bin",
+                payload_size,
+                engine::cache::CacheBudget::new(0),
+            )?
+            .with_ram_cap(cache_budget.max_bytes() as usize)
+        };
+
+        if let Some(dir) = cache_dir {
+            let payload_cache_dir = dir.join("payloads");
+            block_cache = block_cache.with_cache_dir(payload_cache_dir)?;
+        }
+
+        let mut db = Self::new();
+        db.payload_store = PayloadStore {
+            inner: PayloadInner::Remote {
+                cache: std::sync::Mutex::new(block_cache),
+            },
+        };
+
+        db.load_snapshot(snap);
+
+        // Download small index files (GIN, search) if they exist on remote,
+        // then load them to restore full-text search capability.
+        let has_gin = manifest.segments.iter().any(|s| s.name == "gin.bin" && s.size > 12);
+        let has_search = manifest.segments.iter().any(|s| s.name == "search.bin" && s.size > 12);
+
+        if has_gin {
+            if let Ok(gin_bytes) = remote.fetch_file("gin.bin") {
+                let tmp = std::env::temp_dir().join(format!("sekejap_gin_{}.bin", std::process::id()));
+                if std::fs::write(&tmp, &gin_bytes).is_ok() {
+                    db.load_gin_binary(&tmp);
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        }
+
+        if has_search {
+            if let Ok(search_bytes) = remote.fetch_file("search.bin") {
+                let tmp = std::env::temp_dir().join(format!("sekejap_search_{}.bin", std::process::id()));
+                if std::fs::write(&tmp, &search_bytes).is_ok() {
+                    db.load_search_binary(&tmp);
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        }
+
+        // Rebuild indexes that aren't covered by sidecar files.
+        // BM25 is always rebuilt from data (no sidecar).
+        db.rebuild_declared_bm25_indexes();
+        if !has_gin {
+            db.rebuild_declared_gin_indexes();
+        }
+        if !has_search {
+            db.rebuild_declared_search_indexes();
+        }
+
+        // Rebuild spatial grid for geo queries.
+        db.rebuild_spatial_grid();
+
+        // Rebuild HNSW from vectors loaded via snapshot.
+        db.rebuild_declared_hnsw_indexes();
+
+        Ok(db)
+    }
+
     /// Open (or create) a persistent database with explicit configuration.
     ///
     /// On startup:
@@ -477,7 +661,10 @@ impl CoreDB {
         std::fs::create_dir_all(dir)?;
 
         // Acquire exclusive file lock to prevent concurrent access.
-        let lock_file = {
+        // Skipped in read-only mode (read replicas don't need exclusion).
+        let lock_file = if config.read_only {
+            None
+        } else {
             let f = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -676,8 +863,10 @@ impl CoreDB {
         #[cfg(unix)]
         db.edges.remap_meta();
 
-        // 3. Open WAL in append mode
-        db.wal = Some(WalWriter::open(&wal_path)?);
+        // 3. Open WAL in append mode (skip for read-only replicas).
+        if !config.read_only {
+            db.wal = Some(WalWriter::open(&wal_path)?);
+        }
 
         // 4. Build spatial index from loaded data
         db.rebuild_spatial_grid();

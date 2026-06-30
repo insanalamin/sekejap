@@ -27,6 +27,9 @@ classifiers = [
 name = "sekejap"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+s3 = ["sekejap/s3"]
+
 [dependencies]
 # sekejap core (same workspace)
 sekejap = { path = "../.." }

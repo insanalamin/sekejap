@@ -11,6 +11,10 @@
 //!   exceeds a byte or entry threshold.
 //! - **Index rebuild scheduling** — track dirty fields and rebuild HNSW /
 //!   GIN / BM25 indexes on a configurable cadence.
+//! - **S3 sync** (feature `s3`) — upload compacted segments to S3; download
+//!   on open. Local stays fast; S3 is cold storage + distribution.
+//! - **Read-only replicas** — open from S3 segments, block writes, hot-swap
+//!   on [`refresh()`](Engine::refresh) when the writer publishes new data.
 //!
 //! The engine exposes the **full** Sekejap SQL surface — graph traversals,
 //! spatial queries, vector search, full-text search, and standard CRUD — all
@@ -55,6 +59,13 @@ pub mod guard;
 pub mod policy;
 pub mod scheduler;
 
+#[cfg(feature = "s3")]
+pub mod cache;
+#[cfg(feature = "s3")]
+pub mod manifest;
+#[cfg(feature = "s3")]
+pub mod remote;
+
 pub use policy::WalPolicy;
 pub use scheduler::RebuildStrategy;
 
@@ -76,9 +87,15 @@ use serde_json::Value;
 pub struct Engine {
     guard: ReadWriteGuard,
     buffer: Option<WriteBuffer>,
-    #[allow(dead_code)] // scaffolding — wired up when flush() integrates rebuild
+    #[allow(dead_code)]
     scheduler: IndexScheduler,
     wal_policy: WalPolicy,
+    path: Option<String>,
+    read_only: bool,
+    #[cfg(feature = "s3")]
+    remote: Option<remote::RemoteSync>,
+    #[cfg(feature = "s3")]
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -92,6 +109,17 @@ impl Engine {
             buffer_size: None,
             rebuild_strategy: RebuildStrategy::default(),
             wal_policy: WalPolicy::default(),
+            read_only: false,
+            #[cfg(feature = "s3")]
+            remote_url: None,
+            #[cfg(feature = "s3")]
+            remote_creds: None,
+            #[cfg(feature = "s3")]
+            remote_only: false,
+            #[cfg(feature = "s3")]
+            cache_budget: None,
+            #[cfg(feature = "s3")]
+            cache_dir: None,
         }
     }
 
@@ -102,7 +130,18 @@ impl Engine {
             buffer: None,
             scheduler: IndexScheduler::new(RebuildStrategy::Immediate),
             wal_policy: WalPolicy::Manual,
+            path: None,
+            read_only: false,
+            #[cfg(feature = "s3")]
+            remote: None,
+            #[cfg(feature = "s3")]
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Whether this engine is in read-only mode.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     // ── Reads ────────────────────────────────────────────────────────────────
@@ -139,7 +178,11 @@ impl Engine {
     /// Without a buffer, the write is applied immediately.
     ///
     /// Returns the number of affected rows.
+    /// Returns an error if the engine is in read-only mode.
     pub fn execute(&self, sql: &str) -> Result<usize, String> {
+        if self.read_only {
+            return Err("database is read-only".to_string());
+        }
         if let Some(ref buf) = self.buffer {
             let should_flush = buf.push(sql.to_string());
             if should_flush {
@@ -157,7 +200,12 @@ impl Engine {
     /// Parameters are referenced as `$1`, `$2`, ... in the SQL string.
     /// Always applied immediately (bypasses the write buffer).
     /// Takes an exclusive write lock.
+    ///
+    /// Returns an error if the engine is in read-only mode.
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
+        if self.read_only {
+            return Err("database is read-only".to_string());
+        }
         let mut db = self.guard.write();
         db.execute_params(sql, params).map_err(|e| e.to_string())
     }
@@ -203,9 +251,86 @@ impl Engine {
     ///
     /// Rewrites the snapshot + payloads.bin and truncates the WAL log to zero.
     /// Takes an exclusive write lock for the duration of the compaction.
+    ///
+    /// When an S3 remote is configured (feature `s3`), uploads the compacted
+    /// segments after successful local compaction.
+    ///
+    /// Returns an error if the engine is in read-only mode.
     pub fn compact(&self) -> Result<(), String> {
-        let mut db = self.guard.write();
-        db.compact().map_err(|e| e.to_string())
+        if self.read_only {
+            return Err("database is read-only".to_string());
+        }
+        {
+            let mut db = self.guard.write();
+            db.compact().map_err(|e| e.to_string())?;
+        }
+
+        #[cfg(feature = "s3")]
+        if let (Some(ref remote), Some(ref path)) = (&self.remote, &self.path) {
+            remote
+                .sync_to_remote(std::path::Path::new(path))
+                .map_err(|e| format!("S3 sync after compact: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Manually sync local segments to S3.
+    ///
+    /// Uploads all segment files and writes a new manifest.
+    /// Only available when the `s3` feature is enabled and a remote is configured.
+    #[cfg(feature = "s3")]
+    pub fn sync(&self) -> Result<(), String> {
+        let remote = self.remote.as_ref().ok_or("no remote configured")?;
+        let path = self.path.as_ref().ok_or("no database path")?;
+        remote.sync_to_remote(std::path::Path::new(path))
+    }
+
+    /// Check S3 for a newer manifest and hot-swap the local database.
+    ///
+    /// Returns `true` if the database was refreshed (newer generation found),
+    /// `false` if already up-to-date.
+    ///
+    /// Only available in read-only mode with an S3 remote configured.
+    /// During the swap, queries briefly block (microseconds) while the inner
+    /// `CoreDB` is replaced — in-flight reads continue on the old data.
+    #[cfg(feature = "s3")]
+    pub fn refresh(&self) -> Result<bool, String> {
+        if !self.read_only {
+            return Err("refresh() is only available in read-only mode".to_string());
+        }
+        let remote = self.remote.as_ref().ok_or("no remote configured")?;
+        let path = self.path.as_ref().ok_or("no database path")?;
+
+        let latest = remote.latest_generation()?;
+        let current = self
+            .generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if latest <= current {
+            return Ok(false);
+        }
+
+        // Download newer segments (incremental — skips matching files).
+        remote.sync_from_remote(std::path::Path::new(path))?;
+
+        // Reopen CoreDB from updated directory.
+        let new_db =
+            CoreDB::open_read_only(path).map_err(|e| format!("reopening db: {e}"))?;
+        let _old = self.guard.replace(new_db);
+        self.generation
+            .store(latest, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(true)
+    }
+
+    /// The current manifest generation this engine was opened from.
+    ///
+    /// Increments after each successful [`compact()`](Self::compact) upload
+    /// or [`refresh()`](Self::refresh) download.
+    #[cfg(feature = "s3")]
+    pub fn generation(&self) -> u64 {
+        self.generation
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Consume the engine and return the inner `CoreDB`.
@@ -239,6 +364,17 @@ pub struct EngineBuilder {
     buffer_size: Option<usize>,
     rebuild_strategy: RebuildStrategy,
     wal_policy: WalPolicy,
+    read_only: bool,
+    #[cfg(feature = "s3")]
+    remote_url: Option<String>,
+    #[cfg(feature = "s3")]
+    remote_creds: Option<remote::S3Credentials>,
+    #[cfg(feature = "s3")]
+    remote_only: bool,
+    #[cfg(feature = "s3")]
+    cache_budget: Option<cache::CacheBudget>,
+    #[cfg(feature = "s3")]
+    cache_dir: Option<String>,
 }
 
 impl EngineBuilder {
@@ -261,14 +397,268 @@ impl EngineBuilder {
         self
     }
 
+    /// Open the database in read-only mode.
+    ///
+    /// Read-only engines skip the exclusive file lock and WAL writer.
+    /// Write operations ([`execute`](Engine::execute), [`compact`](Engine::compact))
+    /// return an error. Use [`refresh()`](Engine::refresh) (with S3) to pull
+    /// newer data published by a writer.
+    pub fn read_only(mut self, ro: bool) -> Self {
+        self.read_only = ro;
+        self
+    }
+
+    /// Configure S3 remote storage for segment sync.
+    ///
+    /// The URL should be `s3://bucket-name/optional/prefix`.
+    /// Credentials must be set via [`.credentials()`](Self::credentials).
+    ///
+    /// On `build()`, any remote segments missing locally will be downloaded.
+    /// On `compact()`, compacted segments will be uploaded.
+    #[cfg(feature = "s3")]
+    pub fn remote(mut self, url: &str) -> Self {
+        self.remote_url = Some(url.to_string());
+        self
+    }
+
+    /// Set S3 credentials. Required when using `.remote()`.
+    #[cfg(feature = "s3")]
+    pub fn credentials(mut self, creds: remote::S3Credentials) -> Self {
+        self.remote_creds = Some(creds);
+        self
+    }
+
+    /// Enable remote-only mode: payloads stay on S3, fetched on demand.
+    ///
+    /// Only the snapshot (node index) is downloaded. Payload reads go through
+    /// a bounded LRU block cache backed by S3 `GET_RANGE`. This allows
+    /// querying datasets much larger than local disk.
+    ///
+    /// Implies `read_only(true)`. Requires `.remote(url)`.
+    #[cfg(feature = "s3")]
+    pub fn remote_only(mut self, enabled: bool) -> Self {
+        self.remote_only = enabled;
+        if enabled {
+            self.read_only = true;
+        }
+        self
+    }
+
+    /// Set the local block cache budget for remote-only mode.
+    /// Default: 10 GB.
+    #[cfg(feature = "s3")]
+    pub fn cache_budget(mut self, budget: cache::CacheBudget) -> Self {
+        self.cache_budget = Some(budget);
+        self
+    }
+
+    /// Set a local disk cache directory for remote-only mode.
+    ///
+    /// Blocks evicted from the in-memory tier are written here (64 KB files).
+    /// Survives process restarts — blocks are re-discovered on next open.
+    #[cfg(feature = "s3")]
+    pub fn cache_dir(mut self, dir: &str) -> Self {
+        self.cache_dir = Some(dir.to_string());
+        self
+    }
+
     /// Build the Engine, opening (or creating) the database at the configured path.
     pub fn build(self) -> Result<Engine, String> {
-        let db = CoreDB::open(&self.path).map_err(|e| e.to_string())?;
+        #[cfg(feature = "s3")]
+        let remote_sync = match self.remote_url {
+            Some(ref url) => {
+                let creds = self.remote_creds.as_ref()
+                    .ok_or("S3 credentials required — call .credentials() on the builder")?;
+                Some(remote::RemoteSync::from_url(url, creds)?)
+            }
+            None => None,
+        };
+
+        #[cfg(feature = "s3")]
+        let mut initial_gen = 0u64;
+
+        #[cfg(feature = "s3")]
+        let use_remote_only = self.remote_only;
+        #[cfg(not(feature = "s3"))]
+        let use_remote_only = false;
+
+        let db;
+
+        #[cfg(feature = "s3")]
+        if use_remote_only {
+            let r = remote_sync
+                .as_ref()
+                .ok_or("remote_only requires .remote(url)")?;
+            initial_gen = r.latest_generation().unwrap_or(0);
+            let budget = self
+                .cache_budget
+                .unwrap_or_else(cache::CacheBudget::default);
+            db = CoreDB::open_s3(
+                r,
+                budget,
+                self.cache_dir.as_deref().map(std::path::Path::new),
+            )?;
+        } else {
+            // Full sync: download all segments, then open locally.
+            if let Some(ref r) = remote_sync {
+                r.sync_from_remote(std::path::Path::new(&self.path))
+                    .map_err(|e| format!("S3 initial sync: {e}"))?;
+                initial_gen = r.latest_generation().unwrap_or(0);
+            }
+
+            db = if self.read_only {
+                CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
+            } else {
+                CoreDB::open(&self.path).map_err(|e| e.to_string())?
+            };
+        }
+
+        #[cfg(not(feature = "s3"))]
+        {
+            db = if self.read_only {
+                CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
+            } else {
+                CoreDB::open(&self.path).map_err(|e| e.to_string())?
+            };
+        }
+
         Ok(Engine {
             guard: ReadWriteGuard::new(db),
-            buffer: self.buffer_size.map(WriteBuffer::new),
+            buffer: if self.read_only {
+                None
+            } else {
+                self.buffer_size.map(WriteBuffer::new)
+            },
             scheduler: IndexScheduler::new(self.rebuild_strategy),
             wal_policy: self.wal_policy,
+            path: Some(self.path),
+            read_only: self.read_only,
+            #[cfg(feature = "s3")]
+            remote: remote_sync,
+            #[cfg(feature = "s3")]
+            generation: std::sync::atomic::AtomicU64::new(initial_gen),
         })
+    }
+}
+
+#[cfg(all(test, feature = "s3"))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_read_only_blocks_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::builder(dir.path().to_str().unwrap())
+            .read_only(true)
+            .build()
+            .unwrap();
+
+        assert!(engine.is_read_only());
+
+        let err = engine
+            .execute("INSERT INTO t (_key, x) VALUES ('a', 1)")
+            .unwrap_err();
+        assert!(err.contains("read-only"));
+
+        let err = engine
+            .execute_params("INSERT INTO t (_key) VALUES ($1)", &[])
+            .unwrap_err();
+        assert!(err.contains("read-only"));
+
+        let err = engine.compact().unwrap_err();
+        assert!(err.contains("read-only"));
+    }
+
+    #[test]
+    fn test_read_only_allows_queries() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write some data first.
+        {
+            let w = Engine::builder(dir.path().to_str().unwrap())
+                .build()
+                .unwrap();
+            w.execute("CREATE TABLE items (_key TEXT PRIMARY KEY, name TEXT)")
+                .unwrap();
+            w.execute("INSERT INTO items (_key, name) VALUES ('a', 'Alice')")
+                .unwrap();
+            w.compact().unwrap();
+        }
+
+        // Open read-only and verify query works.
+        let r = Engine::builder(dir.path().to_str().unwrap())
+            .read_only(true)
+            .build()
+            .unwrap();
+        let hits = r.query("SELECT name FROM items").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_refresh_detects_new_generation() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let writer_remote =
+            remote::RemoteSync::from_store(store.clone(), "refreshtest").unwrap();
+        let reader_remote =
+            remote::RemoteSync::from_store(store.clone(), "refreshtest").unwrap();
+
+        // Writer: create db, insert data, compact, upload.
+        let w_dir = tempfile::tempdir().unwrap();
+        {
+            let db = CoreDB::open(w_dir.path()).unwrap();
+            drop(db);
+        }
+        {
+            let mut db = CoreDB::open(w_dir.path()).unwrap();
+            db.execute("CREATE TABLE items (_key TEXT PRIMARY KEY, val INTEGER)")
+                .unwrap();
+            db.execute("INSERT INTO items (_key, val) VALUES ('x', 10)")
+                .unwrap();
+            db.compact().unwrap();
+        }
+        writer_remote.sync_to_remote(w_dir.path()).unwrap();
+
+        // Reader: pull from S3, open read-only.
+        let r_dir = tempfile::tempdir().unwrap();
+        reader_remote.sync_from_remote(r_dir.path()).unwrap();
+        let r_path = r_dir.path().to_str().unwrap().to_string();
+
+        // Build engine manually with injected remote.
+        let db = CoreDB::open_read_only(&r_path).unwrap();
+        let engine = Engine {
+            guard: ReadWriteGuard::new(db),
+            buffer: None,
+            scheduler: IndexScheduler::new(RebuildStrategy::Immediate),
+            wal_policy: WalPolicy::Manual,
+            path: Some(r_path),
+            read_only: true,
+            remote: Some(reader_remote),
+            generation: std::sync::atomic::AtomicU64::new(1),
+        };
+
+        // Query should see data.
+        let hits = engine.query("SELECT val FROM items").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // No new generation — refresh returns false.
+        assert!(!engine.refresh().unwrap());
+
+        // Writer adds more data and uploads gen 2.
+        {
+            let mut db = CoreDB::open(w_dir.path()).unwrap();
+            db.execute("INSERT INTO items (_key, val) VALUES ('y', 20)")
+                .unwrap();
+            db.compact().unwrap();
+        }
+        writer_remote.sync_to_remote(w_dir.path()).unwrap();
+
+        // Reader refresh — should detect gen 2 and hot-swap.
+        assert!(engine.refresh().unwrap());
+        assert_eq!(engine.generation(), 2);
+
+        let hits = engine.query("SELECT val FROM items").unwrap();
+        assert_eq!(hits.len(), 2);
     }
 }
